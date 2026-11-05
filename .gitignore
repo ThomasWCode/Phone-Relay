@@ -1,0 +1,8 @@
+node_modules/
+.wrangler/
+relay/wrangler.jsonc
+relay/.dev.vars
+phone/.env
+__pycache__/
+*.pyc
+selftest_screenshot.*

@@ -1,0 +1,4 @@
+# Phone client dependencies (Termux: pip install -r requirements.txt).
+# Pillow is installed from Termux packages instead (pkg install python-pillow);
+# on a desktop for running the tests: pip install pillow
+websockets>=13
