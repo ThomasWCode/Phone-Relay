@@ -19,6 +19,7 @@ const DEVICE_ERROR_STATUS: Record<string, number> = {
   invalid_args: 400,
   foreground_not_allowed: 409,
   password_field: 409,
+  no_text_field: 409,
   screen_off: 409,
   stopped: 503,
 };

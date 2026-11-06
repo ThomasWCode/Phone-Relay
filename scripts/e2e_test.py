@@ -11,9 +11,8 @@ Cloudflare account and no phone. Run from the repository root after
 import json
 import os
 import secrets
-import shlex
+import shutil
 import signal
-import stat
 import subprocess
 import sys
 import tempfile
@@ -89,19 +88,18 @@ def main():
     state_path = os.path.join(tmp, "fake_state.json")
     with open(state_path, "w") as f:
         json.dump({"foreground": "com.android.chrome", "awake": True, "password_focused": False}, f)
-    adb_wrapper = os.path.join(tmp, "adb")
-    with open(adb_wrapper, "w") as f:
-        f.write(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} "
-                f"{shlex.quote(os.path.join(PHONE, 'tests', 'fake_adb.py'))} \"$@\"\n")
-    os.chmod(adb_wrapper, os.stat(adb_wrapper).st_mode | stat.S_IXUSR)
+    # phone_client runs a .py ADB_BIN with its own Python, so no shell wrapper is needed (works on Windows)
+    fake_adb = os.path.join(PHONE, "tests", "fake_adb.py")
     stop_file = os.path.join(tmp, "STOP_PHONE_AGENT")
 
     wrangler_log = open(os.path.join(tmp, "wrangler.log"), "w")
+    new_group = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
+                 else {"start_new_session": True})
     wrangler = subprocess.Popen(
-        ["npx", "wrangler", "dev", "--config", "wrangler.example.jsonc", "--local", "--ip", "127.0.0.1",
-         "--port", str(PORT), "--env-file", env_file, "--persist-to", os.path.join(tmp, "state"),
-         "--show-interactive-dev-session=false"],
-        cwd=RELAY, stdout=wrangler_log, stderr=subprocess.STDOUT, start_new_session=True,
+        [shutil.which("npx") or "npx", "wrangler", "dev", "--config", "wrangler.example.jsonc", "--local",
+         "--ip", "127.0.0.1", "--port", str(PORT), "--env-file", env_file,
+         "--persist-to", os.path.join(tmp, "state"), "--show-interactive-dev-session=false"],
+        cwd=RELAY, stdout=wrangler_log, stderr=subprocess.STDOUT, **new_group,
     )
     client = None
     try:
@@ -127,7 +125,7 @@ def main():
 
         # ---- connect the phone client ----
         env = {**os.environ, "RELAY_URL": f"ws://127.0.0.1:{PORT}/device", "DEVICE_TOKEN": DEVICE,
-               "ADB_BIN": adb_wrapper, "FAKE_ADB_STATE": state_path, "FAKE_ADB_LOG": os.path.join(tmp, "adb.log")}
+               "ADB_BIN": fake_adb, "FAKE_ADB_STATE": state_path, "FAKE_ADB_LOG": os.path.join(tmp, "adb.log")}
         client_log = open(os.path.join(tmp, "client.log"), "w")
         client = subprocess.Popen([sys.executable, os.path.join(PHONE, "phone_client.py"), "--env", "/nonexistent",
                                    "--stop-file", stop_file], env=env, stdout=client_log, stderr=subprocess.STDOUT)
@@ -147,8 +145,7 @@ def main():
         check("GET /screenshot is JPEG", s == 200 and h.get("Content-Type") == "image/jpeg" and b[:2] == b"\xff\xd8", f"{s} {h}")
         check("screenshot headers", h.get("X-Image-Width") == "540" and h.get("X-Screen-Width") == "1080" and h.get("X-Scale") == "0.5", str(h))
 
-        s, _, b = request("GET", "/ui")
-        check("GET /ui", s == 200 and j(b).get("count") == 3, f"{s} {b[:200]}")
+        check("GET /ui is gone (no uiautomator)", request("GET", "/ui")[0] == 404)
 
         s, _, b = request("POST", "/tap", body={"x": 270, "y": 585, "scale": 0.5})
         check("POST /tap scaled", s == 200 and j(b).get("x") == 540, f"{s} {b[:200]}")
@@ -160,18 +157,27 @@ def main():
         set_fake(state_path, password_focused=True)
         s, _, b = request("POST", "/type", body={"text": "hunter2"})
         check("type into password field -> 409", s == 409 and j(b).get("error") == "password_field", f"{s} {b[:200]}")
-        set_fake(state_path, password_focused=False)
+        set_fake(state_path, password_focused=False, text_field=False)
+        s, _, b = request("POST", "/type", body={"text": "hi"})
+        check("type without a text field -> 409", s == 409 and j(b).get("error") == "no_text_field", f"{s} {b[:200]}")
+        set_fake(state_path, text_field=True, popup=True)
+        check("tap in an app's popup menu", request("POST", "/tap", body={"x": 10, "y": 10})[0] == 200)
+        set_fake(state_path, popup=False)
 
         # ---- allowlist ----
         set_fake(state_path, foreground="com.android.settings")
         s, _, b = request("POST", "/tap", body={"x": 10, "y": 10})
         check("tap in Settings -> 409", s == 409 and j(b).get("error") == "foreground_not_allowed", f"{s} {b[:200]}")
         check("screenshot in Settings -> 409", request("GET", "/screenshot")[0] == 409)
-        check("ui in Settings -> 409", request("GET", "/ui")[0] == 409)
         check("back in Settings -> 409", request("POST", "/key", body={"key": "back"})[0] == 409)
-        check("home always allowed", request("POST", "/key", body={"key": "home"})[0] == 200)
+        check("home in Settings -> 409", request("POST", "/key", body={"key": "home"})[0] == 409)
+        check("launch over Settings -> 409", request("POST", "/launch", body={"package": "com.android.chrome"})[0] == 409)
+        set_fake(state_path, foreground="com.microsoft.teams")
+        check("home over Teams -> 409", request("POST", "/key", body={"key": "home"})[0] == 409)
+        set_fake(state_path, foreground="com.android.chrome")
+        check("home from Chrome", request("POST", "/key", body={"key": "home"})[0] == 200)
         s, _, b = request("POST", "/launch", body={"package": "com.google.android.gm"})
-        check("launch Gmail", s == 200, f"{s} {b[:200]}")
+        check("launch Gmail from the home screen", s == 200, f"{s} {b[:200]}")
         check("Gmail now foreground", j(request("GET", "/state")[2]).get("foreground") == "com.google.android.gm")
         set_fake(state_path, foreground="NotificationShade")
         check("lock screen refused", request("POST", "/tap", body={"x": 10, "y": 10})[0] == 409)
@@ -222,11 +228,16 @@ def main():
         if client and client.poll() is None:
             client.terminate()
             client.wait(timeout=10)
-        try:
-            os.killpg(wrangler.pid, signal.SIGTERM)
+        if os.name == "nt":  # npx -> node -> workerd: kill the whole tree
+            subprocess.run(["taskkill", "/PID", str(wrangler.pid), "/T", "/F"], capture_output=True)
             wrangler.wait(timeout=15)
-        except Exception:
-            os.killpg(wrangler.pid, signal.SIGKILL)
+        else:
+            try:
+                os.killpg(wrangler.pid, signal.SIGTERM)
+                wrangler.wait(timeout=15)
+            except Exception:
+                os.killpg(wrangler.pid, signal.SIGKILL)
+        wrangler_log.close()
 
     print(f"\n{len(failures)} failure(s)" if failures else "\nall end-to-end checks passed")
     print(f"logs: {tmp}")

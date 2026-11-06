@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseBody, summariseArgs, validateCommand, validateText, type CommandName } from "../src/validate";
+import { AGENT_ROUTES, parseBody, summariseArgs, validateCommand, validateText, type CommandName } from "../src/validate";
 
 const q = (s = "") => new URLSearchParams(s);
 const v = (cmd: CommandName, body: Record<string, unknown> | null = null, query = "") => validateCommand(cmd, q(query), body);
@@ -7,7 +7,10 @@ const v = (cmd: CommandName, body: Record<string, unknown> | null = null, query 
 describe("validateCommand", () => {
   it("accepts reads without arguments", () => {
     expect(v("state")).toEqual({ ok: true, command: { cmd: "state", args: {} } });
-    expect(v("ui")).toEqual({ ok: true, command: { cmd: "ui", args: {} } });
+  });
+
+  it("has no /ui route (the phone never runs uiautomator)", () => {
+    expect(AGENT_ROUTES["/ui"]).toBeUndefined();
   });
 
   it("screenshot scale defaults to 0.5 and is bounded", () => {

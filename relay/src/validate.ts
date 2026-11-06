@@ -15,7 +15,7 @@ export const DEFAULT_SWIPE_MS = 300;
 export const MAX_TEXT_LENGTH = 500;
 export const MAX_BODY_BYTES = 4096;
 
-export type CommandName = "state" | "screenshot" | "ui" | "tap" | "swipe" | "type" | "key" | "launch";
+export type CommandName = "state" | "screenshot" | "tap" | "swipe" | "type" | "key" | "launch";
 
 export interface Command {
   cmd: CommandName;
@@ -33,7 +33,6 @@ interface Route {
 export const AGENT_ROUTES: Record<string, Route> = {
   "/state": { method: "GET", cmd: "state" },
   "/screenshot": { method: "GET", cmd: "screenshot" },
-  "/ui": { method: "GET", cmd: "ui" },
   "/tap": { method: "POST", cmd: "tap" },
   "/swipe": { method: "POST", cmd: "swipe" },
   "/type": { method: "POST", cmd: "type" },
@@ -89,7 +88,6 @@ export function validateCommand(
 ): ValidationResult {
   switch (cmd) {
     case "state":
-    case "ui":
       return { ok: true, command: { cmd, args: {} } };
 
     case "screenshot": {
