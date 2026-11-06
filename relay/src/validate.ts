@@ -23,19 +23,24 @@ export const DEFAULT_SWIPE_MS = 300;
 export const DEFAULT_TIMEOUT_S = 30;
 export const TRANSFER_TIMEOUT_S = 300;
 const STATUSBAR_ACTIONS = ["notifications", "settings", "collapse"];
-const WAIT_KINDS = ["change", "stable", "foreground"];
+const WAIT_KINDS = ["change", "stable", "foreground", "text"];
+const TYPE_METHODS = ["keys", "paste"];
+const UI_ENGINES = ["helper", "uiautomator"];
+const AUDIO_SOURCES = ["output", "mic"];
 // Commands a batch may run (the JSON ones, plus sleep). Same list as the phone client.
 export const BATCH_COMMANDS = [
   "state", "screenshot", "ui", "tap", "swipe", "type", "key", "launch", "open", "intent",
-  "notifications", "statusbar", "rotation", "wait", "files", "record_start", "sleep",
+  "notifications", "statusbar", "rotation", "wait", "files", "record_start", "gesture",
+  "clipboard_get", "clipboard_set", "sleep",
 ];
 
 export type CommandName =
   | "state" | "screenshot" | "ui" | "tap" | "swipe" | "type" | "key" | "launch"
   | "open" | "intent" | "notifications" | "statusbar" | "rotation" | "wait" | "batch"
-  | "files" | "pull" | "push" | "record" | "record_start" | "record_stop";
+  | "files" | "pull" | "push" | "record" | "record_start" | "record_stop"
+  | "gesture" | "clipboard_get" | "clipboard_set" | "audio";
 // Commands whose reply is a file streamed from the phone, and the one that streams a file to it.
-export const DOWNLOAD_COMMANDS: readonly CommandName[] = ["pull", "record", "record_stop"];
+export const DOWNLOAD_COMMANDS: readonly CommandName[] = ["pull", "record", "record_stop", "audio"];
 export const UPLOAD_COMMAND: CommandName = "push";
 
 export interface Command {
@@ -54,8 +59,8 @@ interface Route {
   raw?: boolean;
 }
 
-// Path -> route. Anything not listed here is not an agent endpoint.
-export const AGENT_ROUTES: Record<string, Route> = {
+// Path -> route (or routes, one per method). Anything not listed here is not an agent endpoint.
+export const AGENT_ROUTES: Record<string, Route | Route[]> = {
   "/state": { method: "GET", cmd: "state" },
   "/screenshot": { method: "GET", cmd: "screenshot" },
   "/ui": { method: "GET", cmd: "ui" },
@@ -77,16 +82,26 @@ export const AGENT_ROUTES: Record<string, Route> = {
   "/record": { method: "GET", cmd: "record" },
   "/record/start": { method: "POST", cmd: "record_start" },
   "/record/stop": { method: "POST", cmd: "record_stop" },
+  "/gesture": { method: "POST", cmd: "gesture" },
+  "/clipboard": [{ method: "GET", cmd: "clipboard_get" }, { method: "POST", cmd: "clipboard_set" }],
+  "/audio": { method: "GET", cmd: "audio" },
 };
+
+// The route for a path and method: null for no such path, "method" for a path without that method.
+export function findRoute(path: string, method: string): Route | null | "method" {
+  const entry = AGENT_ROUTES[path];
+  if (!entry) return null;
+  return (Array.isArray(entry) ? entry : [entry]).find((r) => r.method === method) ?? "method";
+}
 
 // Each command's own fields; every command also takes COMMON_FIELDS.
 const FIELDS: Record<CommandName, string[]> = {
   state: [],
   screenshot: ["scale"],
-  ui: [],
+  ui: ["engine"],
   tap: ["x", "y", "scale"],
   swipe: ["x1", "y1", "x2", "y2", "ms", "scale"],
-  type: ["text"],
+  type: ["text", "method"],
   key: ["key", "longpress"],
   launch: ["package"],
   open: ["url", "package"],
@@ -94,7 +109,7 @@ const FIELDS: Record<CommandName, string[]> = {
   notifications: [],
   statusbar: ["action"],
   rotation: ["rotation"],
-  wait: ["for", "seconds", "interval_ms", "threshold", "package"],
+  wait: ["for", "seconds", "interval_ms", "threshold", "package", "text"],
   batch: ["steps", "stop_on_error"],
   files: ["path"],
   pull: ["path"],
@@ -102,6 +117,10 @@ const FIELDS: Record<CommandName, string[]> = {
   record: ["seconds", "size", "bit_rate"],
   record_start: ["seconds", "size", "bit_rate"],
   record_stop: [],
+  gesture: ["pointers", "ms", "scale"],
+  clipboard_get: [],
+  clipboard_set: ["text"],
+  audio: ["seconds", "source"],
 };
 // Query-string fields read as numbers.
 const NUMERIC_QUERY_FIELDS = ["scale", "timeout", "seconds", "bit_rate"];
@@ -158,7 +177,8 @@ export function defaultTimeout(cmd: CommandName, args: Fields): number {
   if (cmd === "type" && typeof args.text === "string") return DEFAULT_TIMEOUT_S + args.text.length / 10;
   if (cmd === "swipe" && isNumber(args.ms)) return DEFAULT_TIMEOUT_S + Math.max(args.ms, 0) / 1000;
   if (cmd === "wait") return DEFAULT_TIMEOUT_S + (isNumber(args.seconds) ? args.seconds : 10);
-  if (cmd === "record") return 2 * DEFAULT_TIMEOUT_S + 2 * (isNumber(args.seconds) ? args.seconds : 10);
+  if (cmd === "record" || cmd === "audio") return 2 * DEFAULT_TIMEOUT_S + 2 * (isNumber(args.seconds) ? args.seconds : 10);
+  if (cmd === "gesture" && isNumber(args.ms)) return DEFAULT_TIMEOUT_S + Math.max(args.ms, 0) / 1000;
   if (cmd === "pull" || cmd === "push" || cmd === "record_stop") return TRANSFER_TIMEOUT_S;
   if (cmd === "batch" && Array.isArray(args.steps)) {
     let total = DEFAULT_TIMEOUT_S;
@@ -251,10 +271,16 @@ function commonArgs(src: Fields): Fields | string {
 function commandArgs(cmd: CommandName, src: Fields, ignored: string[]): Fields | string {
   switch (cmd) {
     case "state":
-    case "ui":
     case "notifications":
     case "record_stop":
+    case "clipboard_get":
       return {};
+
+    case "ui": {
+      if (src.engine === undefined) return {};
+      if (typeof src.engine !== "string" || !UI_ENGINES.includes(src.engine)) return `engine must be one of ${UI_ENGINES.join(", ")}`;
+      return { engine: src.engine };
+    }
 
     case "screenshot": {
       const scale = src.scale ?? DEFAULT_SCREENSHOT_SCALE;
@@ -280,9 +306,54 @@ function commandArgs(cmd: CommandName, src: Fields, ignored: string[]): Fields |
     }
 
     case "type": {
-      const err = validateText(src.text);
-      if (err) return err;
+      // Keys type ASCII; anything else is pasted through the clipboard (method paste), unless told keys.
+      if (typeof src.text !== "string" || src.text.length === 0) return "text must be a non-empty string";
+      if (src.method !== undefined && (typeof src.method !== "string" || !TYPE_METHODS.includes(src.method))) {
+        return `method must be one of ${TYPE_METHODS.join(", ")}`;
+      }
+      if (src.method === "keys") {
+        const err = validateText(src.text);
+        if (err) return err;
+      }
+      return src.method === undefined ? { text: src.text } : { text: src.text, method: src.method };
+    }
+
+    case "gesture": {
+      const pointers = src.pointers;
+      if (!Array.isArray(pointers) || pointers.length < 1 || pointers.length > 10) return "pointers must be a list of 1 to 10 paths";
+      for (const [i, path] of pointers.entries()) {
+        if (!Array.isArray(path) || path.length === 0 || !path.every((pt) => Array.isArray(pt) && pt.length === 2 && pt.every(isNumber))) {
+          return `pointer ${i} must be a list of [x, y] points`;
+        }
+      }
+      const out: Fields = { pointers };
+      if (src.ms !== undefined) {
+        if (!isNumber(src.ms) || src.ms < 0) return "ms must be a number 0 or above";
+        out.ms = src.ms;
+      }
+      const scale = src.scale ?? 1;
+      if (!isPositive(scale)) return "scale must be a number above 0";
+      out.scale = scale;
+      return out;
+    }
+
+    case "clipboard_set": {
+      // null empties the clipboard
+      if (src.text !== null && typeof src.text !== "string") return "text must be a string, or null to empty the clipboard";
       return { text: src.text };
+    }
+
+    case "audio": {
+      const out: Fields = {};
+      if (src.seconds !== undefined) {
+        if (!isPositive(src.seconds)) return "seconds must be a number above 0";
+        out.seconds = src.seconds;
+      }
+      if (src.source !== undefined) {
+        if (typeof src.source !== "string" || !AUDIO_SOURCES.includes(src.source)) return `source must be one of ${AUDIO_SOURCES.join(", ")}`;
+        out.source = src.source;
+      }
+      return out;
     }
 
     case "key": {
@@ -378,6 +449,10 @@ function commandArgs(cmd: CommandName, src: Fields, ignored: string[]): Fields |
         if (typeof src.package !== "string" || !PACKAGE_RE.test(src.package)) return "package must be an Android package name";
         out.package = src.package;
       }
+      if (src.for === "text" || src.text !== undefined) {
+        if (typeof src.text !== "string" || src.text.length === 0) return "waiting for text needs text, a non-empty string";
+        out.text = src.text;
+      }
       return out;
     }
 
@@ -421,7 +496,7 @@ export function summariseArgs(command: Command): Record<string, unknown> {
 }
 
 function summarise(cmd: string, args: Fields): Fields {
-  if (cmd === "type") return { length: String(args.text ?? "").length };
+  if (cmd === "type" || cmd === "clipboard_set") return { length: String(args.text ?? "").length };
   if (cmd === "batch" && Array.isArray(args.steps)) {
     return { ...args, steps: (args.steps as Fields[]).map((s) => ({ cmd: s.cmd, args: summarise(String(s.cmd), (s.args ?? {}) as Fields) })) };
   }

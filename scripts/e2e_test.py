@@ -177,7 +177,9 @@ def main():
         check("screenshot headers", h.get("X-Image-Width") == "540" and h.get("X-Screen-Width") == "1080" and h.get("X-Scale") == "0.5", str(h))
 
         s, _, b = request("GET", "/ui")
-        check("GET /ui (every package)", s == 200 and j(b).get("count") == 4, f"{s} {b[:200]}")
+        check("GET /ui through the helper (every package)", s == 200 and j(b).get("count") == 4, f"{s} {b[:200]}")
+        s, _, b = request("GET", "/ui?engine=uiautomator")
+        check("GET /ui with uiautomator", s == 200 and j(b).get("count") == 4, f"{s} {b[:200]}")
 
         s, _, b = request("POST", "/tap", body={"x": 270, "y": 585, "scale": 0.5})
         check("POST /tap scaled", s == 200 and j(b).get("x") == 540, f"{s} {b[:200]}")
@@ -188,8 +190,10 @@ def main():
         check("type with % and %s", request("POST", "/type", body={"text": "100% and %s"})[0] == 200)
         check("type with newlines and tabs", request("POST", "/type", body={"text": "a\nb\tc"})[0] == 200)
         check("type 2000 characters", request("POST", "/type", body={"text": "x" * 2000})[0] == 200)
-        s, _, b = request("POST", "/type", body={"text": "café"})
-        check("type non-ASCII -> 400 (not built yet)", s == 400 and j(b).get("error") == "invalid_args")
+        s, _, b = request("POST", "/type", body={"text": "café 😀"})
+        check("non-ASCII text is pasted", s == 200 and j(b).get("method") == "paste", f"{s} {b[:200]}")
+        s, _, b = request("POST", "/type", body={"text": "café", "method": "keys"})
+        check("non-ASCII as keys -> 400", s == 400 and j(b).get("error") == "invalid_args")
         check("KEYCODE_* key", request("POST", "/key", body={"key": "KEYCODE_PAGE_DOWN"})[0] == 200)
         check("power key accepted", request("POST", "/key", body={"key": "KEYCODE_POWER"})[0] == 200)
         check("key by number, long press", request("POST", "/key", body={"key": 82, "longpress": True})[0] == 200)
@@ -300,6 +304,20 @@ def main():
         check("batch passes if_foreground down", s == 200 and j(b)["results"][0].get("error") == "foreground_mismatch",
               f"{s} {b[:300]}")
 
+        # ---- the helper: gestures, clipboard, audio, waiting for text ----
+        s, _, b = request("POST", "/gesture", body={"pointers": [[[500, 1000], [300, 800]], [[580, 1080], [780, 1280]]],
+                                                    "ms": 300})
+        check("two-finger gesture", s == 200 and j(b).get("pointers") == 2, f"{s} {b[:200]}")
+        s, _, b = request("POST", "/clipboard", body={"text": "Grüße clipsecret 👋"})
+        check("set the clipboard", s == 200, f"{s} {b[:200]}")
+        s, _, b = request("GET", "/clipboard")
+        check("read the clipboard", s == 200 and j(b).get("text") == "Grüße clipsecret 👋", f"{s} {b[:200]}")
+        check("clipboard is GET or POST", request("PUT", "/clipboard", body={})[0] == 405)
+        s, h, b = request("GET", "/audio?seconds=1&source=output")
+        check("audio as WAV", s == 200 and h.get("Content-Type") == "audio/wav" and b.startswith(b"RIFF"), f"{s} {h}")
+        s, _, b = request("POST", "/wait", body={"for": "text", "text": "welcome"})
+        check("wait for text on the screen", s == 200 and j(b).get("met") is True, f"{s} {b[:200]}")
+
         # ---- files ----
         s, _, b = request("GET", "/files?path=/sdcard/Download")
         check("list a folder", s == 200 and [e["name"] for e in j(b).get("entries", [])] == ["a.txt"], f"{s} {b[:200]}")
@@ -337,7 +355,7 @@ def main():
         entries = j(b).get("entries", [])
         check("admin log readable", s == 200 and len(entries) > 10, f"{s}")
         check("typed text not logged", b"hello world" not in b and b"hunter2" not in b and b"batchsecret" not in b
-              and b"intentsecret" not in b)
+              and b"intentsecret" not in b and b"clipsecret" not in b)
         check("type logged as length", any(e.get("action") == "type" and e.get("detail") == {"length": 11} for e in entries))
 
         # ---- kill switch (admin) ----

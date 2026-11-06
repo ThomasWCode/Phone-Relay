@@ -499,8 +499,8 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
     async def test_type(self):
         ctl, adb = controller()
         res = await ctl.handle("type", {"text": "hello world"})
-        self.assertEqual(res, {"length": 11, "field_package": "com.android.chrome", "field_input_type": 0x1,
-                               "password_field": False})
+        self.assertEqual(res, {"length": 11, "method": "keys", "field_package": "com.android.chrome",
+                               "field_input_type": 0x1, "password_field": False})
         self.assertEqual(adb.inputs(), ["input text hello%sworld"])
 
     async def test_type_percent(self):
@@ -624,19 +624,20 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ui["count"], 4)
 
     async def test_ui_discarded_if_foreground_changes_with_if_foreground(self):
-        ctl, adb = controller()
-        original = adb.run
+        for engine, marker in [("helper", "Helper ui"), ("uiautomator", "uiautomator dump")]:
+            ctl, adb = controller()
+            original = adb.run
 
-        async def run(*args, timeout=None):
-            out = await original(*args, timeout=timeout)
-            if "uiautomator dump" in args[1]:
-                adb.state["foreground"] = "com.android.settings"
-            return out
+            async def run(*args, timeout=None, adb=adb, original=original, marker=marker):
+                out = await original(*args, timeout=timeout)
+                if len(args) > 1 and marker in args[1]:
+                    adb.state["foreground"] = "com.android.settings"
+                return out
 
-        adb.run = run
-        with self.assertRaises(pc.CommandError) as cm:
-            await ctl.handle("ui", {"if_foreground": "com.android.chrome"})
-        self.assertEqual(cm.exception.code, "foreground_mismatch")
+            adb.run = run
+            with self.assertRaises(pc.CommandError, msg=engine) as cm:
+                await ctl.handle("ui", {"if_foreground": "com.android.chrome", "engine": engine})
+            self.assertEqual(cm.exception.code, "foreground_mismatch")
 
     async def test_stop_file_halts_long_typing_between_chunks(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1142,6 +1143,176 @@ class FileAndRecordTests(unittest.IsolatedAsyncioTestCase):
         for bad in [{"seconds": 0}, {"size": "big"}, {"bit_rate": 1.5}]:
             with self.assertRaises(pc.CommandError, msg=repr(bad)):
                 await ctl.handle("record_start", bad)
+
+
+class HelperTests(unittest.IsolatedAsyncioTestCase):
+    def helper_calls(self, adb):
+        return [c[1] for c in adb.calls if len(c) > 1 and fake_adb.HELPER_PREFIX in c[1]]
+
+    async def test_jar_is_pushed_once_and_again_only_if_it_changed(self):
+        ctl, adb = controller()
+        await ctl.handle("ui", {})
+        await ctl.handle("ui", {})
+        self.assertEqual([c[0] for c in adb.calls].count("push"), 1)
+        ctl2 = pc.PhoneController(adb, stop_file=ctl.stop_file, focus_retry_delay=0)  # a new client run, same phone
+        await ctl2.handle("ui", {})
+        self.assertEqual([c[0] for c in adb.calls].count("push"), 1)  # the phone's copy matches
+        with tempfile.TemporaryDirectory() as tmp:
+            changed = os.path.join(tmp, "helper.jar")
+            with open(pc.HELPER_JAR, "rb") as f, open(changed, "wb") as g:
+                g.write(f.read() + b"changed")
+            ctl3 = pc.PhoneController(adb, stop_file=ctl.stop_file, focus_retry_delay=0, helper_jar=changed)
+            await ctl3.handle("ui", {})
+        self.assertEqual([c[0] for c in adb.calls].count("push"), 2)
+
+    async def test_missing_jar(self):
+        ctl, _ = controller()
+        ctl.helper_jar = os.path.join(tempfile.gettempdir(), "no-such-helper.jar")
+        with self.assertRaises(pc.CommandError) as cm:
+            await ctl.handle("ui", {})
+        self.assertEqual(cm.exception.code, "helper_missing")
+
+    async def test_ui_uses_the_helper_not_uiautomator(self):
+        ctl, adb = controller()
+        ui = await ctl.handle("ui", {})
+        self.assertEqual(ui["count"], 4)
+        self.assertFalse(any("uiautomator" in c[1] for c in adb.calls if len(c) > 1))
+        ui = await ctl.handle("ui", {"engine": "uiautomator"})
+        self.assertEqual(ui["count"], 4)
+        self.assertTrue(any("uiautomator dump" in c[1] for c in adb.calls if len(c) > 1))
+        with self.assertRaises(pc.CommandError):
+            await ctl.handle("ui", {"engine": "other"})
+
+    async def test_helper_failure_is_reported_never_replaced_by_uiautomator(self):
+        ctl, adb = controller({"helper_error": "NoSuchMethodException: connect"})
+        with self.assertRaises(pc.CommandError) as cm:
+            await ctl.handle("ui", {})
+        self.assertEqual(cm.exception.code, "helper_failed")
+        self.assertIn("NoSuchMethodException", cm.exception.detail)
+        self.assertFalse(any("uiautomator" in c[1] for c in adb.calls if len(c) > 1))
+
+    async def test_a_helper_that_never_started_is_a_failure_not_a_success(self):
+        """app_process failing before the helper's main (a deleted or broken jar) prints no status line."""
+        ctl, adb = controller()
+        await ctl.handle("ui", {})  # pushes the jar
+        for cmd, args in [("gesture", {"pointers": [[[1, 1]]]}), ("clipboard_set", {"text": "x"}),
+                          ("type", {"text": "café"}), ("ui", {})]:
+            adb.state["files"].pop(fake_adb.HELPER_REMOTE, None)  # deleted on the phone behind the client's back
+            ctl._helper_pushed = True  # while the client believes it is still there
+            with self.assertRaises(pc.CommandError, msg=cmd) as cm:
+                await ctl.handle(cmd, args)
+            self.assertEqual(cm.exception.code, "helper_failed", cmd)
+            self.assertIn("did not run", cm.exception.detail)
+        self.assertNotIn("gestures", adb.state)
+        self.assertEqual((await ctl.handle("ui", {}))["count"], 4)  # the failure made it push the jar again
+
+    async def test_content_that_looks_like_a_marker_is_just_content(self):
+        ctl, adb = controller()
+        for text in ["PHONE_RELAY_HELPER_ERROR boom", "PHONE_RELAY_HELPER_OK", "x\nPHONE_RELAY_REFUSED"]:
+            await ctl.handle("clipboard_set", {"text": text})
+            self.assertEqual((await ctl.handle("clipboard_get", {}))["text"], text)
+            res = await ctl.handle("clipboard_get", {"if_foreground": "com.android.chrome"})
+            self.assertEqual(res["text"], text)
+
+    async def test_helper_runs_inside_the_guard(self):
+        ctl, adb = controller({"foreground": "com.android.settings"})
+        with self.assertRaises(pc.CommandError) as cm:
+            await ctl.handle("gesture", {"pointers": [[[1, 1]]], "if_foreground": "com.android.chrome"})
+        self.assertEqual(cm.exception.code, "foreground_mismatch")
+        self.assertNotIn("gestures", adb.state)
+
+    async def test_gesture(self):
+        ctl, adb = controller()
+        pinch = {"pointers": [[[500, 1000], [300, 800]], [[580, 1080], [780, 1280]]], "ms": 400}
+        res = await ctl.handle("gesture", pinch)
+        self.assertEqual(res, {"pointers": 2, "ms": 400})
+        self.assertEqual(adb.state["gestures"], [pinch])
+        await ctl.handle("gesture", {"pointers": [[[50, 100], [60, 110], [70, 120]]], "scale": 0.5})
+        self.assertEqual(adb.state["gestures"][1], {"pointers": [[[100, 200], [120, 220], [140, 240]]], "ms": 300})
+        for bad in [{}, {"pointers": []}, {"pointers": [[]]}, {"pointers": [[[1]]]}, {"pointers": [[["1", 2]]]},
+                    {"pointers": [[[1, 1]]] * 11}, {"pointers": [[[1, 1]]], "ms": -1}]:
+            with self.assertRaises(pc.CommandError, msg=repr(bad)) as cm:
+                await ctl.handle("gesture", bad)
+            self.assertEqual(cm.exception.code, "invalid_args")
+
+    async def test_clipboard(self):
+        ctl, adb = controller()
+        self.assertEqual(await ctl.handle("clipboard_get", {}), {"text": None})
+        await ctl.handle("clipboard_set", {"text": "Grüße 👋 \"quoted\" $(x)"})
+        self.assertEqual(adb.state["clipboard"], "Grüße 👋 \"quoted\" $(x)")
+        self.assertEqual((await ctl.handle("clipboard_get", {}))["text"], "Grüße 👋 \"quoted\" $(x)")
+        await ctl.handle("clipboard_set", {"text": ""})  # an empty clip is allowed
+        res = await ctl.handle("clipboard_set", {"text": None})  # null empties the clipboard
+        self.assertEqual((res, adb.state["clipboard"]), ({"length": 0, "cleared": True}, None))
+        with self.assertRaises(pc.CommandError):
+            await ctl.handle("clipboard_set", {"text": 5})
+
+    async def test_long_text_goes_in_a_file_that_is_removed(self):
+        ctl, adb = controller()
+        text = "Ünïcödé " * 2000
+        await ctl.handle("clipboard_set", {"text": text})
+        self.assertEqual(adb.state["clipboard"], text)
+        self.assertNotIn(pc.HELPER_TEXT_REMOTE, adb.state["files"])
+        self.assertTrue(any(c[0] == "push" and c[2] == pc.HELPER_TEXT_REMOTE for c in adb.calls))
+
+    async def test_type_pastes_what_keys_cannot_type(self):
+        ctl, adb = controller()
+        res = await ctl.handle("type", {"text": "Café — 日本語 😀\nnew line"})
+        self.assertEqual(res["method"], "paste")
+        self.assertEqual(adb.state["pasted"], ["Café — 日本語 😀\nnew line"])
+        self.assertEqual(adb.inputs(), [])
+        res = await ctl.handle("type", {"text": "plain ascii", "method": "paste"})
+        self.assertEqual((res["method"], adb.state["pasted"][-1]), ("paste", "plain ascii"))
+        res = await ctl.handle("type", {"text": "plain ascii"})
+        self.assertEqual(res["method"], "keys")
+        for bad in [{"text": "café", "method": "keys"}, {"text": "x", "method": "voice"}, {"text": ""}]:
+            with self.assertRaises(pc.CommandError, msg=repr(bad)) as cm:
+                await ctl.handle("type", bad)
+            self.assertEqual(cm.exception.code, "invalid_args")
+
+    async def test_audio(self):
+        ctl, adb = controller()
+        relay = FakeRelay()
+        res = await ctl.handle("audio", {"seconds": 2.5, "source": "mic"}, relay)
+        self.assertEqual((res["seconds"], res["source"]), (2.5, "mic"))
+        self.assertEqual(relay.start()["mime"], "audio/wav")
+        self.assertTrue(relay.received().startswith(b"RIFF"))
+        self.assertIn(b"2.5s mic", relay.received())
+        self.assertNotIn(pc.AUDIO_REMOTE, adb.state["files"])
+        await ctl.handle("audio", {}, FakeRelay())  # default: 10 s of the output
+        for bad in [{"source": "speaker"}, {"seconds": 0}]:
+            with self.assertRaises(pc.CommandError, msg=repr(bad)):
+                await ctl.handle("audio", bad, FakeRelay())
+
+    async def test_wait_for_text(self):
+        ctl, adb = controller()
+        res = await ctl.handle("wait", {"for": "text", "text": "welcome", "interval_ms": 0})
+        self.assertTrue(res["met"])
+        self.assertEqual(res["element"]["text"], "Hello & welcome")
+        res = await ctl.handle("wait", {"for": "text", "text": "Search or type", "interval_ms": 0})
+        self.assertEqual(res["element"]["desc"], "Search or type URL")
+        res = await ctl.handle("wait", {"for": "text", "text": "never there", "seconds": 0.2, "interval_ms": 50})
+        self.assertFalse(res["met"])
+        self.assertFalse(any("uiautomator" in c[1] for c in adb.calls if len(c) > 1))
+        with self.assertRaises(pc.CommandError):
+            await ctl.handle("wait", {"for": "text"})
+
+    async def test_batch_with_helper_steps(self):
+        ctl, adb = controller()
+        res = await ctl.handle("batch", {"steps": [
+            {"cmd": "clipboard_set", "args": {"text": "from a batch"}},
+            {"cmd": "gesture", "args": {"pointers": [[[1, 1], [2, 2]]]}},
+            {"cmd": "clipboard_get"},
+        ]})
+        self.assertTrue(res["all_ok"])
+        self.assertEqual(res["results"][2]["result"], {"text": "from a batch"})
+
+    def test_helper_jar_matches_its_source(self):
+        """The committed jar was built from the committed source (rebuild with helper/build.py)."""
+        sys.path.insert(0, os.path.join(os.path.dirname(HERE), "helper"))
+        import build
+        self.assertEqual(build.jar_hash(pc.HELPER_JAR), build.source_hash(),
+                         "phone/helper/phone-relay-helper.jar is stale: run python phone/helper/build.py")
 
 
 class FakeSocket:

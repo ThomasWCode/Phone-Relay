@@ -17,7 +17,8 @@ These come from the owner's own instructions for working on this phone, cut down
 - The owner may be using the phone. Check `/state` and a screenshot first. If they seem to be using it (an app unrelated to your task is in front, or the screen changes between two screenshots), ask before you send input.
 - Some of the owner's apps run automations that bring another app to the front by themselves for a few seconds. Never send input while one is running: if an app you didn't open appears, wait and check again.
 - Give every input `if_foreground` with the app you mean to act on. The phone checks it in the same command as the action, so a focus change between your screenshot and your tap refuses the tap instead of landing in another app.
-- `/ui` briefly unbinds every accessibility service on the phone. Prefer screenshots, and use `/ui` only when it is worth that cost.
+- `/ui?engine=uiautomator` briefly unbinds every accessibility service on the phone; the default `/ui` does not. Use the uiautomator engine only when the default fails, and say so.
+- Text you paste goes through the clipboard, which gets its old text back afterwards. Don't leave anything of yours on it (`/clipboard`) when you're done.
 - Mute media before anything that might play sound (videos, voice notes).
 
 ## Messages, accounts and money

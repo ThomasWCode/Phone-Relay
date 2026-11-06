@@ -19,6 +19,7 @@ The design and its reasoning are in [docs/PLAN.md](docs/PLAN.md). This README co
 | `relay/` | Cloudflare Worker + SQLite-backed Durable Object (TypeScript) |
 | `relay/test/` | Worker unit tests (vitest) |
 | `phone/phone_client.py` | Phone client for Termux (Python, single file) |
+| `phone/helper/` | The helper the client runs on the phone with `app_process`: Java source, `build.py`, and the built `phone-relay-helper.jar` |
 | `phone/tests/` | Phone client unit tests, plus `fake_adb.py` |
 | `scripts/e2e_test.py` | Local end-to-end test: `wrangler dev` + phone client + fake adb |
 | `docs/AGENT_INSTRUCTIONS.md` | Instructions to give Claude |
@@ -158,10 +159,10 @@ All endpoints need `Authorization: Bearer <AGENT_TOKEN>`, which the network secr
 |---|---|
 | `GET /state` | foreground, awake, battery, screen, client version |
 | `GET /screenshot?scale=0.5` | JPEG (PNG if Pillow is missing on the phone). Headers `X-Image-*`, `X-Screen-*`, `X-Scale`, `X-Foreground` |
-| `GET /ui` | Every element on the screen, every package. Runs `uiautomator dump`, which unbinds every accessibility service on the phone for a moment |
+| `GET /ui?engine=` | Every element on the screen, every package, through the helper (accessibility services stay bound). `engine=uiautomator` runs `uiautomator dump`, which unbinds every accessibility service on the phone for a moment |
 | `POST /tap` `{x,y,scale?}` | Any coordinates |
 | `POST /swipe` `{x1,y1,x2,y2,ms?,scale?}` | `ms` from 0 |
-| `POST /type` `{text}` | ASCII of any length; `\n` and `\t` become Enter and Tab; the reply gives the focused field's package, `inputType` and whether it is a password field |
+| `POST /type` `{text,method?}` | Any text: ASCII as keys (`\n` and `\t` become Enter and Tab), the rest pasted through the clipboard; the reply gives the method, the focused field's package, `inputType` and whether it is a password field |
 | `POST /key` `{key,longpress?}` | back, home, recents, enter, tab, delete, any `KEYCODE_*` name or key number |
 | `POST /launch` `{package}` | Any installed app |
 | `POST /open` `{url,package?}` | Any URL: web pages, `mailto:` links, deep links |
@@ -173,12 +174,26 @@ All endpoints need `Authorization: Bearer <AGENT_TOKEN>`, which the network secr
 | `POST /batch` `{steps,stop_on_error?}` | Several commands, with sleeps, in one request |
 | `GET /files?path=`, `GET /files/pull?path=`, `POST /files/push?path=` | List, download and upload files of any size, streamed in acknowledged 256 KiB chunks |
 | `GET /record?seconds=`, `POST /record/start`, `POST /record/stop` | Screen recording (MP4; a zip of segments past 180 s) |
+| `POST /gesture` `{pointers,ms?,scale?}` | Multi-touch: up to 10 fingers, each along a path |
+| `GET /clipboard`, `POST /clipboard` `{text}` | Read or set the clipboard |
+| `GET /audio?seconds=&source=` | The sound output or the microphone, as WAV |
 
 Every endpoint also takes `if_foreground` (run only while that app, or one of a list, has focus, checked in the same shell command as the action) and `timeout` (seconds, no upper limit; default 30). Unknown fields are dropped and named in `ignored_fields`.
 
-Errors: 400 `invalid_args`, 401 `unauthorized`, 404 (`not_found` for files), 405, 409 `foreground_mismatch`, 422 `launch_failed`, 503 `device_offline` / `disabled` / `stopped`, 504 `timeout` / `device_timeout`, 502 other device errors.
+Errors: 400 `invalid_args`, 401 `unauthorized`, 404 (`not_found` for files), 405, 409 `foreground_mismatch`, 422 `launch_failed`, 503 `device_offline` / `disabled` / `stopped`, 504 `timeout` / `device_timeout`, 502 other device errors (`helper_failed` among them).
 
 The full list of what the agent can do, what is actively restricted and what is just not built is in [docs/CAPABILITIES.md](docs/CAPABILITIES.md).
+
+### The helper
+
+`phone/helper/phone-relay-helper.jar` is committed, so neither Termux nor a PC running the client needs the Android SDK. To rebuild it after changing `phone/helper/src/` (needs a JDK 17+ and the Android SDK's platform and build-tools; `ANDROID_HOME` or the usual install folder):
+
+```bash
+python phone/helper/build.py          # writes the jar; commit it with the source
+python phone/helper/build.py --check  # is the committed jar built from the committed source?
+```
+
+The build is reproducible (fixed timestamps), and a unit test fails if the jar was not rebuilt after a source change.
 
 ## 6. Tests
 
@@ -208,6 +223,8 @@ What the end-to-end test covers: token separation (agent, device and admin token
 
 CI (`.github/workflows/tests.yml`) runs all three on every pull request.
 
+Checked on a Galaxy S24 (Android 17) through the whole stack (`wrangler dev`, the phone client on a PC over wireless adb, HTTP as an agent sends it), after the allowlist was removed, every input with `if_foreground`: opening a URL and an intent, `/wait` for the foreground, a settled screen and text, screenshots, the helper's UI tree in Chrome with every accessibility service still bound during and after it, tapping and typing in Chrome's address bar (keys, then pasted Unicode, with the clipboard's old text back afterwards), setting, reading and emptying the clipboard, a two-finger pinch both ways, `/record/start`-`/record/stop` and `/record?seconds=`, 2 s of audio from the output and from the microphone, rotation to landscape and back, the shade, notifications, a 3 MB push and pull, a batch, `if_foreground` refusing, an unresolvable URL (422) and a timeout (504). Afterwards: no crash in logcat, the accessibility services enabled and bound, nothing left in `/data/local/tmp`. On that phone, `am` exits 1 for an unresolvable intent, `sha256sum` exits 1 for a missing file, and the helper needed the ActivityThread's ConfigurationController filled in for the clipboard and audio; the code allows for all three.
+
 Checked on a Galaxy S24 (Android 17) with real input in Chrome and Gmail, before the allowlist was removed:
 - the self-test;
 - taps, swipes and typing (`%` and `%s` included);
@@ -225,7 +242,8 @@ Not yet tested, because it needs the real phone and account (phase 4 of the plan
 
 - **No allowlist**: the agent can do anything a person holding the unlocked phone can do, in any app (banking, messaging, Settings included), and press any key, power included. What stands between a session and the phone is the agent token (held by the network secret, never inside the session), the kill switches and the owner's rules in [docs/PHONE_RULES.md](docs/PHONE_RULES.md), which are guidance only.
 - **`if_foreground`**: the old allowlist's same-command guard, now opt-in. `if <named app focused and screen awake>; then <action>; else echo PHONE_RELAY_REFUSED; fi` runs on the phone, so a focus change between the agent's check and its action is refused. A change in the milliseconds inside that one command is still possible. Focused in-app popups (`PopupWindow:…`) count for the app in `mFocusedApp`.
-- **`uiautomator`**: only `/ui` runs `uiautomator dump`, which briefly unbinds every accessibility service on the phone. Nothing else calls it, including `--selftest`.
+- **`uiautomator`**: only `/ui?engine=uiautomator` runs `uiautomator dump`, which briefly unbinds every accessibility service on the phone. The default `/ui`, and `/wait` for text, use the helper, which leaves them bound. Nothing else calls uiautomator, including `--selftest`.
+- **The helper** runs as the shell user (`app_process`), with the shell's permissions: input injection, window content, the clipboard, audio capture. `--selftest` pushes it and runs its `version` command. Pasting puts the old clipboard text back after half a second; if Android refuses the helper's clipboard read, the paste still works but the old text is not restored. Capturing the sound output silences the phone's own speaker while it runs.
 - **Notifications**: a heads-up notification from another app can appear in a screenshot. Turn on Do Not Disturb during agent sessions if that matters.
 - **Password fields**: the agent can type into them and tap the keyboard over them. The reply to `/type` says when the focused field is a password field.
 - **Timeouts**: each command has a deadline (default 30 s; the agent can set any). The phone kills the adb call when it passes, so a hung command does not block the queue; the relay waits 10 s longer for a reply before giving up.

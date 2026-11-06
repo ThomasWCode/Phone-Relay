@@ -5,7 +5,7 @@
 import { isAuthorised } from "./auth";
 import { DOC_ROUTES, NOTES_DOC, renderDoc, withNotes } from "./docs";
 import { json } from "./http";
-import { AGENT_ROUTES, parseBody, validateCommand } from "./validate";
+import { findRoute, parseBody, validateCommand } from "./validate";
 import type { DeviceHub } from "./device";
 
 export { DeviceHub } from "./device";
@@ -67,9 +67,9 @@ export default {
       });
     }
 
-    const route = AGENT_ROUTES[path];
+    const route = findRoute(path, request.method);
     if (!route) return json(404, { ok: false, error: "not_found" });
-    if (request.method !== route.method) return json(405, { ok: false, error: "method_not_allowed" });
+    if (route === "method") return json(405, { ok: false, error: "method_not_allowed" });
 
     let body: Record<string, unknown> | null = null;
     if (route.method === "POST" && !route.raw) {
