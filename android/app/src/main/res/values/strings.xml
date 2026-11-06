@@ -7,4 +7,10 @@
     <string name="notification_title">Phone Relay is on</string>
     <string name="turn_off">Turn off</string>
     <string name="off">Off</string>
+    <string name="pairing_channel">Pairing</string>
+    <string name="pairing_title">Pair Phone Relay\'s shell</string>
+    <string name="pairing_how">In Wireless debugging, tap Pair device with pairing code, then come back here and type the code.</string>
+    <string name="pairing_code">Pairing code</string>
+    <string name="pairing_digits">The code is six digits: try again.</string>
+    <string name="pairing_done">Paired: the shell bridge is ready.</string>
 </resources>

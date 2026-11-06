@@ -37,7 +37,7 @@ class CommandsTest {
         assertEquals("android-app", st.str("client"))
         assertEquals(87, st["battery"]!!.jsonPrimitive.int)
         assertTrue(st["capabilities"]!!.jsonArray.map { it.jsonPrimitive.content }.containsAll(listOf("tap", "type", "pull")))
-        assertTrue("chrome_eval" !in st["capabilities"]!!.jsonArray.map { it.jsonPrimitive.content })
+        assertTrue("chrome_eval" in st["capabilities"]!!.jsonArray.map { it.jsonPrimitive.content }) // through the shell bridge
     }
 
     @Test
@@ -194,9 +194,80 @@ class CommandsTest {
     }
 
     @Test
-    fun adbOnlyCommandsAreUnsupported() = runTest {
-        for (cmd in listOf("chrome_eval", "chrome_tabs")) assertEquals("unsupported", error(cmd).code, cmd)
+    fun unknownCommandsAreRefused() = runTest {
         assertEquals("invalid_args", error("shell").code)
+    }
+
+    @Test
+    fun theShellBridgePressesAnyKeyAndTypesWithNoField() = runTest {
+        device.shellPaired = true
+        run("key", """{"key": "KEYCODE_CAMERA"}""")
+        assertEquals("input keyevent KEYCODE_CAMERA", device.shellCommands.last())
+        run("key", """{"key": "KEYCODE_CAMERA", "longpress": true}""")
+        assertEquals("input keyevent --longpress KEYCODE_CAMERA", device.shellCommands.last())
+        device.field = null
+        run("key", """{"key": "KEYCODE_A"}""") // no field: a key press, where the app would have typed into one
+        assertEquals("input keyevent KEYCODE_A", device.shellCommands.last())
+        run("key", """{"key": "back"}""") // what the app can do itself stays its own
+        assertEquals(3, device.shellCommands.size)
+        val typed = run("type", """{"text": "a b%s\n"}""")
+        assertEquals("shell", typed.str("via"))
+        assertEquals("input text 'a%sb%' && input text 's' && input keyevent KEYCODE_ENTER", device.shellCommands.last())
+        assertEquals("no_text_field", error("type", """{"text": "é"}""").code) // not ASCII: needs a field
+        assertEquals("no_text_field", error("type", """{"text": "x", "method": "paste"}""").code)
+        device.shellPaired = false
+        val e = error("key", """{"key": "KEYCODE_CAMERA"}""")
+        assertEquals("unsupported", e.code)
+        assertTrue("shell bridge" in e.detail, e.detail)
+        assertEquals("no_text_field", error("type", """{"text": "abc"}""").code)
+    }
+
+    @Test
+    fun theForegroundGuardHoldsThroughTheShellBridgesSetup() = runTest {
+        device.shellPaired = true
+        device.field = null
+        // The owner switches apps while the bridge is being set up: nothing is typed or pressed.
+        device.duringShellSetup = { device.fg = "com.example.other" }
+        for ((cmd, a) in listOf("type" to """{"text": "abc"""", "key" to """{"key": "KEYCODE_CAMERA"""")) {
+            assertEquals("foreground_mismatch", error(cmd, "$a, \"if_foreground\": \"com.android.chrome\"}").code, cmd)
+        }
+        device.fg = "com.android.chrome"
+        assertTrue(device.shellCommands.isEmpty(), device.shellCommands.toString())
+        // Long text goes in several commands; the guard is checked before each, not once.
+        device.duringShellSetup = null
+        var calls = 0
+        device.duringShellSetup = { if (++calls == 2) device.fg = "com.example.other" }
+        val long = "x".repeat(5000)
+        assertEquals("foreground_mismatch", error("type", """{"text": "$long", "if_foreground": "com.android.chrome"}""").code)
+        assertEquals(1, device.shellCommands.size) // the first chunk went; the second was refused
+    }
+
+    @Test
+    fun chromeDevToolsThroughTheShellBridge() = runTest {
+        assertEquals("shell_unavailable", error("chrome_tabs").code)
+        device.shellPaired = true
+        assertEquals(listOf("chrome_devtools_remote", "webview_devtools_remote_4321"), run("chrome_sockets")["sockets"]!!.jsonArray.map { it.jsonPrimitive.content })
+        assertEquals(3, run("chrome_tabs")["count"]!!.jsonPrimitive.int)
+        val value = run("chrome_eval", """{"expression": "1+1"}""")
+        assertEquals(JsonPrimitive(false), value["threw"])
+        assertEquals(2, value["value"]!!.jsonPrimitive.int)
+        assertEquals("/devtools/page/A", device.chrome.calls.last().first) // the first page by default
+        val threw = run("chrome_eval", """{"expression": "throw 1", "tab": 1}""")
+        assertEquals("1", threw.str("exception"))
+        assertEquals("/devtools/page/B", device.chrome.calls.last().first)
+        run("chrome_cdp", """{"method": "Browser.getVersion", "tab": "browser"}""")
+        assertEquals("/devtools/browser" to "Browser.getVersion", device.chrome.calls.last().let { it.first to it.second })
+        val created = run("chrome_new", """{"url": "https://example.org/new"}""")
+        assertEquals("NEW", created["tab"]!!.jsonObject.str("id"))
+        assertEquals("Target is closing", run("chrome_close", """{"tab": "NEW"}""").str("reply"))
+        assertEquals("Target activated", run("chrome_activate", """{"tab": "A"}""").str("reply"))
+        assertEquals("webview_devtools_remote_4321", run("chrome_tabs", """{"socket": "webview_devtools_remote_4321"}""").let { device.devtoolsSockets.last() })
+        for ((cmd, bad) in listOf(
+            "chrome_cdp" to """{"method": "nodot"}""", "chrome_cdp" to """{"method": "A.b", "params": [1]}""",
+            "chrome_tabs" to """{"socket": "a b"}""", "chrome_eval" to """{"expression": "1", "tab": "x y"}""",
+            "chrome_activate" to """{"tab": "browser"}""",
+        )) assertEquals("invalid_args", error(cmd, bad).code, "$cmd $bad")
+        assertEquals("not_found", error("chrome_eval", """{"expression": "1", "tab": 9}""").code)
     }
 
     @Test
@@ -503,5 +574,19 @@ class ConsentTest {
         assertEquals(byId, Consent.startButton(prompt(start = byId), "Phone Relay"))
         val notClickable = FakeDevice.node(Consent.SYSTEM_UI, "Start")
         assertEquals(null, Consent.startButton(prompt(start = notClickable), "Phone Relay"))
+    }
+}
+
+class ShellTextTest {
+    @Test
+    fun typesAsTheAdbClientDoes() {
+        assertEquals("'it'\\''s%sok'", ShellText.escape("it's ok"))
+        assertEquals("input text '100%'", ShellText.inputText("100%"))
+        assertEquals("input text 'a%' && input text 's%sb'", ShellText.inputText("a%s b"))
+        assertEquals(listOf("input text 'a' && input keyevent KEYCODE_TAB && input text 'b'"), ShellText.commands("a\tb"))
+        assertEquals(listOf("input keyevent KEYCODE_ENTER && input keyevent KEYCODE_ENTER"), ShellText.commands("\r\n\r"))
+        assertEquals(2, ShellText.commands("x".repeat(5000)).size) // chunks of 1000, joined while short
+        assertTrue(ShellText.canType("a\nb"))
+        assertTrue(!ShellText.canType("é") && !ShellText.canType("") && !ShellText.canType("a\u0007"))
     }
 }

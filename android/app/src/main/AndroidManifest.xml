@@ -30,6 +30,11 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- The shell bridge: wireless debugging switched back on when Android turned it off (granted
+         once over adb: pm grant ... WRITE_SECURE_SETTINGS). -->
+    <uses-permission
+        android:name="android.permission.WRITE_SECURE_SETTINGS"
+        tools:ignore="ProtectedPermissions" />
 
     <application
         android:name=".RelayApp"
@@ -113,6 +118,11 @@
                 android:name="android.service.quicksettings.TOGGLEABLE_TILE"
                 android:value="true" />
         </service>
+
+        <!-- The pairing code, typed into the pairing notification. -->
+        <receiver
+            android:name=".PairingReceiver"
+            android:exported="false" />
 
         <receiver
             android:name=".BootReceiver"
