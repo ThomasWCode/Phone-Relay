@@ -8,6 +8,8 @@
   "compatibility_date": "2026-10-01",
   "workers_dev": true,
   "preview_urls": false,
+  // Bundle the agent docs (../docs/*.md) as text so the Worker can serve them.
+  "rules": [{ "type": "Text", "globs": ["**/*.md"], "fallthrough": true }],
   "durable_objects": {
     "bindings": [{ "name": "DEVICE_HUB", "class_name": "DeviceHub" }]
   },

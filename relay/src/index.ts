@@ -3,6 +3,7 @@
 // WebSocket.
 
 import { isAuthorised } from "./auth";
+import { DOC_ROUTES, renderDoc } from "./docs";
 import { json } from "./http";
 import { AGENT_ROUTES, parseBody, validateCommand } from "./validate";
 import type { DeviceHub } from "./device";
@@ -55,6 +56,14 @@ export default {
 
     // Everything else needs the agent token, including unknown paths.
     if (!(await isAuthorised(request, env.AGENT_TOKEN))) return unauthorised();
+
+    // Agent docs: served by the Worker itself, not the phone.
+    if (path in DOC_ROUTES) {
+      if (request.method !== "GET") return json(405, { ok: false, error: "method_not_allowed" });
+      return new Response(renderDoc(DOC_ROUTES[path], url.host), {
+        headers: { "Content-Type": "text/markdown; charset=utf-8", "Cache-Control": "no-store" },
+      });
+    }
 
     const route = AGENT_ROUTES[path];
     if (!route) return json(404, { ok: false, error: "not_found" });
