@@ -35,6 +35,7 @@ The owner's rules in [PHONE_RULES.md](PHONE_RULES.md) and the rules in [AGENT_IN
 - **Send any intent** (`/intent`): start an activity or send a broadcast with an action, data, MIME type, component, package, categories, flags and typed extras (a particular Settings screen, a share to an app, ...).
 - **Use** any app, Settings, the notification shade and quick settings, and the lock screen's own controls. Unlocking a locked phone needs its PIN or biometrics, which the agent does not have.
 - In a browser, anything a person can do by touch and typing: open any URL, use sites where the phone is signed in, download files, pick saved passwords from the browser's own autofill dropdown.
+- **Chrome's pages from the inside**, through Chrome DevTools (`/chrome/*`): list the tabs, run JavaScript in any tab and get its value (`/chrome/eval`), call any DevTools protocol method on a tab or the browser (`/chrome/cdp`: navigate, read the DOM, cookies and storage, network, screenshots of a page, input events, ...), and open, bring to front or close tabs. The page's own session applies: what the signed-in user's Chrome can do, the script can do. Chrome lists no tabs while it is in the background with its pages frozen; bring it to the front first. Debuggable WebViews in other apps have DevTools sockets too (`/chrome/sockets`), usable with `socket=`.
 - In email and messaging apps: read, search, compose, send, forward, delete, switch accounts.
 
 ### Clipboard
@@ -77,9 +78,6 @@ Requests are still checked for shape, in the Worker and again on the phone: numb
 
 Typed text is never logged, only its length. That limits what is recorded, not what the agent can do.
 
-## Not built (nothing prevents it)
+## Not built
 
-| Capability | How it could be added |
-|---|---|
-| Chrome page DOM and JavaScript | Chrome DevTools over `adb forward ... localabstract:chrome_devtools_remote`; powerful, would let the agent read and script pages directly |
-| Status page for the owner | `/admin/status` covers this for now |
+Nothing from the earlier list is left. The owner dropped these rather than have them built: the phase 5 native app, the phase 6 MCP wrapper and custom domain, and a status page for the owner (`/admin/status` and `/admin/log` give the same information).

@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 
 import fake_adb  # noqa: E402
+import fake_devtools  # noqa: E402
 import phone_client as pc  # noqa: E402
 
 logging.getLogger("asyncio").setLevel(logging.WARNING)  # quiet asyncio debug mode in async tests
@@ -61,6 +62,11 @@ class InProcessAdb:
             if code:
                 raise pc.CommandError("adb_failed", err)
             return b""
+        if args[0] == "forward":
+            code, out = fake_adb.forward(list(args), self.state)
+            if code:
+                raise pc.CommandError("adb_failed", "forward failed")
+            return out.encode()
         cmd = " ".join(args[1:])
         m = fake_adb.GUARD_RE.match(cmd)
         if m is None:
@@ -1313,6 +1319,102 @@ class HelperTests(unittest.IsolatedAsyncioTestCase):
         import build
         self.assertEqual(build.jar_hash(pc.HELPER_JAR), build.source_hash(),
                          "phone/helper/phone-relay-helper.jar is stale: run python phone/helper/build.py")
+
+
+class DevToolsTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.devtools = fake_devtools.FakeDevTools()
+        await self.devtools.start()
+        self.ctl, self.adb = controller({"devtools_port": self.devtools.port})
+
+    async def asyncTearDown(self):
+        await self.devtools.stop()
+
+    def no_forward_left(self):
+        self.assertEqual(self.adb.state.get("forwards"), [])
+
+    async def test_sockets(self):
+        res = await self.ctl.handle("chrome_sockets", {})
+        self.assertEqual(res["sockets"], ["chrome_devtools_remote", "webview_devtools_remote_4321"])
+
+    async def test_tabs(self):
+        res = await self.ctl.handle("chrome_tabs", {})
+        self.assertEqual(res["count"], 3)
+        self.assertEqual(res["tabs"][0], {"id": "T1", "type": "page", "title": "Example", "url": "https://example.com/"})
+        self.no_forward_left()
+
+    async def test_eval_in_the_front_tab_and_by_id_or_index(self):
+        res = await self.ctl.handle("chrome_eval", {"expression": "1+1"})
+        self.assertEqual(res, {"threw": False, "type": "number", "value": 2, "description": "2"})
+        path, method, params = self.devtools.calls[-1]
+        self.assertEqual((path, method), ("/devtools/page/T1", "Runtime.evaluate"))
+        self.assertTrue(params["returnByValue"] and params["awaitPromise"])
+        self.assertEqual((await self.ctl.handle("chrome_eval", {"expression": "document.title", "tab": "T2"}))["value"], "Other")
+        self.assertEqual((await self.ctl.handle("chrome_eval", {"expression": "document.title", "tab": 1}))["value"], "Other")
+        self.no_forward_left()
+
+    async def test_eval_exception(self):
+        res = await self.ctl.handle("chrome_eval", {"expression": "throw boom"})
+        self.assertEqual(res, {"threw": True, "exception": "Error: boom"})
+
+    async def test_cdp_any_method_on_a_tab_or_the_browser(self):
+        res = await self.ctl.handle("chrome_cdp", {"method": "Page.navigate", "params": {"url": "https://example.net/"}})
+        self.assertEqual(res["result"], {"echo": {"url": "https://example.net/"}, "target": "/devtools/page/T1"})
+        res = await self.ctl.handle("chrome_cdp", {"method": "Target.getTargets", "tab": "browser"})
+        self.assertEqual(res["result"]["target"], "/devtools/browser")
+        with self.assertRaises(pc.CommandError) as cm:
+            await self.ctl.handle("chrome_cdp", {"method": "Nope.missing"})
+        self.assertEqual(cm.exception.code, "devtools_failed")
+        self.assertIn("wasn't found", cm.exception.detail)
+        self.no_forward_left()
+
+    async def test_new_activate_close(self):
+        res = await self.ctl.handle("chrome_new", {"url": "https://example.net/a b?x=1&y=2"})
+        self.assertEqual(res["tab"]["url"], "https://example.net/a b?x=1&y=2")
+        new_id = res["tab"]["id"]
+        self.assertIn(("/devtools/browser", "Target.createTarget", {"url": "https://example.net/a b?x=1&y=2"}),
+                      self.devtools.calls)
+        res = await self.ctl.handle("chrome_new", {"url": "https://example.net/#/settings?tab=2"})  # a hash route
+        self.assertEqual(res["tab"]["url"], "https://example.net/#/settings?tab=2")
+        await self.ctl.handle("chrome_close", {"tab": res["tab"]["id"]})
+        self.assertIn("activated", (await self.ctl.handle("chrome_activate", {"tab": new_id}))["reply"])
+        res = await self.ctl.handle("chrome_close", {"tab": new_id})
+        self.assertEqual(res["tab"], new_id)
+        self.assertNotIn(new_id, [t["id"] for t in self.devtools.tabs])
+        self.no_forward_left()
+
+    async def test_refusals(self):
+        for cmd, args, code in [
+            ("chrome_eval", {"expression": "1", "tab": 9}, "not_found"),
+            ("chrome_eval", {"expression": "1", "tab": "T9"}, "not_found"),
+            ("chrome_eval", {"expression": "1", "tab": "a b"}, "invalid_args"),
+            ("chrome_eval", {}, "invalid_args"),
+            ("chrome_eval", {"expression": "1", "await_promise": "no"}, "invalid_args"),
+            ("chrome_cdp", {"method": "navigate"}, "invalid_args"),
+            ("chrome_cdp", {"method": "Page.navigate", "params": []}, "invalid_args"),
+            ("chrome_close", {"tab": "browser"}, "invalid_args"),
+            ("chrome_tabs", {"socket": "bad name!"}, "invalid_args"),
+        ]:
+            with self.assertRaises(pc.CommandError, msg=f"{cmd} {args}") as cm:
+                await self.ctl.handle(cmd, args)
+            self.assertEqual(cm.exception.code, code, f"{cmd} {args}")
+        self.no_forward_left()
+
+    async def test_chrome_not_running(self):
+        await self.devtools.stop()
+        with self.assertRaises(pc.CommandError) as cm:
+            await self.ctl.handle("chrome_tabs", {})
+        self.assertEqual(cm.exception.code, "devtools_unavailable")
+        self.no_forward_left()
+        await self.devtools.start()  # for asyncTearDown
+
+    async def test_guarded_and_in_a_batch(self):
+        with self.assertRaises(pc.CommandError) as cm:
+            await self.ctl.handle("chrome_eval", {"expression": "1", "if_foreground": "com.android.settings"})
+        self.assertEqual(cm.exception.code, "foreground_mismatch")
+        res = await self.ctl.handle("batch", {"steps": [{"cmd": "chrome_tabs"}, {"cmd": "chrome_eval", "args": {"expression": "1+1"}}]})
+        self.assertTrue(res["all_ok"])
+        self.assertEqual(res["results"][1]["result"]["value"], 2)
 
 
 class FakeSocket:

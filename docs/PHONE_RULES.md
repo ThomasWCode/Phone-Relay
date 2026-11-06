@@ -18,6 +18,7 @@ These come from the owner's own instructions for working on this phone, cut down
 - Some of the owner's apps run automations that bring another app to the front by themselves for a few seconds. Never send input while one is running: if an app you didn't open appears, wait and check again.
 - Give every input `if_foreground` with the app you mean to act on. The phone checks it in the same command as the action, so a focus change between your screenshot and your tap refuses the tap instead of landing in another app.
 - `/ui?engine=uiautomator` briefly unbinds every accessibility service on the phone; the default `/ui` does not. Use the uiautomator engine only when the default fails, and say so.
+- Chrome DevTools (`/chrome/*`) acts inside the owner's real, signed-in Chrome: never read or change cookies, saved passwords, or storage of sites other than the one the task is about.
 - Text you paste goes through the clipboard, which gets its old text back afterwards. Don't leave anything of yours on it (`/clipboard`) when you're done.
 - Mute media before anything that might play sound (videos, voice notes).
 

@@ -105,6 +105,10 @@ def main():
         cwd=RELAY, stdout=wrangler_log, stderr=subprocess.STDOUT, **new_group,
     )
     client = None
+    # A fake Chrome DevTools endpoint; the fake adb's `forward` points at it.
+    devtools = subprocess.Popen([sys.executable, os.path.join(PHONE, "tests", "fake_devtools.py")],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    set_fake(state_path, devtools_port=int(devtools.stdout.readline()))
     try:
         ok = wait_for(lambda: request("GET", "/state", token=None)[0] == 401, timeout=90)
         check("wrangler dev started", ok, f"see {wrangler_log.name}")
@@ -318,6 +322,28 @@ def main():
         s, _, b = request("POST", "/wait", body={"for": "text", "text": "welcome"})
         check("wait for text on the screen", s == 200 and j(b).get("met") is True, f"{s} {b[:200]}")
 
+        # ---- Chrome DevTools ----
+        s, _, b = request("GET", "/chrome/sockets")
+        check("DevTools sockets", s == 200 and "chrome_devtools_remote" in j(b).get("sockets", []), f"{s} {b[:200]}")
+        s, _, b = request("GET", "/chrome/tabs")
+        check("Chrome tabs", s == 200 and j(b).get("count") == 3, f"{s} {b[:200]}")
+        s, _, b = request("POST", "/chrome/eval", body={"expression": "evalsecret && 1+1"})
+        check("JavaScript in the front tab", s == 200 and j(b).get("value") == 2 and j(b).get("threw") is False,
+              f"{s} {b[:200]}")
+        s, _, b = request("POST", "/chrome/eval", body={"expression": "document.title", "tab": 1})
+        check("JavaScript in another tab", s == 200 and j(b).get("value") == "Other", f"{s} {b[:200]}")
+        s, _, b = request("POST", "/chrome/cdp", body={"method": "Page.navigate", "params": {"url": "https://example.net/"}})
+        check("a raw DevTools call", s == 200 and j(b).get("result", {}).get("echo") == {"url": "https://example.net/"},
+              f"{s} {b[:200]}")
+        s, _, b = request("POST", "/chrome/new", body={"url": "https://example.net/"})
+        new_id = (j(b).get("tab") or {}).get("id")
+        check("open a tab", s == 200 and new_id, f"{s} {b[:200]}")
+        check("close it", request("POST", "/chrome/close", body={"tab": new_id})[0] == 200)
+        s, _, b = request("POST", "/chrome/eval", body={"expression": "1", "tab": 9})
+        check("no such tab -> 404", s == 404 and j(b).get("error") == "not_found", f"{s} {b[:200]}")
+        st = json.load(open(state_path))
+        check("no adb forward left behind", st.get("forwards") == [], str(st.get("forwards")))
+
         # ---- files ----
         s, _, b = request("GET", "/files?path=/sdcard/Download")
         check("list a folder", s == 200 and [e["name"] for e in j(b).get("entries", [])] == ["a.txt"], f"{s} {b[:200]}")
@@ -355,7 +381,7 @@ def main():
         entries = j(b).get("entries", [])
         check("admin log readable", s == 200 and len(entries) > 10, f"{s}")
         check("typed text not logged", b"hello world" not in b and b"hunter2" not in b and b"batchsecret" not in b
-              and b"intentsecret" not in b and b"clipsecret" not in b)
+              and b"intentsecret" not in b and b"clipsecret" not in b and b"evalsecret" not in b)
         check("type logged as length", any(e.get("action") == "type" and e.get("detail") == {"length": 11} for e in entries))
 
         # ---- kill switch (admin) ----
@@ -386,6 +412,7 @@ def main():
                              env={**env, "DEVICE_TOKEN": "y" * 64}, capture_output=True, timeout=30)
         check("bad device token -> client exits 2", bad.returncode == 2, bad.stderr.decode()[-300:])
     finally:
+        devtools.kill()
         if client and client.poll() is None:
             client.terminate()
             client.wait(timeout=10)

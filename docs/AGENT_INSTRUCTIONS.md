@@ -29,6 +29,8 @@ curl -sS "$R/record?seconds=5" -o /tmp/screen.mp4
 curl -sS -X POST $R/gesture -H 'Content-Type: application/json' -d '{"pointers":[[[540,1100],[540,700]],[[540,1300],[540,1700]]],"ms":400}'   # pinch out
 curl -sS -X POST $R/type   -H 'Content-Type: application/json' -d '{"text":"Grüße 👋"}'   # pasted: not ASCII
 curl -sS $R/clipboard
+curl -sS $R/chrome/tabs
+curl -sS -X POST $R/chrome/eval -H 'Content-Type: application/json' -d '{"expression":"document.title"}'
 ```
 
 ## Endpoints
@@ -57,6 +59,11 @@ curl -sS $R/clipboard
 | `POST /record/start {seconds?,size?,bit_rate?}`, `POST /record/stop` | Record around other commands: start, act, then stop returns the video. `seconds` (default 10) is the most it records |
 | `POST /gesture {pointers,ms?,scale?}` | Several fingers at once: `pointers` is a list of paths, each a list of `[x, y]` points; every finger goes down at its first point, follows its path over `ms` (default 300) and lifts |
 | `GET /clipboard`, `POST /clipboard {text}` | Read the clipboard's text (`null` if none), or set it; `"text": null` empties it |
+| `GET /chrome/tabs` | Chrome's targets: `id`, `type` (`page` for a tab), `title`, `url`. Empty while Chrome is in the background: `/launch` it first |
+| `POST /chrome/eval {expression,tab?,await_promise?}` | Run JavaScript in a tab (`tab`: an id, or an index into the pages; default the first, the one in front) and get its value: `threw`, `type`, `value`, or `exception` |
+| `POST /chrome/cdp {method,params?,tab?}` | Any [DevTools protocol](https://chromedevtools.github.io/devtools-protocol/) method on a tab, or on the browser with `"tab":"browser"`; the reply's `result` is DevTools' own |
+| `POST /chrome/new {url}`, `POST /chrome/activate {tab}`, `POST /chrome/close {tab}` | Open a tab, bring one to the front, close one |
+| `GET /chrome/sockets` | DevTools sockets on the phone (Chrome's, and any debuggable WebView's); every `/chrome/*` call takes `socket=` for another one |
 | `GET /audio?seconds=&source=` | Record `seconds` (default 10) of the phone's sound output (`source=output`, the default; it is silent on the phone meanwhile) or its microphone (`source=mic`), as WAV |
 
 Every endpoint also takes:
@@ -85,6 +92,7 @@ What you can and cannot do, in full: [CAPABILITIES.md](CAPABILITIES.md). From th
 | 409 | `foreground_mismatch` | The app you named with `if_foreground` was not in front (or the screen was off). Take a screenshot and work out why before you retry |
 | 422 | `launch_failed` | Nothing on the phone handles that URL or intent |
 | 502 | `helper_failed`, `helper_missing` | The helper could not do it (its reason is in `detail`). Tell the user; for `/ui`, `engine=uiautomator` is the fallback |
+| 502 | `devtools_unavailable`, `devtools_failed` | Chrome is not running or not in front (`/launch` it), or DevTools refused the call (`detail` has its error) |
 | 503 | `device_offline`, `disabled`, `stopped` | Stop and tell the user |
 | 504 | `timeout`, `device_timeout` | The command ran past its deadline. Retry once, with a larger `timeout` if the work is slow, then tell the user |
 | 502 | other device error | Retry once, then tell the user |
