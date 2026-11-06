@@ -64,7 +64,7 @@ curl -sS -X POST $R/chrome/eval -H 'Content-Type: application/json' -d '{"expres
 | `POST /chrome/cdp {method,params?,tab?}` | Any [DevTools protocol](https://chromedevtools.github.io/devtools-protocol/) method on a tab, or on the browser with `"tab":"browser"`; the reply's `result` is DevTools' own |
 | `POST /chrome/new {url}`, `POST /chrome/activate {tab}`, `POST /chrome/close {tab}` | Open a tab, bring one to the front, close one |
 | `GET /chrome/sockets` | DevTools sockets on the phone (Chrome's, and any debuggable WebView's); every `/chrome/*` call takes `socket=` for another one |
-| `GET /audio?seconds=&source=` | Record `seconds` (default 10) of the phone's sound output (`source=output`, the default; with the adb client it is silent on the phone meanwhile) or its microphone (`source=mic`), as WAV |
+| `GET /audio?seconds=&source=` | Record `seconds` (default 10) of the phone's sound output (`source=output`, the default; with the adb client it is silent on the phone meanwhile; with the app, sound already playing when the capture starts can stay out of it: have the playback start after it begins) or its microphone (`source=mic`), as WAV |
 
 Every endpoint also takes:
 - **`if_foreground`**: a package name or a list (on a GET, `?if_foreground=a.b,c.d`). The command runs only while one of them has focus and the screen is on, checked on the phone just before the action, so a focus change between your screenshot and your tap refuses the tap (409 `foreground_mismatch`) instead of landing in another app. Use it for every input.

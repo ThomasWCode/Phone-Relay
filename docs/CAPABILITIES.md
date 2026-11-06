@@ -71,7 +71,7 @@ The phone side is either the **Android app** (always on; it drives the phone thr
 
 ### Screen recording
 - **Record** the screen as MP4: for a set time (`/record?seconds=`), or around other commands (`/record/start`, then anything, then `/record/stop`, which returns the video). With the adb client Android stops each file at 180 s, so a longer recording comes back as a zip of consecutive MP4 segments; the app's is one MP4. The video has no sound.
-- **Audio** (`/audio`): the phone's audio output or its microphone, for a set time, as a 48 kHz stereo WAV. With the adb client the output does not play on the phone itself while it is captured; the app captures it as it plays. The microphone shows Android's privacy indicator.
+- **Audio** (`/audio`): the phone's audio output or its microphone, for a set time, as a 48 kHz stereo WAV. With the adb client the output does not play on the phone itself while it is captured; the app captures it as it plays, but only sound that starts after the capture has begun: a stream already open when it starts (a track mid-play) can stay out of it, so start or restart the playback after `/audio` begins (a delayed start from inside the page, or a track change). The microphone shows Android's privacy indicator.
 
 ### Waiting and batches
 - **Wait** (`/wait`) until the screen changes, stops changing (an animation or page load has settled), an app comes to the front, or some text appears in the UI tree. Screens are compared at 1/8 scale, so a blinking cursor does not count as a change.
