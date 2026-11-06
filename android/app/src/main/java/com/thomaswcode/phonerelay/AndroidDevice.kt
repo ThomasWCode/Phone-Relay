@@ -27,6 +27,7 @@ import android.view.WindowManager
 import android.view.accessibility.AccessibilityNodeInfo
 import com.thomaswcode.phonerelay.commands.CommandError
 import com.thomaswcode.phonerelay.commands.Device
+import com.thomaswcode.phonerelay.commands.DevToolsLink
 import com.thomaswcode.phonerelay.commands.Field
 import com.thomaswcode.phonerelay.commands.FileEntry
 import com.thomaswcode.phonerelay.commands.Frame
@@ -56,7 +57,12 @@ import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.JsonObject
 
 /** The Device the commands drive, done with the accessibility service and Android's own APIs. */
-class AndroidDevice(private val context: Context, private val capture: Capture) : Device {
+class AndroidDevice(
+    private val context: Context,
+    private val capture: Capture,
+    private val adb: AdbShell,
+    private val version: String,
+) : Device {
 
     private val service: PhoneAccessibilityService
         get() = PhoneAccessibilityService.instance
@@ -381,6 +387,19 @@ class AndroidDevice(private val context: Context, private val capture: Capture) 
     override fun ownFileSize(path: String): Long = File(path).length()
 
     override fun endCapture() = capture.end()
+
+    // ---- the shell bridge ----
+
+    override suspend fun shell(command: String): String = adb.run(command)
+
+    override suspend fun <T> devtools(socket: String, work: suspend (DevToolsLink) -> T): T {
+        val bridge = DevToolsBridge(adb, socket, version)
+        try {
+            return work(bridge)
+        } finally {
+            bridge.close()
+        }
+    }
 
     // ---- sound, power ----
 

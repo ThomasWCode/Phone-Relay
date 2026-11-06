@@ -20,10 +20,11 @@ import kotlinx.serialization.json.put
  *
  * Differences from the adb client: if_foreground is checked just before the action (the adb
  * client's check, in the same shell command, leaves a longer gap: `input` takes a moment to start);
- * typing needs a focused text field, and goes through the accessibility service's own input
- * connection to it (as a keyboard); keys are what an app can do (Keys), any key reaching a focused
- * field; recording and audio go through MediaProjection, whose consent prompt the accessibility
- * service answers; Chrome DevTools is refused as unsupported.
+ * typing goes through the accessibility service's own input connection to the focused field (as a
+ * keyboard); keys are what an app can do (Keys), any key reaching a focused field; recording and
+ * audio go through MediaProjection, whose consent prompt the accessibility service answers. What
+ * only the shell user can do (Chrome DevTools, other keys, typing with no field focused) goes
+ * through the shell bridge: the app's own adb connection to this phone (AdbShell), once paired.
  */
 class Commands(
     private val device: Device,
@@ -52,6 +53,15 @@ class Commands(
         "record_stop" to { _, s -> recordStop(s ?: noStream("record_stop")) },
         "record" to { a, s -> record(a, s ?: noStream("record")) },
         "audio" to { a, s -> audio(a, s ?: noStream("audio")) },
+        "chrome_sockets" to { _, _ ->
+            buildJsonObject { put("sockets", JsonArray(DevTools.sockets(device.shell("cat /proc/net/unix")).map { JsonPrimitive(it) })) }
+        },
+        "chrome_tabs" to { a, _ -> device.devtools(DevTools.socket(a)) { DevTools.tabs(it) } },
+        "chrome_eval" to { a, _ -> device.devtools(DevTools.socket(a)) { DevTools.eval(it, a) } },
+        "chrome_cdp" to { a, _ -> device.devtools(DevTools.socket(a)) { DevTools.cdp(it, a) } },
+        "chrome_new" to { a, _ -> device.devtools(DevTools.socket(a)) { DevTools.new(it, a) } },
+        "chrome_close" to { a, _ -> device.devtools(DevTools.socket(a)) { DevTools.tabAction(it, a, "close") } },
+        "chrome_activate" to { a, _ -> device.devtools(DevTools.socket(a)) { DevTools.tabAction(it, a, "activate") } },
         "wait" to { a, _ -> wait(a) },
         "batch" to { a, _ -> batch(a) },
         "files" to { a, _ -> files(a) },
@@ -63,9 +73,7 @@ class Commands(
     val capabilities: List<String> = handlers.keys.sorted()
 
     suspend fun handle(cmd: String, args: JsonObject, stream: Stream? = null): JsonObject {
-        val handler = handlers[cmd] ?: if (cmd in ADB_ONLY) {
-            throw CommandError("unsupported", "$cmd needs the adb client (phone/phone_client.py); the Android app cannot do it")
-        } else throw CommandError("invalid_args", "unknown command: $cmd")
+        val handler = handlers[cmd] ?: throw CommandError("invalid_args", "unknown command: $cmd")
         val packages = args.ifForeground()
         val timeout = args.timeoutArg(defaultTimeout(cmd, args))
         // Checked before the command starts; a batch checks each step instead.
@@ -202,11 +210,42 @@ class Commands(
         return "set_text"
     }
 
-    private fun type(args: JsonObject): JsonObject {
+    /** Runs a shell command (the shell bridge) for what the app cannot do; `instead` is the error without it. */
+    private suspend fun shell(command: String, instead: CommandError): String {
+        val out = try {
+            device.shell(command)
+        } catch (e: CommandError) {
+            if (e.code != "shell_unavailable") throw e
+            throw CommandError(instead.code, "${instead.detail} (the shell bridge would do it: ${e.detail})")
+        }
+        if (Regex("^(Error|Exception|java\\.)", RegexOption.MULTILINE).containsMatchIn(out)) {
+            throw CommandError("device_error", out.trim().takeLast(300))
+        }
+        return out
+    }
+
+    /** Typing with no text field focused: `input text` through the shell bridge, ASCII only, as the adb client types. */
+    private suspend fun shellType(text: String, method: String): JsonObject {
+        val noField = CommandError("no_text_field", "no text field has focus: tap one first")
+        if (method != "keys" || !ShellText.canType(text)) {
+            throw CommandError("no_text_field", "no text field has focus: tap one first (with none, only ASCII can be typed, as keys)")
+        }
+        for (command in ShellText.commands(text)) shell(command, noField)
+        return buildJsonObject {
+            put("length", text.length)
+            put("method", method)
+            put("via", "shell")
+            put("field_package", JsonNull)
+            put("field_input_type", 0)
+            put("password_field", false)
+        }
+    }
+
+    private suspend fun type(args: JsonObject): JsonObject {
         val text = args.stringArg("text")!!
         val method = args.stringArg("method", required = false) ?: "keys"
         if (method != "keys" && method != "paste") throw CommandError("invalid_args", "method must be keys or paste")
-        val first = field()
+        val first = device.focusedField() ?: return shellType(text, method)
         var via = "paste"
         if (method == "paste") {
             device.paste(text)
@@ -231,7 +270,7 @@ class Commands(
         }
     }
 
-    private fun key(args: JsonObject): JsonObject {
+    private suspend fun key(args: JsonObject): JsonObject {
         val raw = args["key"] as? JsonPrimitive ?: throw CommandError("invalid_args", "key must be a name or a number")
         val name = if (!raw.isString && raw.intOrNull != null) {
             keyName(raw.intOrNull!!) ?: throw CommandError("invalid_args", "no key ${raw.content}")
@@ -243,6 +282,18 @@ class Commands(
         if ((action.editsField || action is KeyAction.Unsupported) && device.sendKey(name)) {
             return buildJsonObject { put("key", raw) }
         }
+        try {
+            keyAction(action)
+        } catch (e: CommandError) {
+            // What the app cannot press (or has no field for) goes to the shell, as `input keyevent`.
+            if (e.code != "unsupported" && e.code != "no_text_field") throw e
+            if (!SHELL_KEY.matches(name)) throw e
+            shell("input keyevent ${if (args.boolArg("longpress", false)) "--longpress " else ""}$name", e)
+        }
+        return buildJsonObject { put("key", raw) }
+    }
+
+    private fun keyAction(action: KeyAction) {
         when (action) {
             is KeyAction.Global -> device.globalAction(action.action)
             KeyAction.ImeEnter -> device.imeEnter()
@@ -259,7 +310,6 @@ class Commands(
             KeyAction.Wake -> device.wake()
             is KeyAction.Unsupported -> throw CommandError("unsupported", action.reason)
         }
-        return buildJsonObject { put("key", raw) }
     }
 
     // ---- apps ----
@@ -552,10 +602,8 @@ class Commands(
             "state", "screenshot", "ui", "tap", "swipe", "type", "key", "launch", "open", "intent", "notifications",
             "statusbar", "rotation", "wait", "files", "gesture", "clipboard_set", "clipboard_get", "record_start", "sleep",
         )
-        /** The adb client's commands that need the shell user's privileges. */
-        val ADB_ONLY = setOf(
-            "chrome_sockets", "chrome_tabs", "chrome_eval", "chrome_cdp", "chrome_new", "chrome_close", "chrome_activate",
-        )
+        /** A key the shell may be given: a KEYCODE_* name or a number. */
+        private val SHELL_KEY = Regex("^(KEYCODE_[A-Z0-9_]{1,40}|\\d{1,4})$")
 
         /** Fraction of pixels that changed noticeably between two frames (1 for different sizes). */
         fun frameDiff(a: Frame, b: Frame): Double {

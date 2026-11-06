@@ -5,7 +5,10 @@ import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.io.OutputStream
 import kotlinx.coroutines.delay
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 
@@ -139,6 +142,23 @@ class FakeDevice : Device {
         files.remove(RECORDING)
     }
 
+    /** The shell bridge: off (not paired) unless a test pairs it; what it was told to run. */
+    var shellPaired = false
+    val shellCommands = mutableListOf<String>()
+    val devtoolsSockets = mutableListOf<String>()
+    val chrome = FakeChrome()
+    override suspend fun shell(command: String): String {
+        if (!shellPaired) throw CommandError("shell_unavailable", "pair the app with wireless debugging first")
+        shellCommands += command
+        return if (command == "cat /proc/net/unix") UNIX_SOCKETS else ""
+    }
+
+    override suspend fun <T> devtools(socket: String, work: suspend (DevToolsLink) -> T): T {
+        if (!shellPaired) throw CommandError("shell_unavailable", "pair the app with wireless debugging first")
+        devtoolsSockets += socket
+        return work(chrome)
+    }
+
     val volume = mutableListOf<Int>()
     override fun adjustVolume(direction: Int) {
         volume += direction
@@ -204,6 +224,12 @@ class FakeDevice : Device {
     }
 
     companion object {
+        const val UNIX_SOCKETS = """Num       RefCount Protocol Flags    Type St Inode Path
+0000000000000000: 00000002 00000000 00010000 0001 01 12345 @chrome_devtools_remote
+0000000000000000: 00000002 00000000 00010000 0001 01 12346 @webview_devtools_remote_4321
+0000000000000000: 00000002 00000000 00010000 0001 01 12347 @some_other_socket
+0000000000000000: 00000002 00000000 00010000 0001 01 12348 @chrome_devtools_remote
+"""
         const val RECORDING = "/data/user/0/com.thomaswcode.phonerelay/cache/record.mp4"
         const val AUDIO = "/data/user/0/com.thomaswcode.phonerelay/cache/audio.wav"
 
@@ -226,6 +252,36 @@ class FakeDevice : Device {
             override val checked = false
             override val visible = visible
             override val children = children
+        }
+    }
+}
+
+/** Chrome's DevTools endpoint in memory: two tabs, the browser target, and the calls made to it. */
+class FakeChrome : DevToolsLink {
+    val tabs = mutableListOf("A" to "https://example.org/one", "B" to "https://example.org/two")
+    val calls = mutableListOf<Triple<String, String, JsonObject>>()
+
+    override suspend fun http(path: String, method: String): JsonElement = when {
+        path == "/json/list" -> JsonArray(tabs.map { (id, url) ->
+            buildJsonObject { put("id", id); put("type", "page"); put("title", "Tab $id"); put("url", url); put("webSocketDebuggerUrl", "ws://x/devtools/page/$id") }
+        } + buildJsonObject { put("id", "W"); put("type", "service_worker"); put("title", "worker"); put("url", "https://example.org/sw.js") })
+        path == "/json/version" -> buildJsonObject { put("webSocketDebuggerUrl", "ws://127.0.0.1/devtools/browser") }
+        path.startsWith("/json/close/") -> { tabs.removeAll { it.first == path.substringAfterLast('/') }; JsonPrimitive("Target is closing") }
+        path.startsWith("/json/activate/") -> JsonPrimitive("Target activated")
+        else -> throw CommandError("devtools_failed", "$method $path: HTTP 404")
+    }
+
+    override suspend fun cdp(path: String, method: String, params: JsonObject): JsonObject {
+        calls += Triple(path, method, params)
+        return when (method) {
+            "Runtime.evaluate" -> if ((params["expression"] as JsonPrimitive).content == "throw 1") {
+                buildJsonObject { put("exceptionDetails", buildJsonObject { put("text", "Uncaught"); put("exception", buildJsonObject { put("description", "1") }) }) }
+            } else buildJsonObject { put("result", buildJsonObject { put("type", "number"); put("value", 2); put("description", "2") }) }
+            "Target.createTarget" -> {
+                tabs.add(0, "NEW" to (params["url"] as JsonPrimitive).content)
+                buildJsonObject { put("targetId", "NEW") }
+            }
+            else -> buildJsonObject { put("ok", true) }
         }
     }
 }

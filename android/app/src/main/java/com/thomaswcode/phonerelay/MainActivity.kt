@@ -146,6 +146,31 @@ private fun Screen(@Suppress("UNUSED_PARAMETER") tick: Int) {
                 Text("Both arrive over adb from the owner's computer; see the repository's README.", style = MaterialTheme.typography.bodySmall)
             }
         }
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("Shell access", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    if (app.shell.paired) "✓ Paired with wireless debugging" else "✗ Not paired",
+                    style = MaterialTheme.typography.titleSmall,
+                )
+                Text(
+                    "For Chrome DevTools, keys no app can press, and typing with no text field: the app's own connection to " +
+                        "this phone's wireless debugging (Wi-Fi only). Pair once: tap Pair, then in Wireless debugging tap " +
+                        "Pair device with pairing code, and type the code into the notification.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                Text(
+                    if (app.shell.canEnable()) "It switches wireless debugging back on by itself when Android turns it off."
+                    else "To have it switch wireless debugging back on by itself (after a reboot): adb shell pm grant " +
+                        "${context.packageName} android.permission.WRITE_SECURE_SETTINGS",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                OutlinedButton(onClick = {
+                    Pairing.ask(context)
+                    runCatching { context.startActivity(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS)) }
+                }) { Text(if (app.shell.paired) "Pair again" else "Pair") }
+            }
+        }
         Text("What the app needs", style = MaterialTheme.typography.titleMedium)
         for (grant in grants(context)) {
             Card(Modifier.fillMaxWidth()) {

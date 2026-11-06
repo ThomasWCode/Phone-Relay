@@ -3,8 +3,8 @@ package com.thomaswcode.phonerelay.commands
 /**
  * What a key does in the app. Only the shell may inject key events, so each key is done the way an
  * app can: a global action, the keyboard's action key, editing the focused field, scrolling, the
- * volume or a media key. Keys none of these can do are refused as unsupported: the adb client
- * presses any key.
+ * volume or a media key. Keys none of these can do go through the shell bridge (`input keyevent`),
+ * as the adb client presses them.
  */
 sealed class KeyAction {
     /** A key for the focused text field: pressed there as a key when the app has an input connection. */
@@ -68,7 +68,7 @@ object Keys {
             "KEYCODE_VOLUME_DOWN" -> KeyAction.Volume(-1)
             "KEYCODE_VOLUME_MUTE" -> KeyAction.Volume(101)
             else -> if (name.startsWith("KEYCODE_MEDIA_")) KeyAction.Media(name)
-            else KeyAction.Unsupported("$name cannot be pressed by the app (only the adb client injects any key)")
+            else KeyAction.Unsupported("$name needs the shell to press it")
         }
     }
 

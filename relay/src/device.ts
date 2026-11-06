@@ -24,8 +24,9 @@ const DEVICE_ERROR_STATUS: Record<string, number> = {
   no_text_field: 409, // the Android app types into a focused field only
   gesture_cancelled: 409, // Android cancelled the app's gesture (a real touch, the screen changed)
   launch_failed: 422,
-  unsupported: 501, // a command the connected client cannot run (the app's adb-only ones)
+  unsupported: 501, // a command the connected client cannot run
   permission_missing: 503, // the app lacks a grant the owner gives on the phone
+  shell_unavailable: 503, // the app's shell bridge: not paired, or wireless debugging is off or not reachable
   timeout: 504,
   stopped: 503,
 };
