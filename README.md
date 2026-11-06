@@ -164,10 +164,19 @@ All endpoints need `Authorization: Bearer <AGENT_TOKEN>`, which the network secr
 | `POST /type` `{text}` | ASCII of any length; `\n` and `\t` become Enter and Tab; the reply gives the focused field's package, `inputType` and whether it is a password field |
 | `POST /key` `{key,longpress?}` | back, home, recents, enter, tab, delete, any `KEYCODE_*` name or key number |
 | `POST /launch` `{package}` | Any installed app |
+| `POST /open` `{url,package?}` | Any URL: web pages, `mailto:` links, deep links |
+| `POST /intent` `{action?,data?,type?,component?,package?,categories?,flags?,extras?,broadcast?}` | Any activity intent or broadcast, through `am` |
+| `GET /notifications` | Every notification as data (`dumpsys notification --noredact`) |
+| `POST /statusbar` `{action}` | Open the shade or quick settings, or close them |
+| `POST /rotation` `{rotation}` | 0-3 or `"auto"`; replies with the old setting |
+| `POST /wait` `{for,seconds?,...}` | Until the screen changes, settles, or an app comes to the front |
+| `POST /batch` `{steps,stop_on_error?}` | Several commands, with sleeps, in one request |
+| `GET /files?path=`, `GET /files/pull?path=`, `POST /files/push?path=` | List, download and upload files of any size, streamed in acknowledged 256 KiB chunks |
+| `GET /record?seconds=`, `POST /record/start`, `POST /record/stop` | Screen recording (MP4; a zip of segments past 180 s) |
 
 Every endpoint also takes `if_foreground` (run only while that app, or one of a list, has focus, checked in the same shell command as the action) and `timeout` (seconds, no upper limit; default 30). Unknown fields are dropped and named in `ignored_fields`.
 
-Errors: 400 `invalid_args`, 401 `unauthorized`, 404, 405, 409 `foreground_mismatch`, 503 `device_offline` / `disabled` / `stopped`, 504 `timeout` / `device_timeout`, 502 other device errors.
+Errors: 400 `invalid_args`, 401 `unauthorized`, 404 (`not_found` for files), 405, 409 `foreground_mismatch`, 422 `launch_failed`, 503 `device_offline` / `disabled` / `stopped`, 504 `timeout` / `device_timeout`, 502 other device errors.
 
 The full list of what the agent can do, what is actively restricted and what is just not built is in [docs/CAPABILITIES.md](docs/CAPABILITIES.md).
 
@@ -195,7 +204,7 @@ python3 -m unittest discover -s phone/tests -v
 python3 scripts/e2e_test.py
 ```
 
-What the end-to-end test covers: token separation (agent, device and admin tokens cannot stand in for each other), validation, every endpoint, the docs and the owner's private notes, actions in any app (Settings, Teams, lock screen, launcher) and with the screen off, typing into password fields, typing `%`, newlines and long text, any key, launch of any app, `if_foreground` (refusals, popups, screen off), timeouts (a hung command stopped, a long one allowed), no rate limit, unknown fields named, the admin kill switch and reconnect, the stop file, a bad device token, and that typed text never reaches the log.
+What the end-to-end test covers: token separation (agent, device and admin tokens cannot stand in for each other), validation, every endpoint, the docs and the owner's private notes, actions in any app (Settings, Teams, lock screen, launcher) and with the screen off, typing into password fields, typing `%`, newlines and long text, any key, launch of any app, `if_foreground` (refusals, popups, screen off), timeouts (a hung command stopped, a long one allowed), no rate limit, unknown fields named, opening URLs and `mailto:` links, intents, notifications, the status bar, rotation, waits, batches (and their `if_foreground`), listing files, a 3 MB push and pull compared byte for byte, empty and missing files, screen recordings (one file, and a zip past 180 s), the admin kill switch and reconnect, the stop file, a bad device token, and that typed text never reaches the log.
 
 CI (`.github/workflows/tests.yml`) runs all three on every pull request.
 
@@ -220,7 +229,9 @@ Not yet tested, because it needs the real phone and account (phase 4 of the plan
 - **Notifications**: a heads-up notification from another app can appear in a screenshot. Turn on Do Not Disturb during agent sessions if that matters.
 - **Password fields**: the agent can type into them and tap the keyboard over them. The reply to `/type` says when the focused field is a password field.
 - **Timeouts**: each command has a deadline (default 30 s; the agent can set any). The phone kills the adb call when it passes, so a hung command does not block the queue; the relay waits 10 s longer for a reply before giving up.
-- **Logging**: typed text is stored as its length only.
+- **Logging**: typed text is stored as its length only, inside batches too; an intent's extras are logged by name, not value.
+- **Files**: pulls and pushes are streamed through the Worker in chunks with acknowledgements, at most 8 chunks (2 MiB) in flight, so a big file never sits whole in the Durable Object's memory. The phone client writes each to a temporary file next to it, which it deletes afterwards.
+- **Recording** runs on the phone as a detached shell loop around `screenrecord`, with its state in `/data/local/tmp/phone_relay_rec.*`; `/record/stop` ends it, and `/record/start` ends any earlier one first.
 - **Request shapes** are still checked (numbers are numbers, names match their patterns, text is ASCII), in the Worker and on the phone, so no value can carry shell syntax.
 
 ## 8. Not built
