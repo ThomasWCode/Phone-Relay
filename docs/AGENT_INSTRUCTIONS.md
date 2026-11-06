@@ -6,7 +6,7 @@ Copy this into the CLAUDE.md of the repository you use for phone sessions, or pa
 
 - Relay: `https://<WORKER_HOST>` (replace with the real host).
 - Authentication is added by the environment's network secret. Do not add an `Authorization` header yourself, and do not look for a token: none exists inside the session.
-- Call the API with `curl`. Examples:
+- Call the API with `curl`. From Python or another HTTP library, set your own `User-Agent` header: Cloudflare rejects some default ones, Python's `urllib` among them, with `403 error code: 1010`. Examples:
 
 ```bash
 R=https://<WORKER_HOST>
