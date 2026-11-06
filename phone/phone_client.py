@@ -6,8 +6,12 @@ replies. There is no app allowlist: every app, key and setting is reachable.
 A command given `if_foreground` (a package or a list) runs in the same shell
 command as a focus check, so it only runs while one of those apps has focus.
 
-`ui` (the UI tree) runs `uiautomator dump`, which unbinds every accessibility
-service on the phone for a moment. Nothing else uses it, including --selftest.
+Some commands go through a helper run as the shell user with app_process
+(helper/phone-relay-helper.jar, pushed to the phone on first use): the UI tree,
+multi-touch gestures, the clipboard, pasting text `input text` cannot type, and
+audio. Its UI tree leaves the phone's accessibility services bound; only
+`ui` with engine=uiautomator runs `uiautomator dump`, which unbinds them all
+for a moment. Nothing else uses uiautomator, including --selftest.
 
 Files and screen recordings cross the relay socket in acknowledged chunks
 (see Channel), so their size is not limited by the socket's message size.
@@ -38,7 +42,7 @@ import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 # ---- key names and defaults (the relay has its own copy of the key names) ----
 
@@ -80,14 +84,27 @@ RECORD_PID = "/data/local/tmp/phone_relay_rec.pid"  # the recording loop's shell
 RECORD_CHILD = "/data/local/tmp/phone_relay_rec.child"  # the screenrecord it is waiting on
 RECORD_STOP = "/data/local/tmp/phone_relay_rec.stop"  # asks the loop not to start another segment
 STATUSBAR_ACTIONS = {"notifications": "expand-notifications", "settings": "expand-settings", "collapse": "collapse"}
-WAIT_KINDS = ("change", "stable", "foreground")
+WAIT_KINDS = ("change", "stable", "foreground", "text")
 # A batch may run any command that replies with JSON, plus sleep; not the streaming ones or batch itself.
 BATCH_COMMANDS = ("state", "screenshot", "ui", "tap", "swipe", "type", "key", "launch", "open", "intent",
-                  "notifications", "statusbar", "rotation", "wait", "files", "record_start", "sleep")
+                  "notifications", "statusbar", "rotation", "wait", "files", "record_start", "gesture",
+                  "clipboard_get", "clipboard_set", "sleep")
 # Commands that run their action inside the if_foreground guard themselves (in the same shell command).
 # Any other command given if_foreground is checked against the foreground before it starts.
 SELF_GUARDED = ("screenshot", "ui", "tap", "swipe", "type", "key", "launch", "open", "intent", "statusbar",
-                "rotation", "record_start", "record", "batch")
+                "rotation", "record_start", "record", "batch", "gesture", "clipboard_get", "clipboard_set", "audio")
+# The app_process helper: built from helper/src by helper/build.py, pushed to the phone on first use.
+HELPER_JAR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "helper", "phone-relay-helper.jar")
+HELPER_REMOTE = "/data/local/tmp/phone-relay-helper.jar"
+HELPER_CLASS = "com.thomaswcode.phonerelay.Helper"
+HELPER_ERROR = "PHONE_RELAY_HELPER_ERROR"  # the helper's one-line failure report
+# Text longer than this goes to the helper in a file, not on its command line.
+HELPER_ARG_LIMIT = 4000
+HELPER_TEXT_REMOTE = "/data/local/tmp/phone_relay_text.txt"
+AUDIO_REMOTE = "/data/local/tmp/phone_relay_audio.wav"
+AUDIO_SOURCES = ("output", "mic")
+TYPE_METHODS = ("keys", "paste")
+UI_ENGINES = ("helper", "uiautomator")
 # Side messages of a running command, routed to its Channel rather than queued as commands.
 SIDE_TYPES = ("chunk", "end", "ack", "cancel")
 
@@ -467,15 +484,24 @@ def guarded(action: str, packages: tuple[str, ...]) -> str:
 
 
 def validate_text(text: object) -> str:
-    """Any length of ASCII. Newlines and tabs are typed as Enter and Tab; other control characters cannot be."""
+    """Text `input text` can type as keys: any length of ASCII. Newlines and tabs are typed as Enter
+    and Tab; other control characters, and anything beyond ASCII, have to be pasted instead."""
     if not isinstance(text, str) or not text:
         raise CommandError("invalid_args", "text must be a non-empty string")
     for c in text:
         if ord(c) > 0x7E:
-            raise CommandError("invalid_args", "non-ASCII text is not supported yet")
+            raise CommandError("invalid_args", "non-ASCII text cannot be typed as keys; paste it (method paste)")
         if ord(c) < 0x20 and c not in "\n\r\t":
-            raise CommandError("invalid_args", "control characters other than newline and tab cannot be typed")
+            raise CommandError("invalid_args", "control characters other than newline and tab cannot be typed as keys")
     return text
+
+
+def keys_can_type(text: str) -> bool:
+    try:
+        validate_text(text)
+        return True
+    except CommandError:
+        return False
 
 
 def escape_text(text: str) -> str:
@@ -655,8 +681,10 @@ def default_timeout(cmd: str, args: dict) -> float:
         return DEFAULT_TIMEOUT_S + max(args["ms"], 0) / 1000
     if cmd == "wait":
         return DEFAULT_TIMEOUT_S + (args["seconds"] if _is_number(args.get("seconds")) else 10)
-    if cmd == "record":
+    if cmd in ("record", "audio"):
         return 2 * DEFAULT_TIMEOUT_S + 2 * (args["seconds"] if _is_number(args.get("seconds")) else 10)
+    if cmd == "gesture" and _is_number(args.get("ms")):
+        return DEFAULT_TIMEOUT_S + max(args["ms"], 0) / 1000
     if cmd in ("pull", "push", "record_stop"):
         return TRANSFER_TIMEOUT_S
     if cmd == "batch" and isinstance(args.get("steps"), list):
@@ -693,11 +721,14 @@ class PhoneController:
         stop_file: str = DEFAULT_STOP_FILE,
         focus_retries: int = 3,
         focus_retry_delay: float = 0.3,
+        helper_jar: str = HELPER_JAR,
     ) -> None:
         self.adb = adb
         self.stop_file = stop_file
         self.focus_retries = focus_retries
         self.focus_retry_delay = focus_retry_delay
+        self.helper_jar = helper_jar
+        self._helper_pushed = False
         self._screen_size: tuple[int, int] | None = None
 
     def stopped(self) -> bool:
@@ -724,6 +755,52 @@ class PhoneController:
                 raise CommandError("device_error", "could not read screen size")
             self._screen_size = size
         return self._screen_size
+
+    async def _helper_command(self, *args: str) -> str:
+        """The shell command running the helper with `args`; pushes the jar first if the phone's copy differs."""
+        if not self._helper_pushed:
+            try:
+                with open(self.helper_jar, "rb") as f:
+                    local = hashlib.sha256(f.read()).hexdigest()
+            except OSError as e:
+                raise CommandError("helper_missing", f"{self.helper_jar}: build it with helper/build.py") from e
+            # `; true`: adb passes on the shell's exit status, and sha256sum fails before the first push.
+            remote = (await self.adb.shell(f"sha256sum {HELPER_REMOTE} 2>/dev/null; true")).split()[:1]
+            if remote != [local]:
+                await self.adb.run("push", self.helper_jar, HELPER_REMOTE)
+            self._helper_pushed = True
+        # `|| true`: the helper exits 1 on failure, which adb would report without the reason it printed.
+        return f"CLASSPATH={HELPER_REMOTE} app_process / {HELPER_CLASS} " + " ".join(shlex.quote(a) for a in args) + " || true"
+
+    async def _helper(self, args: dict, *helper_args: str) -> str:
+        """Run the helper (inside the if_foreground guard if asked); its failure becomes helper_failed."""
+        out = await self._guarded(await self._helper_command(*helper_args), args)
+        if HELPER_ERROR in out:
+            raise CommandError("helper_failed", out.split(HELPER_ERROR, 1)[1].strip()[:300])
+        return out
+
+    async def _helper_text_arg(self, text: str) -> tuple[str, bool]:
+        """The helper's argument for `text`: base64, or "@file" pushed to the phone when it is long.
+        The bool says whether that file must be removed afterwards."""
+        encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
+        if len(encoded) <= HELPER_ARG_LIMIT:
+            return encoded, False
+        local = _local_temp(".txt")
+        try:
+            with open(local, "w", encoding="utf-8", newline="") as f:
+                f.write(text)
+            await self.adb.run("push", local, HELPER_TEXT_REMOTE)
+        finally:
+            _remove(local)
+        return "@" + HELPER_TEXT_REMOTE, True
+
+    async def _helper_with_text(self, args: dict, command: str, text: str) -> str:
+        arg, is_file = await self._helper_text_arg(text)
+        try:
+            return await self._helper(args, command, arg)
+        finally:
+            if is_file:
+                await self.adb.shell(f"rm -f {HELPER_TEXT_REMOTE}")
 
     async def _mismatch(self, packages: tuple[str, ...]) -> CommandError:
         fg, wake = await self.foreground_and_wake()
@@ -785,6 +862,9 @@ class PhoneController:
             "batch": self.cmd_batch,
             "files": self.cmd_files,
             "record_start": self.cmd_record_start,
+            "gesture": self.cmd_gesture,
+            "clipboard_get": self.cmd_clipboard_get,
+            "clipboard_set": self.cmd_clipboard_set,
         }.get(cmd)
         # These stream bytes over the relay socket, so they need the command's channel.
         streaming = {
@@ -792,6 +872,7 @@ class PhoneController:
             "push": self.cmd_push,
             "record": self.cmd_record,
             "record_stop": self.cmd_record_stop,
+            "audio": self.cmd_audio,
         }.get(cmd)
         if handler is None and streaming is None:
             raise CommandError("invalid_args", f"unknown command: {cmd}")
@@ -847,9 +928,19 @@ class PhoneController:
         img.convert("RGB").save(buf, "JPEG", quality=JPEG_QUALITY, optimize=True)
         return _image_result(buf.getvalue(), "image/jpeg", img.size[0], img.size[1], rw, rh, scale, fg)
 
+    async def _ui_xml(self, args: dict) -> bytes:
+        """The UI tree as uiautomator XML: from the helper (accessibility services stay bound), or from
+        `uiautomator dump` itself when engine is uiautomator (it unbinds them for a moment)."""
+        engine = args.get("engine", "helper")
+        if engine not in UI_ENGINES:
+            raise CommandError("invalid_args", f"engine must be one of {', '.join(UI_ENGINES)}")
+        if engine == "uiautomator":
+            return await self._dump_ui(_if_foreground(args))
+        return (await self._helper(args, "ui")).encode("utf-8")
+
     async def cmd_ui(self, args: dict) -> dict:
         packages = _if_foreground(args)
-        xml_bytes = await self._dump_ui(packages)
+        xml_bytes = await self._ui_xml(args)
         fg, _ = await self.foreground_and_wake()
         # With if_foreground: if the app in front changed during the dump, discard it.
         if packages is not None and fg not in packages:
@@ -883,19 +974,83 @@ class PhoneController:
         return (await self.input_state())[0]
 
     async def cmd_type(self, args: dict) -> dict:
-        commands = type_commands(args.get("text"))  # validates
+        """Type text as keys (`input text`), or paste it through the clipboard: what keys cannot type
+        (beyond ASCII, emoji, other control characters) is pasted unless the method says otherwise."""
+        text, method = args.get("text"), args.get("method")
+        if not isinstance(text, str) or not text:
+            raise CommandError("invalid_args", "text must be a non-empty string")
+        if method is not None and method not in TYPE_METHODS:
+            raise CommandError("invalid_args", f"method must be one of {', '.join(TYPE_METHODS)}")
+        method = method or ("keys" if keys_can_type(text) else "paste")
+        commands = type_commands(text) if method == "keys" else []  # validates
         # Typing with no field focused is the agent's call: the reply says what was focused.
         field = await self.text_field()
+        if method == "paste":
+            await self._helper_with_text(args, "paste", text)
         for command in commands:
             if self.stopped():  # a long text: the owner's stop file halts it between chunks
                 raise CommandError("stopped", "stop file present")
             await self._guarded(command, args)
         return {
-            "length": len(args["text"]),
+            "length": len(text),
+            "method": method,
             "field_package": field[0] if field else None,
             "field_input_type": field[1] if field else None,
             "password_field": is_password_type(field[1]) if field else False,
         }
+
+    async def cmd_gesture(self, args: dict) -> dict:
+        """Several fingers at once (pinch, rotate, two-finger swipe): each pointer a path of [x, y] points."""
+        scale = _scale(args)
+        pointers = args.get("pointers")
+        if not isinstance(pointers, list) or not 1 <= len(pointers) <= 10:
+            raise CommandError("invalid_args", "pointers must be a list of 1 to 10 paths")
+        paths = []
+        for i, path in enumerate(pointers):
+            if not isinstance(path, list) or not path or not all(
+                isinstance(pt, list) and len(pt) == 2 and all(_is_number(v) for v in pt) for pt in path
+            ):
+                raise CommandError("invalid_args", f"pointer {i} must be a list of [x, y] points")
+            paths.append([[round(x / scale, 1), round(y / scale, 1)] for x, y in path])
+        ms = _number_arg(args, "ms", 300)
+        await self._helper_with_text(args, "gesture", json.dumps({"pointers": paths, "ms": round(ms)}))
+        return {"pointers": len(paths), "ms": round(ms)}
+
+    async def cmd_clipboard_get(self, args: dict) -> dict:
+        out = await self._helper(args, "clip-get")
+        line = next((ln for ln in reversed(out.splitlines()) if ln.startswith("{")), None)
+        if line is None:
+            raise CommandError("helper_failed", out.strip()[-300:])
+        return {"text": json.loads(line).get("text")}
+
+    async def cmd_clipboard_set(self, args: dict) -> dict:
+        """Put text on the clipboard; null empties it."""
+        text = args.get("text")
+        if text is None:
+            await self._helper(args, "clip-clear")
+            return {"length": 0, "cleared": True}
+        if not isinstance(text, str):
+            raise CommandError("invalid_args", "text must be a string, or null to empty the clipboard")
+        await self._helper_with_text(args, "clip-set", text)
+        return {"length": len(text)}
+
+    async def cmd_audio(self, args: dict, channel: Channel) -> dict:
+        """Record the phone's audio output (it goes quiet on the speaker meanwhile) or its microphone, as WAV."""
+        seconds = _number_arg(args, "seconds", 10)
+        if seconds <= 0:
+            raise CommandError("invalid_args", "seconds must be above 0")
+        source = args.get("source", "output")
+        if source not in AUDIO_SOURCES:
+            raise CommandError("invalid_args", f"source must be one of {', '.join(AUDIO_SOURCES)}")
+        local = _local_temp(".wav")
+        try:
+            await self._helper(args, "audio", f"{seconds:g}", source, AUDIO_REMOTE)
+            await self.adb.run("pull", AUDIO_REMOTE, local)
+            size = await channel.send_file(local, "audio/wav", {"X-Audio-Source": source})
+        finally:
+            _remove(local)
+            await self.adb.shell(f"rm -f {AUDIO_REMOTE}")
+        return {"seconds": seconds, "source": source, "bytes": size}
 
     async def cmd_key(self, args: dict) -> dict:
         keycode = resolve_key(args.get("key"))
@@ -1012,6 +1167,9 @@ class PhoneController:
         interval = _number_arg(args, "interval_ms", 500) / 1000
         threshold = _number_arg(args, "threshold", 0.005)
         package = _package_arg(args)
+        wanted = args.get("text")
+        if kind == "text" and (not isinstance(wanted, str) or not wanted):
+            raise CommandError("invalid_args", "waiting for text needs text, a non-empty string")
         loop = asyncio.get_running_loop()
         started = loop.time()
         deadline = started + seconds
@@ -1019,6 +1177,16 @@ class PhoneController:
         def result(met: bool, **extra) -> dict:
             return {"met": met, "elapsed_ms": round((loop.time() - started) * 1000), **extra}
 
+        if kind == "text":
+            # The helper's UI tree: no accessibility service is unbound, however often it polls.
+            while True:
+                found = next((e for e in parse_ui(await self._ui_xml({"engine": "helper"}))
+                              if wanted in e["text"] or wanted in e["desc"]), None)
+                if found is not None:
+                    return result(True, element=found)
+                if loop.time() >= deadline:
+                    return result(False)
+                await asyncio.sleep(interval)
         if kind == "foreground":
             first, _ = await self.foreground_and_wake()
             fg = first
@@ -1208,7 +1376,7 @@ def _log_args(cmd: str, args: object) -> object:
     """Args with typed text replaced by its length, and an intent's extra values by their names."""
     if not isinstance(args, dict):
         return args
-    if cmd == "type":
+    if cmd in ("type", "clipboard_set"):
         text = args.get("text")
         return {"length": len(text) if isinstance(text, str) else "?"}
     if cmd == "batch" and isinstance(args.get("steps"), list):
@@ -1409,6 +1577,12 @@ async def selftest(controller: PhoneController) -> int:
     else:
         ok = False
         print("FAIL if_foreground guard:", probe.strip()[:200], "/", refused.strip()[:200])
+    try:
+        version = (await controller.adb.shell(await controller._helper_command("version"))).strip().splitlines()[-1:]
+        print("helper: version", version[0] if version else "?", "(app_process works)")
+    except CommandError as e:
+        ok = False
+        print("FAIL helper:", e)
     field = await controller.text_field()
     print("text field:", "none" if field is None else f"package={field[0]} inputType={field[1]:#x} password={is_password_type(field[1])}")
     try:

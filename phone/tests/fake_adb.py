@@ -9,6 +9,8 @@ State is a JSON file named by FAKE_ADB_STATE:
 "shade" is the screenshot's grey level, so tests can make the screen change.
 "files" is the phone's storage (path -> base64 content); its folders are implied by the paths.
 "rotation" is [accelerometer_rotation, user_rotation].
+The app_process helper is played too: "clipboard" holds its text, "pasted" and "gestures"
+collect what it was given, and "helper_error" makes it fail with that message.
 Every invocation is appended to the file named by FAKE_ADB_LOG (one JSON list per line).
 
 Guarded commands (`if <focus guard>; then <action>; else echo PHONE_RELAY_REFUSED; fi`)
@@ -17,6 +19,7 @@ so the tests exercise the real regexes.
 """
 
 import base64
+import hashlib
 import json
 import math
 import os
@@ -35,6 +38,9 @@ COMPONENTS = {
     "com.google.android.gm": "com.google.android.gm/.ConversationListActivityGmail",
 }
 RECORD_PREFIX = "/data/local/tmp/phone_relay_rec_"
+HELPER_REMOTE = "/data/local/tmp/phone-relay-helper.jar"
+HELPER_PREFIX = f"CLASSPATH={HELPER_REMOTE} app_process / com.thomaswcode.phonerelay.Helper "
+FAKE_WAV = b"RIFF\x24\x00\x00\x00WAVEfmt fake audio"
 MISSING_MARKER = "PHONE_RELAY_MISSING"
 MTIME = 1700000000
 # Made-up notifications in the shape `dumpsys notification --noredact` prints.
@@ -224,6 +230,44 @@ def am(cmd, state):
     return f"Starting: Intent {{ cmp={target}/.Main }}\nStatus: ok\n"
 
 
+def helper_text(arg, files):
+    """The helper's text argument: base64, or @path of a stored file."""
+    if arg.startswith("@"):
+        return base64.b64decode(files[arg[1:]]).decode("utf-8")
+    return base64.b64decode(arg).decode("utf-8")
+
+
+def helper(cmd, state):
+    """The app_process helper's commands, as phone_client calls them."""
+    files = state.setdefault("files", {})
+    if HELPER_REMOTE not in files:
+        return "/system/bin/sh: app_process: Error: Could not find class\n"
+    if state.get("helper_error"):
+        return f"PHONE_RELAY_HELPER_ERROR {state['helper_error']}\n"
+    args = shlex.split(cmd[len(HELPER_PREFIX):].removesuffix(" || true"))
+    name = args[0]
+    if name == "version":
+        return "1\n"
+    if name == "ui":
+        return ui_xml(state)
+    if name == "gesture":
+        state.setdefault("gestures", []).append(json.loads(helper_text(args[1], files)))
+    elif name == "clip-get":
+        return json.dumps({"text": state.get("clipboard")}) + "\n"
+    elif name == "clip-set":
+        state["clipboard"] = helper_text(args[1], files)
+    elif name == "clip-clear":
+        state["clipboard"] = None
+    elif name == "paste":
+        state.setdefault("pasted", []).append(helper_text(args[1], files))
+    elif name == "audio":
+        files[args[3]] = base64.b64encode(FAKE_WAV + f" {args[1]}s {args[2]}".encode()).decode()
+    else:
+        return f"PHONE_RELAY_HELPER_ERROR IllegalArgumentException: unknown command: {name}\n"
+    save_state(state)
+    return ""
+
+
 def run(cmd, state):
     """Output of one `adb shell`/`exec-out` command (bytes)."""
     m = GUARD_RE.match(cmd)
@@ -234,6 +278,13 @@ def run(cmd, state):
     if cmd.startswith("uiautomator dump"):
         return ui_xml(state).encode()
     files = state.setdefault("files", {})
+    if cmd.startswith(HELPER_PREFIX):
+        return helper(cmd, state).encode()
+    if cmd.startswith("sha256sum "):  # `sha256sum PATH 2>/dev/null; true`
+        path = cmd.split()[1]
+        if path not in files:
+            return b""
+        return f"{hashlib.sha256(base64.b64decode(files[path])).hexdigest()}  {path}\n".encode()
     if "setsid nohup sh -c" in cmd:  # a background recording: its segments appear at once
         seconds = int(re.search(r"\+ (\d+) \)\)", cmd).group(1))
         for i in range(math.ceil(seconds / 180)):
