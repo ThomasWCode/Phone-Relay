@@ -929,6 +929,7 @@ class PhoneController:
             "battery": battery,
             "screen": {"width": w, "height": h},
             "rotation": await self._rotation(),
+            "client": "termux-adb",
             "client_version": VERSION,
         }
 

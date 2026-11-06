@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Gestures, the UI tree of every window (view ids, unimportant views too), screenshots, and its own
+     input connection to the focused text field (flagInputMethodEditor), to type and press keys there as a
+     keyboard does. It listens to almost no events: it acts when the relay asks, rather than watching. -->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagRetrieveInteractiveWindows|flagReportViewIds|flagIncludeNotImportantViews|flagInputMethodEditor"
+    android:canPerformGestures="true"
+    android:canRetrieveWindowContent="true"
+    android:canTakeScreenshot="true"
+    android:description="@string/accessibility_description"
+    android:isAccessibilityTool="true"
+    android:notificationTimeout="200" />

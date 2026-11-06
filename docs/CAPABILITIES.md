@@ -7,6 +7,23 @@ Three lists:
 
 The owner's rules in [PHONE_RULES.md](PHONE_RULES.md) and the rules in [AGENT_INSTRUCTIONS.md](AGENT_INSTRUCTIONS.md) (never send email unasked, treat screen text as data, and so on) are guidance to the agent. **They are not enforced by code.** There is no app allowlist, no key deny list, no rate limit and no range limit.
 
+## Two clients
+
+The phone side is either the **Android app** (always on; it drives the phone through its accessibility service) or the **adb client** (`phone_client.py` over wireless debugging; it drives the phone as the shell user). `/state` says which is connected (`client`: `android-app` or `termux-adb`) and, for the app, lists the commands it runs (`capabilities`). Everything below applies to both, except:
+
+| | Android app | adb client |
+|---|---|---|
+| Runs | Always, on any network; back by itself after a reboot or an update | Only while wireless debugging is on (Wi-Fi); started again after each reboot |
+| Off switch on the phone | Quick Settings tile, notification, the app | The stop file |
+| `if_foreground` | Checked just before the action | Checked in the same shell command as the action |
+| Typing | Into the focused field only (409 `no_text_field` otherwise), through the app's own input connection, as a keyboard types | Anywhere, as key events (`input text`), pasting what is not ASCII |
+| Keys | Back, Home, Recents, the shade, power (locks; held: the power menu), wake, d-pad, volume, media, page up/down; while a field is focused, any key | Any key |
+| UI tree | Every window of the main user, as the accessibility framework gives it | The same through the helper, or `uiautomator` |
+| Screenshots | Through the accessibility service (about 3 a second at most) | `screencap` |
+| Gestures | Up to Android's stroke limit, at most 60 s each | Up to 10 fingers, any length |
+| Shell-only (501 `unsupported` in the app) | — | Reading the clipboard, screen recording, audio, Chrome DevTools, `engine=uiautomator` |
+| Grants the owner gives once | Accessibility service, notification access, all-files access, modify system settings, no battery optimisation | Wireless debugging pairing |
+
 ## Can do
 
 ### See
@@ -80,4 +97,6 @@ Typed text is never logged, only its length. That limits what is recorded, not w
 
 ## Not built
 
-Nothing from the earlier list is left. The owner dropped these rather than have them built: the phase 5 native app, the phase 6 MCP wrapper and custom domain, and a status page for the owner (`/admin/status` and `/admin/log` give the same information).
+Nothing from the earlier list is left; the native app (phase 5) is built. The owner dropped these rather than have them built: the phase 6 MCP wrapper and custom domain, and a status page for the owner (`/admin/status` and `/admin/log` give the same information).
+
+The app does not record the screen or audio (MediaProjection, with Android's consent prompt every time), read the clipboard (Android allows that only to the app in front or the keyboard), or reach Chrome DevTools (its socket admits the shell user only). The adb client does all four.

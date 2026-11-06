@@ -21,7 +21,11 @@ const DEVICE_ERROR_STATUS: Record<string, number> = {
   invalid_args: 400,
   not_found: 404,
   foreground_mismatch: 409,
+  no_text_field: 409, // the Android app types into a focused field only
+  gesture_cancelled: 409, // Android cancelled the app's gesture (a real touch, the screen changed)
   launch_failed: 422,
+  unsupported: 501, // a command the connected client cannot run (the app's adb-only ones)
+  permission_missing: 503, // the app lacks a grant the owner gives on the phone
   timeout: 504,
   stopped: 503,
 };
@@ -45,6 +49,8 @@ interface DeviceInfo {
   connected_at: number;
   client?: string;
   version?: string;
+  // The commands the client runs (the Android app announces them; the adb client runs them all).
+  capabilities?: string[];
 }
 
 function base64ToBytes(b64: string): Uint8Array {
@@ -429,6 +435,7 @@ export class DeviceHub extends DurableObject<Env> {
         connected_at: (ws.deserializeAttachment() as DeviceInfo | null)?.connected_at ?? Date.now(),
         client: String(msg.client ?? "").slice(0, 64),
         version: String(msg.version ?? "").slice(0, 32),
+        ...(Array.isArray(msg.capabilities) ? { capabilities: msg.capabilities.slice(0, 100).map((c) => String(c).slice(0, 40)) } : {}),
       };
       ws.serializeAttachment(info);
       this.log("device", "hello", { client: info.client, version: info.version }, true);
