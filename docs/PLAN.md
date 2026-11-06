@@ -1,6 +1,7 @@
 # Plan: Remote Android control for cloud Claude agents
 
 Status: plan only (v2). Date: 2026-11-05.
+Update 2026-11-06: phases 0-4 are built. At the owner's request the app allowlist, key deny list, rate limits and input limits of sections 6-7 were then removed, and phases 5-6 dropped. [CAPABILITIES.md](CAPABILITIES.md) describes the relay as it is now; this plan is kept as written.
 Changes since v1: workers.dev instead of a custom subdomain (DNS is on Spaceship), S24 specifics, Gmail + Chrome allowlist, design details, extra hardening.
 
 ## 1. Goal

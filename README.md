@@ -1,6 +1,6 @@
 # Phone Relay
 
-Lets Claude, running in Claude Code cloud sessions, view and control an Android phone (Gmail and Chrome only) through a Cloudflare Worker relay. There is no VPS and no inbound port on the phone.
+Lets Claude, running in Claude Code cloud sessions, view and control an Android phone (any app: there is no allowlist) through a Cloudflare Worker relay. There is no VPS and no inbound port on the phone.
 
 ```
 Claude (cloud session) --HTTPS, agent token added by the network secret-->  Cloudflare Worker
@@ -10,7 +10,7 @@ Claude (cloud session) --HTTPS, agent token added by the network secret-->  Clou
 Phone (Termux: phone_client.py + adb over loopback) --outbound WSS, device token--+
 ```
 
-The design and its reasoning are in [docs/PLAN.md](docs/PLAN.md). This README covers setup and use. Phases 0-4 of the plan are built. Phases 5-6 (native app, MCP, custom domain) are not.
+The design and its reasoning are in [docs/PLAN.md](docs/PLAN.md). This README covers setup and use. Phases 0-4 of the plan are built, without the plan's app allowlist, key deny list, rate limits and input limits: those were removed later (see [docs/CAPABILITIES.md](docs/CAPABILITIES.md)). Phases 5-6 (native app, MCP, custom domain) were dropped.
 
 ## Layout
 
@@ -22,7 +22,10 @@ The design and its reasoning are in [docs/PLAN.md](docs/PLAN.md). This README co
 | `phone/tests/` | Phone client unit tests, plus `fake_adb.py` |
 | `scripts/e2e_test.py` | Local end-to-end test: `wrangler dev` + phone client + fake adb |
 | `docs/AGENT_INSTRUCTIONS.md` | Instructions to give Claude |
+| `docs/PHONE_RULES.md` | The owner's rules for the phone, from their own instructions; the relay serves them to the agent |
+| `docs/CAPABILITIES.md` | What the agent can do, what is restricted and what is not built |
 | `docs/PLAN.md` | The plan this was built from |
+| `private/` | Git-ignored: the owner's private notes for the agent (`PHONE_NOTES.md`) and local helper scripts |
 
 ## 1. Deploy the relay (on your own computer)
 
@@ -78,11 +81,11 @@ curl -sS -o /dev/null -w '%{http_code}\n' https://WORKER_HOST/state
    cp .env.example .env && chmod 600 .env
    # set RELAY_URL=wss://WORKER_HOST/device and DEVICE_TOKEN=<device token>
    ```
-8. **Self-test**: open Chrome on the phone, then:
+8. **Self-test**: unlock the phone and open any app, then:
    ```bash
    python phone_client.py --selftest
    ```
-   It prints the raw `mCurrentFocus`/`mWakefulness` lines and the parsed state, runs the input guard with a harmless `echo`, shows the focused text field's `inputType`, and saves `selftest_screenshot.jpg`. It sends no input. **Check that the foreground package it reports is right**: the allowlist depends on it. Then open Settings and re-run the self-test: it must report `foreground_allowed: false` and stop.
+   It prints the raw `mCurrentFocus`/`mWakefulness` lines and the parsed state, runs the `if_foreground` guard with a harmless `echo` (it must pass for the app in front and refuse another package), shows the focused text field's `inputType`, and saves `selftest_screenshot.jpg`. It sends no input. **Check that the foreground package it reports is right**: `if_foreground` depends on it.
 9. **Run**:
    ```bash
    ./start.sh            # takes a wake lock and runs the client; reconnects with backoff
@@ -125,6 +128,7 @@ The stop file is `~/STOP_PHONE_AGENT` on the computer (`$HOME\STOP_PHONE_AGENT` 
 5. Point Claude at the instructions. The relay serves them behind the agent token, so in the phone environment a session can read them with no copying and no extra hosts:
    - `GET /` and `GET /docs/AGENT_INSTRUCTIONS.md`: [docs/AGENT_INSTRUCTIONS.md](docs/AGENT_INSTRUCTIONS.md), with `<WORKER_HOST>` replaced by the relay's host
    - `GET /docs/CAPABILITIES.md`: [docs/CAPABILITIES.md](docs/CAPABILITIES.md)
+   - `GET /docs/PHONE_RULES.md`: [docs/PHONE_RULES.md](docs/PHONE_RULES.md), followed by your private notes if you have set them (section 4)
 
    Tell the session, for example: *Before using the phone, run `curl -sS https://WORKER_HOST/` and follow it.* The files are bundled at deploy time, so run `npx wrangler deploy` again after changing them.
 
@@ -132,11 +136,15 @@ The stop file is `~/STOP_PHONE_AGENT` on the computer (`$HOME\STOP_PHONE_AGENT` 
 
 ```bash
 A="Authorization: Bearer $ADMIN_TOKEN"; R=https://WORKER_HOST
-curl -sS -H "$A" $R/admin/status              # connected?, device info, rate counts
+curl -sS -H "$A" $R/admin/status              # connected?, device info, notes length
 curl -sS -H "$A" "$R/admin/log?n=50"          # action log (typed text is stored as length only)
 curl -sS -H "$A" -X POST $R/admin/disable     # kill switch: drops the phone, blocks reconnects
 curl -sS -H "$A" -X POST $R/admin/enable
+curl -sS -H "$A" -X PUT --data-binary @private/PHONE_NOTES.md $R/admin/notes   # private notes for the agent
+curl -sS -H "$A" $R/admin/notes                # read them back; PUT an empty body to clear them
 ```
+
+The private notes are appended to `/docs/PHONE_RULES.md` under "The owner's private notes". They live in the Durable Object, not in this public repository, so put anything personal there (your schedule, which apps you have installed), never in `docs/`.
 
 On the phone, `touch ~/STOP_PHONE_AGENT` makes the client refuse all commands and exit within about 2 seconds. `start.sh` removes the file when you start the client again.
 
@@ -148,16 +156,18 @@ All endpoints need `Authorization: Bearer <AGENT_TOKEN>`, which the network secr
 
 | Endpoint | Notes |
 |---|---|
-| `GET /state` | foreground, foreground_allowed, awake, battery, screen, allowlist |
+| `GET /state` | foreground, awake, battery, screen, client version |
 | `GET /screenshot?scale=0.5` | JPEG (PNG if Pillow is missing on the phone). Headers `X-Image-*`, `X-Screen-*`, `X-Scale`, `X-Foreground` |
-| `GET /ui` | Elements from allowed packages only; password text is blanked. Runs `uiautomator dump`, which unbinds every accessibility service on the phone for a moment |
-| `POST /tap` `{x,y,scale?}` | Refused while the keyboard is open on a password field |
-| `POST /swipe` `{x1,y1,x2,y2,ms?,scale?}` | ms 50-5000; same password-keyboard rule as tap |
-| `POST /type` `{text}` | 1-500 printable ASCII, `%` included; refused in password fields; the reply gives the focused field's `inputType` |
-| `POST /key` `{key}` | back, home, recents, enter, tab, delete, or any `KEYCODE_*` except power, calls, camera, assistant, volume, brightness and media; only while an allowed app is in front |
-| `POST /launch` `{package}` | Gmail or Chrome only, started from an allowed app or the home screen |
+| `GET /ui` | Every element on the screen, every package. Runs `uiautomator dump`, which unbinds every accessibility service on the phone for a moment |
+| `POST /tap` `{x,y,scale?}` | Any coordinates |
+| `POST /swipe` `{x1,y1,x2,y2,ms?,scale?}` | `ms` from 0 |
+| `POST /type` `{text}` | ASCII of any length; `\n` and `\t` become Enter and Tab; the reply gives the focused field's package, `inputType` and whether it is a password field |
+| `POST /key` `{key,longpress?}` | back, home, recents, enter, tab, delete, any `KEYCODE_*` name or key number |
+| `POST /launch` `{package}` | Any installed app |
 
-Errors: 400 `invalid_args`, 401 `unauthorized`, 404, 405, 409 `foreground_not_allowed` / `screen_off` / `password_field`, 429 `rate_limited`, 503 `device_offline` / `disabled` / `stopped`, 504 `device_timeout`, 502 other device errors.
+Every endpoint also takes `if_foreground` (run only while that app, or one of a list, has focus, checked in the same shell command as the action) and `timeout` (seconds, no upper limit; default 30). Unknown fields are dropped and named in `ignored_fields`.
+
+Errors: 400 `invalid_args`, 401 `unauthorized`, 404, 405, 409 `foreground_mismatch`, 503 `device_offline` / `disabled` / `stopped`, 504 `timeout` / `device_timeout`, 502 other device errors.
 
 The full list of what the agent can do, what is actively restricted and what is just not built is in [docs/CAPABILITIES.md](docs/CAPABILITIES.md).
 
@@ -185,9 +195,11 @@ python3 -m unittest discover -s phone/tests -v
 python3 scripts/e2e_test.py
 ```
 
-What the end-to-end test covers: token separation (agent, device and admin tokens cannot stand in for each other), validation, every endpoint, the allowlist (Settings, Teams, lock screen, launcher), in-app popups, screen off, password-field refusals (typing, and keyboard taps), typing `%`, `KEYCODE_*` keys and denied keys, Home and launch refused over other apps, launch from the home screen, the screenshot rate limit, the admin kill switch and reconnect, the stop file, a bad device token, and that typed text never reaches the log.
+What the end-to-end test covers: token separation (agent, device and admin tokens cannot stand in for each other), validation, every endpoint, the docs and the owner's private notes, actions in any app (Settings, Teams, lock screen, launcher) and with the screen off, typing into password fields, typing `%`, newlines and long text, any key, launch of any app, `if_foreground` (refusals, popups, screen off), timeouts (a hung command stopped, a long one allowed), no rate limit, unknown fields named, the admin kill switch and reconnect, the stop file, a bad device token, and that typed text never reaches the log.
 
-Checked on a Galaxy S24 (Android 17) with real input in Chrome and Gmail:
+CI (`.github/workflows/tests.yml`) runs all three on every pull request.
+
+Checked on a Galaxy S24 (Android 17) with real input in Chrome and Gmail, before the allowlist was removed:
 - the self-test;
 - taps, swipes and typing (`%` and `%s` included);
 - `KEYCODE_*` keys, with `KEYCODE_POWER` refused;
@@ -202,17 +214,16 @@ Not yet tested, because it needs the real phone and account (phase 4 of the plan
 
 ## 7. Security notes and known gaps
 
-- **Allowlist**: enforced by the client (it checks the foreground app before every action, and again after screenshots) and in the Worker (`/launch`, keys). Every input, screenshot and launch also runs inside a shell guard on the phone: `if <allowed app focused and screen awake>; then <action>; else echo PHONE_RELAY_REFUSED; fi`. The check and the action run in the same command, so a focus change between the client's check and the action is refused. A change in the milliseconds inside that one command is still possible. Focused in-app popups (`PopupWindow:…`, e.g. Chrome's menu) are attributed to the app in `mFocusedApp`; any other window without a package name (lock screen, shade) is refused.
+- **No allowlist**: the agent can do anything a person holding the unlocked phone can do, in any app (banking, messaging, Settings included), and press any key, power included. What stands between a session and the phone is the agent token (held by the network secret, never inside the session), the kill switches and the owner's rules in [docs/PHONE_RULES.md](docs/PHONE_RULES.md), which are guidance only.
+- **`if_foreground`**: the old allowlist's same-command guard, now opt-in. `if <named app focused and screen awake>; then <action>; else echo PHONE_RELAY_REFUSED; fi` runs on the phone, so a focus change between the agent's check and its action is refused. A change in the milliseconds inside that one command is still possible. Focused in-app popups (`PopupWindow:…`) count for the app in `mFocusedApp`.
 - **`uiautomator`**: only `/ui` runs `uiautomator dump`, which briefly unbinds every accessibility service on the phone. Nothing else calls it, including `--selftest`.
-- **Keyboard taps**: the on-screen keyboard never takes focus, so its keys pass the focus guard. While a password field is focused and the keyboard is open, taps and swipes are refused, so a password cannot be typed key by key. Chrome's in-page autofill dropdown is not covered.
-- **Notifications**: a heads-up notification from another app can appear in a screenshot taken while Chrome or Gmail is in front. Turn on Do Not Disturb during agent sessions.
-- **Password fields**: adb *can* type into password fields. This differs from the plan's "cannot enter secure fields (by design)". The client reads the focused field's `inputType` from `dumpsys input_method` and refuses `/type` for password types (text, visible, web and number passwords). That covers standard Android and HTML password inputs, but not custom fields that do not declare a password type.
-- **Gmail and Chrome**: use a test Google account. Keep Chrome signed out, with saved passwords and payment autofill off. The allowlist limits apps, not what Chrome can browse to.
-- **Rate limits** (300 requests/min, 120 screenshots/min by default; set `RATE_ACTIONS_PER_MIN` / `RATE_SCREENSHOTS_PER_MIN` as wrangler vars to change them) are stored in Durable Object storage, so they survive hibernation. `/state` and `/ui` count as requests.
-- **Coordinates** are checked against the larger screen dimension so both orientations work. Taps outside the visible screen are possible within that square; Android ignores them.
-- **Phone-side policy** (allowlist, keys) is constant in `phone_client.py`. Changing it means editing the code on the phone, which is intentional.
+- **Notifications**: a heads-up notification from another app can appear in a screenshot. Turn on Do Not Disturb during agent sessions if that matters.
+- **Password fields**: the agent can type into them and tap the keyboard over them. The reply to `/type` says when the focused field is a password field.
+- **Timeouts**: each command has a deadline (default 30 s; the agent can set any). The phone kills the adb call when it passes, so a hung command does not block the queue; the relay waits 10 s longer for a reply before giving up.
+- **Logging**: typed text is stored as its length only.
+- **Request shapes** are still checked (numbers are numbers, names match their patterns, text is ASCII), in the Worker and on the phone, so no value can carry shell syntax.
 
 ## 8. Not built
 
-- Phase 5 native app (Accessibility Service + MediaProjection) and phase 6 MCP wrapper / custom domain.
-- A status page for you (open question 4 in the plan); `/admin/status` covers this for now.
+- Everything under "Not built" in [docs/CAPABILITIES.md](docs/CAPABILITIES.md), including a status page for you (open question 4 in the plan); `/admin/status` covers that for now.
+- Phase 5 (native app) and phase 6 (MCP wrapper, custom domain) are dropped, not planned.
