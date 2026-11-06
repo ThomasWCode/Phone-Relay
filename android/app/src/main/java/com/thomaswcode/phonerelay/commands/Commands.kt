@@ -18,11 +18,12 @@ import kotlinx.serialization.json.put
  * client (phone/phone_client.py), done with what an app can use: its accessibility service
  * (gestures, global actions, the UI tree, screenshots, text fields) and Android's own APIs.
  *
- * Differences from the adb client: if_foreground is checked just before the action, not in the
- * same shell command, so a focus change in between is still possible; typing needs a focused text
- * field, and goes through the accessibility service's own input connection to it (as a keyboard);
- * keys are limited to what an app can do (Keys), any key reaching a focused field; the shell-only
- * commands (reading the clipboard, recording, audio, Chrome DevTools) are refused as unsupported.
+ * Differences from the adb client: if_foreground is checked just before the action (the adb
+ * client's check, in the same shell command, leaves a longer gap: `input` takes a moment to start);
+ * typing needs a focused text field, and goes through the accessibility service's own input
+ * connection to it (as a keyboard); keys are what an app can do (Keys), any key reaching a focused
+ * field; recording and audio go through MediaProjection, whose consent prompt the accessibility
+ * service answers; Chrome DevTools is refused as unsupported.
  */
 class Commands(
     private val device: Device,
@@ -46,6 +47,11 @@ class Commands(
         "statusbar" to { a, _ -> statusbar(a) },
         "rotation" to { a, _ -> rotation(a) },
         "clipboard_set" to { a, _ -> clipboardSet(a) },
+        "clipboard_get" to { _, _ -> buildJsonObject { put("text", device.readClipboard()) } },
+        "record_start" to { a, _ -> recordStart(a) },
+        "record_stop" to { _, s -> recordStop(s ?: noStream("record_stop")) },
+        "record" to { a, s -> record(a, s ?: noStream("record")) },
+        "audio" to { a, s -> audio(a, s ?: noStream("audio")) },
         "wait" to { a, _ -> wait(a) },
         "batch" to { a, _ -> batch(a) },
         "files" to { a, _ -> files(a) },
@@ -68,6 +74,9 @@ class Commands(
         return withTimeoutOrNull((timeout * 1000).toLong()) { handler(args, stream) }
             ?: throw CommandError("timeout", "$cmd took longer than ${fmt(timeout)} s; pass a larger timeout")
     }
+
+    /** The connection closed (the owner's switch, a disable, a drop): capture ends with it, as in the adb client. */
+    fun closed() = device.endCapture()
 
     private fun noStream(cmd: String): Nothing = throw CommandError("invalid_args", "$cmd streams over the relay; it cannot run here")
 
@@ -121,9 +130,9 @@ class Commands(
     }
 
     private fun ui(args: JsonObject): JsonObject {
+        // Both engines are the accessibility tree here: it unbinds no other accessibility service, unlike uiautomator.
         val engine = args.stringArg("engine", required = false) ?: "helper"
-        if (engine == "uiautomator") throw CommandError("unsupported", "engine=uiautomator needs the adb client")
-        if (engine != "helper") throw CommandError("invalid_args", "engine must be helper or uiautomator")
+        if (engine != "helper" && engine != "uiautomator") throw CommandError("invalid_args", "engine must be helper or uiautomator")
         val elements = UiTree.elements(device.uiRoots())
         recheck(args, "UI dump")
         return buildJsonObject {
@@ -345,6 +354,55 @@ class Commands(
         return buildJsonObject { put("length", text.length) }
     }
 
+    // ---- recording and audio ----
+
+    private fun recordSeconds(args: JsonObject): Double {
+        val seconds = args.numberArg("seconds", 10.0)
+        if (seconds <= 0) throw CommandError("invalid_args", "seconds must be above 0")
+        return seconds
+    }
+
+    private suspend fun recordStart(args: JsonObject): JsonObject {
+        val seconds = recordSeconds(args)
+        val size = args.stringArg("size", required = false)?.let {
+            val m = Regex("^(\\d{2,5})x(\\d{2,5})$").matchEntire(it) ?: throw CommandError("invalid_args", "size must look like 720x1560")
+            Size(m.groupValues[1].toInt(), m.groupValues[2].toInt())
+        }
+        val bitRate = args["bit_rate"]?.takeIf { it !is JsonNull }?.let {
+            (it as? JsonPrimitive)?.takeIf { p -> !p.isString }?.intOrNull?.takeIf { b -> b > 0 }
+                ?: throw CommandError("invalid_args", "bit_rate must be a whole number of bits per second")
+        } ?: RECORD_BIT_RATE
+        device.startRecording(seconds, size, bitRate)
+        return buildJsonObject { put("recording", true); put("max_seconds", seconds) }
+    }
+
+    private suspend fun sendOwnFile(stream: Stream, path: String, mime: String, headers: Map<String, String>): Long = try {
+        device.openRead(path).use { stream.sendFile(it, device.ownFileSize(path), mime, headers) }
+    } finally {
+        runCatching { device.deleteFile(path) }
+    }
+
+    private suspend fun recordStop(stream: Stream): JsonObject {
+        val path = device.stopRecording() ?: throw CommandError("not_found", "no recording: start one with /record/start")
+        val size = sendOwnFile(stream, path, "video/mp4", mapOf("X-Segments" to "1"))
+        return buildJsonObject { put("segments", 1); put("bytes", size) }
+    }
+
+    private suspend fun record(args: JsonObject, stream: Stream): JsonObject {
+        val started = recordStart(args)
+        delay(Math.round((started["max_seconds"] as JsonPrimitive).content.toDouble() * 1000) + 300)
+        return recordStop(stream)
+    }
+
+    private suspend fun audio(args: JsonObject, stream: Stream): JsonObject {
+        val seconds = recordSeconds(args)
+        val source = args.stringArg("source", required = false) ?: "output"
+        if (source !in AUDIO_SOURCES) throw CommandError("invalid_args", "source must be one of ${AUDIO_SOURCES.joinToString(", ")}")
+        val path = device.recordAudio(seconds, source)
+        val size = sendOwnFile(stream, path, "audio/wav", mapOf("X-Audio-Source" to source))
+        return buildJsonObject { put("seconds", seconds); put("source", source); put("bytes", size) }
+    }
+
     // ---- wait and batch ----
 
     private suspend fun wait(args: JsonObject): JsonObject {
@@ -487,15 +545,16 @@ class Commands(
 
     companion object {
         const val TAP_MS = 50L
+        const val RECORD_BIT_RATE = 2_000_000
+        val AUDIO_SOURCES = listOf("output", "mic")
         val WAIT_KINDS = listOf("change", "stable", "foreground", "text")
         val BATCH_COMMANDS = listOf(
             "state", "screenshot", "ui", "tap", "swipe", "type", "key", "launch", "open", "intent", "notifications",
-            "statusbar", "rotation", "wait", "files", "gesture", "clipboard_set", "sleep",
+            "statusbar", "rotation", "wait", "files", "gesture", "clipboard_set", "clipboard_get", "record_start", "sleep",
         )
         /** The adb client's commands that need the shell user's privileges. */
         val ADB_ONLY = setOf(
-            "clipboard_get", "record", "record_start", "record_stop", "audio", "chrome_sockets", "chrome_tabs",
-            "chrome_eval", "chrome_cdp", "chrome_new", "chrome_close", "chrome_activate",
+            "chrome_sockets", "chrome_tabs", "chrome_eval", "chrome_cdp", "chrome_new", "chrome_close", "chrome_activate",
         )
 
         /** Fraction of pixels that changed noticeably between two frames (1 for different sizes). */

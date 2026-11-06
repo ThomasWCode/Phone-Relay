@@ -15,14 +15,16 @@ The phone side is either the **Android app** (always on; it drives the phone thr
 |---|---|---|
 | Runs | Always, on any network; back by itself after a reboot or an update | Only while wireless debugging is on (Wi-Fi); started again after each reboot |
 | Off switch on the phone | Quick Settings tile, notification, the app | The stop file |
-| `if_foreground` | Checked just before the action | Checked in the same shell command as the action |
+| `if_foreground` | Checked just before the action, milliseconds ahead of it | Checked in the same shell command as the action, which still leaves a gap: `input` (a Java program) takes a moment to start |
 | Typing | Into the focused field only (409 `no_text_field` otherwise), through the app's own input connection, as a keyboard types | Anywhere, as key events (`input text`), pasting what is not ASCII |
 | Keys | Back, Home, Recents, the shade, power (locks; held: the power menu), wake, d-pad, volume, media, page up/down; while a field is focused, any key | Any key |
-| UI tree | Every window of the main user, as the accessibility framework gives it | The same through the helper, or `uiautomator` |
+| UI tree | Every window of the main user, as the accessibility framework gives it; `engine=uiautomator` gives the same tree and unbinds nothing | The same through the helper, or `uiautomator` |
 | Screenshots | Through the accessibility service (about 3 a second at most) | `screencap` |
-| Gestures | Up to Android's stroke limit, at most 60 s each | Up to 10 fingers, any length |
-| Shell-only (501 `unsupported` in the app) | — | Reading the clipboard, screen recording, audio, Chrome DevTools, `engine=uiautomator` |
-| Grants the owner gives once | Accessibility service, notification access, all-files access, modify system settings, no battery optimisation | Wireless debugging pairing |
+| Gestures | Up to 10 fingers, any length (past Android's 60 s, as strokes that continue each other, the fingers staying down) | Up to 10 fingers, any length |
+| Reading the clipboard | An invisible window of the app comes forward for a moment (Android lets only the app in front read it) | Through the helper |
+| Screen recording, audio | MediaProjection: Android's consent prompt shows for a moment before each, and the app answers it; the status bar shows the capture. One MP4 at any length. The sound output is captured as it plays, without apps that refuse capture (and calls) | `screenrecord` (MP4 segments past 180 s) and the helper (the output goes quiet on the phone meanwhile) |
+| Shell-only (501 `unsupported` in the app) | — | Chrome DevTools |
+| Grants the owner gives once | Accessibility service, notification access, all-files access, modify system settings, no battery optimisation, the microphone | Wireless debugging pairing |
 
 ## Can do
 
@@ -68,8 +70,8 @@ The phone side is either the **Android app** (always on; it drives the phone thr
 - **Pull** any file the shell can read (`/files/pull`), and **push** a file anywhere the shell can write (`/files/push`), of any size. Files cross the relay in acknowledged 256 KiB chunks and are streamed, never held whole in memory. A pushed file is not added to the media library, so a gallery app may not show it straight away.
 
 ### Screen recording
-- **Record** the screen as MP4: for a set time (`/record?seconds=`), or around other commands (`/record/start`, then anything, then `/record/stop`, which returns the video). Android stops each file at 180 s, so a longer recording comes back as a zip of consecutive MP4 segments. The video has no sound.
-- **Audio** (`/audio`): the phone's audio output or its microphone, for a set time, as a 48 kHz stereo WAV. While the output is captured it does not play on the phone itself; the microphone shows Android's privacy indicator.
+- **Record** the screen as MP4: for a set time (`/record?seconds=`), or around other commands (`/record/start`, then anything, then `/record/stop`, which returns the video). With the adb client Android stops each file at 180 s, so a longer recording comes back as a zip of consecutive MP4 segments; the app's is one MP4. The video has no sound.
+- **Audio** (`/audio`): the phone's audio output or its microphone, for a set time, as a 48 kHz stereo WAV. With the adb client the output does not play on the phone itself while it is captured; the app captures it as it plays. The microphone shows Android's privacy indicator.
 
 ### Waiting and batches
 - **Wait** (`/wait`) until the screen changes, stops changing (an animation or page load has settled), an app comes to the front, or some text appears in the UI tree. Screens are compared at 1/8 scale, so a blinking cursor does not count as a change.
@@ -79,7 +81,7 @@ The phone side is either the **Android app** (always on; it drives the phone thr
 Gestures, the clipboard, pasted text, audio and the UI tree go through a small Java helper (`phone/helper/`), which the phone client pushes to `/data/local/tmp` on first use and runs as the shell user with `app_process`, as scrcpy does. It reaches hidden framework APIs by reflection; if a future Android changes one, that command fails with 502 `helper_failed` and its reason, and nothing falls back silently.
 
 ### Control
-- **`if_foreground`**: any command can name one package or a list. It then runs only while one of them has focus and the screen is on, checked in the same shell command on the phone as the action; otherwise it is refused with 409 `foreground_mismatch`. A screenshot or UI dump is thrown away if the app changed during the capture. In-app popup menus count for their app.
+- **`if_foreground`**: any command can name one package or a list. It then runs only while one of them has focus and the screen is on, checked on the phone just before the action (the adb client: in the same shell command); otherwise it is refused with 409 `foreground_mismatch`. A screenshot or UI dump is thrown away if the app changed during the capture. In-app popup menus count for their app.
 - **`timeout`**: any command can set its deadline in seconds, with no upper limit. Without one it is 30 s, plus the work's own time: 0.1 s per typed character, a swipe's duration, a wait's `seconds`, twice a recording's length, a batch's steps. Moving a file, or stopping a recording and fetching it, gets 300 s.
 - Fields a command does not take are dropped and named in the reply (`ignored_fields`, or the `X-Ignored-Fields` header on screenshots), so a typo does not pass silently.
 
@@ -99,4 +101,4 @@ Typed text is never logged, only its length. That limits what is recorded, not w
 
 Nothing from the earlier list is left; the native app (phase 5) is built. The owner dropped these rather than have them built: the phase 6 MCP wrapper and custom domain, and a status page for the owner (`/admin/status` and `/admin/log` give the same information).
 
-The app does not record the screen or audio (MediaProjection, with Android's consent prompt every time), read the clipboard (Android allows that only to the app in front or the keyboard), or reach Chrome DevTools (its socket admits the shell user only). The adb client does all four.
+The app does all the adb client does but reach Chrome DevTools, whose socket admits the shell user only.

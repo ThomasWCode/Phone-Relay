@@ -25,6 +25,11 @@
         tools:ignore="ProtectedPermissions" />
     <!-- KEYCODE_WAKEUP: turning the screen on. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- /record and /audio: a projection (Android asks before each one; the accessibility service
+         answers) and the microphone, each in the relay's service while it runs. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
     <application
         android:name=".RelayApp"
@@ -45,10 +50,28 @@
             </intent-filter>
         </activity>
 
+        <!-- /clipboard and the capture prompt: a moment in front, with nothing to see. -->
+        <activity
+            android:name=".ClipboardActivity"
+            android:configChanges="density|keyboard|keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:taskAffinity=""
+            android:theme="@style/Invisible" />
+
+        <activity
+            android:name=".ProjectionActivity"
+            android:configChanges="density|keyboard|keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:taskAffinity=""
+            android:theme="@style/Invisible" />
+
+        <!-- specialUse from the start; mediaProjection and microphone only while a capture runs. -->
         <service
             android:name=".RelayService"
             android:exported="false"
-            android:foregroundServiceType="specialUse">
+            android:foregroundServiceType="specialUse|mediaProjection|microphone">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="A remote-control relay the owner turns on: keeps a WebSocket to the owner's relay open so their agent can reach the phone." />

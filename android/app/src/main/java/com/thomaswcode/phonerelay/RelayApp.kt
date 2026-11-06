@@ -17,6 +17,9 @@ class RelayApp : Application() {
         private set
     lateinit var connection: RelayConnection
         private set
+    /** Screen recording and sound capture: ProjectionActivity hands it Android's consent. */
+    lateinit var capture: Capture
+        private set
     private lateinit var _enabled: MutableStateFlow<Boolean>
     /** Whether the owner has the relay on, wherever it was switched (the app, the tile, the notification). */
     val enabled: StateFlow<Boolean> get() = _enabled
@@ -26,7 +29,8 @@ class RelayApp : Application() {
         prefs = Prefs(this)
         _enabled = MutableStateFlow(prefs.enabled)
         prefs.importPending()
-        val commands = Commands(AndroidDevice(this), BuildConfig.VERSION_NAME) { code ->
+        capture = Capture(this, scope)
+        val commands = Commands(AndroidDevice(this, capture), BuildConfig.VERSION_NAME) { code ->
             KeyEvent.keyCodeToString(code).takeIf { it.startsWith("KEYCODE_") }
         }
         connection = RelayConnection(prefs, commands, BuildConfig.VERSION_NAME, scope)

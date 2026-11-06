@@ -67,7 +67,14 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private class Grant(val name: String, val why: String, val granted: Boolean, val open: () -> Intent?)
+/** A grant: a Settings screen to open, or (open gives null) a runtime permission to ask for. */
+private class Grant(
+    val name: String,
+    val why: String,
+    val granted: Boolean,
+    val permission: String = Manifest.permission.POST_NOTIFICATIONS,
+    val open: () -> Intent?,
+)
 
 private fun grants(context: Context): List<Grant> {
     val pkg = Uri.parse("package:${context.packageName}")
@@ -92,6 +99,9 @@ private fun grants(context: Context): List<Grant> {
         Grant("Modify system settings", "/rotation", Settings.System.canWrite(context)) {
             Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS, pkg)
         },
+        Grant("Microphone", "/audio (both sources: Android needs it for the phone's sound too)",
+            context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED,
+            Manifest.permission.RECORD_AUDIO) { null },
     )
 }
 
@@ -148,7 +158,7 @@ private fun Screen(@Suppress("UNUSED_PARAMETER") tick: Int) {
                     if (!grant.granted) {
                         OutlinedButton(onClick = {
                             val intent = grant.open()
-                            if (intent == null) askNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
+                            if (intent == null) askNotifications.launch(grant.permission)
                             else runCatching { context.startActivity(intent) }
                         }) { Text("Allow") }
                     }

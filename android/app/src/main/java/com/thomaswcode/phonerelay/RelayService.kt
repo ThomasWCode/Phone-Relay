@@ -23,6 +23,8 @@ import kotlinx.coroutines.launch
  */
 class RelayService : Service() {
     private var statusJob: Job? = null
+    /** What a capture is doing, for the notification, while one runs. */
+    @Volatile private var capturing: String? = null
     private val screen = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) = RelayApp.of(context).connection.nudge()
     }
@@ -31,6 +33,7 @@ class RelayService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        instance = this
         val app = RelayApp.of(this)
         channel()
         startForeground(NOTIFICATION_ID, notification(app.connection.status.value.label), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
@@ -57,10 +60,22 @@ class RelayService : Service() {
     }
 
     override fun onDestroy() {
+        instance = null
         statusJob?.cancel()
         runCatching { unregisterReceiver(screen) }
         RelayApp.of(this).connection.stop()
         super.onDestroy()
+    }
+
+    /**
+     * Takes on a capture's foreground service types (mediaProjection, microphone) beside specialUse,
+     * or drops them with 0: Android lets a projection and the microphone run only in a service of
+     * their type. The notification says what is being captured.
+     */
+    fun captureTypes(types: Int, what: String?) {
+        capturing = if (types == 0) null else what
+        val status = RelayApp.of(this).connection.status.value.label
+        startForeground(NOTIFICATION_ID, notification(status), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE or types)
     }
 
     private fun channel() {
@@ -83,7 +98,7 @@ class RelayService : Service() {
         return Notification.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_relay)
             .setContentTitle(getString(R.string.notification_title))
-            .setContentText(status)
+            .setContentText(capturing?.let { "$status; $it" } ?: status)
             .setContentIntent(open)
             .setOngoing(true)
             .addAction(Notification.Action.Builder(null, getString(R.string.turn_off), off).build())
@@ -95,6 +110,11 @@ class RelayService : Service() {
         private const val CHANNEL = "relay"
         private const val NOTIFICATION_ID = 1
         const val ACTION_TURN_OFF = "com.thomaswcode.phonerelay.TURN_OFF"
+
+        /** The running service, for a capture to take on its types. */
+        @Volatile
+        var instance: RelayService? = null
+            private set
 
         fun start(context: Context) {
             context.startForegroundService(Intent(context, RelayService::class.java))

@@ -20,6 +20,7 @@ import android.os.Bundle
 import android.os.Environment
 import android.os.PowerManager
 import android.provider.Settings
+import android.util.Log
 import android.view.Display
 import android.view.KeyEvent
 import android.view.WindowManager
@@ -31,6 +32,7 @@ import com.thomaswcode.phonerelay.commands.FileEntry
 import com.thomaswcode.phonerelay.commands.Frame
 import com.thomaswcode.phonerelay.commands.GlobalAction
 import com.thomaswcode.phonerelay.commands.IntentSpec
+import com.thomaswcode.phonerelay.commands.Paths
 import com.thomaswcode.phonerelay.commands.Point
 import com.thomaswcode.phonerelay.commands.Rotation
 import com.thomaswcode.phonerelay.commands.Shot
@@ -47,12 +49,14 @@ import java.io.OutputStream
 import java.nio.file.Files
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.JsonObject
 
 /** The Device the commands drive, done with the accessibility service and Android's own APIs. */
-class AndroidDevice(private val context: Context) : Device {
+class AndroidDevice(private val context: Context, private val capture: Capture) : Device {
 
     private val service: PhoneAccessibilityService
         get() = PhoneAccessibilityService.instance
@@ -152,7 +156,8 @@ class AndroidDevice(private val context: Context) : Device {
 
     // ---- the UI tree ----
 
-    private class Node(private val n: AccessibilityNodeInfo) : UiNode {
+    /** A node of the UI tree; Capture presses the capture prompt's button through it. */
+    class Node(val n: AccessibilityNodeInfo) : UiNode {
         override val text get() = n.text?.toString()
         override val desc get() = n.contentDescription?.toString()
         override val viewId: String? get() = n.viewIdResourceName
@@ -180,25 +185,43 @@ class AndroidDevice(private val context: Context) : Device {
 
     override suspend fun gesture(paths: List<List<Point>>, ms: Long) {
         val s = service
-        if (ms > GestureDescription.getMaxGestureDuration()) {
-            throw CommandError("unsupported", "Android limits one gesture to ${GestureDescription.getMaxGestureDuration() / 1000} s")
-        }
         if (paths.size > GestureDescription.getMaxStrokeCount()) {
             throw CommandError("unsupported", "Android takes at most ${GestureDescription.getMaxStrokeCount()} fingers at once")
         }
         if (paths.any { path -> path.any { it.x < 0 || it.y < 0 } }) {
             throw CommandError("invalid_args", "Android takes no point beyond the screen's top or left edge")
         }
-        val builder = GestureDescription.Builder()
-        for (points in paths) {
-            val path = Path().apply {
-                moveTo(points[0].x, points[0].y)
-                for (p in points.drop(1)) lineTo(p.x, p.y)
+        // Android takes a minute at most in one gesture: a longer one goes as slices, each stroke continuing the last, the fingers staying down.
+        val slices = Paths.slices(ms, GestureDescription.getMaxGestureDuration())
+        var strokes: List<GestureDescription.StrokeDescription>? = null
+        for (i in 0 until slices) {
+            val t0 = i.toDouble() / slices
+            val t1 = (i + 1).toDouble() / slices
+            val sliceMs = ms * (i + 1) / slices - ms * i / slices
+            val more = i < slices - 1
+            val previous = strokes
+            strokes = paths.mapIndexed { k, points ->
+                val part = Paths.slice(points, t0, t1)
+                val path = Path().apply {
+                    moveTo(part[0].x, part[0].y)
+                    for (p in part.drop(1)) lineTo(p.x, p.y)
+                }
+                previous?.get(k)?.continueStroke(path, 0, sliceMs, more) ?: GestureDescription.StrokeDescription(path, 0, sliceMs, more)
             }
-            builder.addStroke(GestureDescription.StrokeDescription(path, 0, ms))
+            val builder = GestureDescription.Builder()
+            strokes.forEach(builder::addStroke)
+            val started = android.os.SystemClock.uptimeMillis()
+            dispatch(s, builder.build())
+            // A finger held still sends nothing after its first touch, so Android calls a slice that continues done at
+            // once (found on the phone): wait out the slice's time, the finger still down, before the next.
+            if (more) delay(sliceMs - (android.os.SystemClock.uptimeMillis() - started))
+            if (slices > 1) Log.i("PhoneRelay", "gesture slice ${i + 1}/$slices of $sliceMs ms took ${android.os.SystemClock.uptimeMillis() - started} ms")
         }
+    }
+
+    private suspend fun dispatch(s: AccessibilityService, gesture: GestureDescription) {
         suspendCancellableCoroutine { cont ->
-            val dispatched = s.dispatchGesture(builder.build(), object : AccessibilityService.GestureResultCallback() {
+            val dispatched = s.dispatchGesture(gesture, object : AccessibilityService.GestureResultCallback() {
                 override fun onCompleted(gestureDescription: GestureDescription?) = cont.resume(Unit)
                 override fun onCancelled(gestureDescription: GestureDescription?) =
                     cont.resumeWithException(CommandError("gesture_cancelled", "Android cancelled the gesture (a real touch, or the screen changed)"))
@@ -326,6 +349,38 @@ class AndroidDevice(private val context: Context) : Device {
         val clipboard = context.getSystemService(ClipboardManager::class.java)
         if (text == null) clipboard.clearPrimaryClip() else clipboard.setPrimaryClip(ClipData.newPlainText("Phone Relay", text))
     }
+
+    override suspend fun readClipboard(): String? {
+        val s = service
+        val result = CompletableDeferred<String?>()
+        ClipboardActivity.pending = result
+        try {
+            // Android lets only the app in front read the clipboard: an invisible window comes forward for a moment.
+            s.startActivity(
+                Intent(context, ClipboardActivity::class.java).addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION or Intent.FLAG_ACTIVITY_NO_USER_ACTION,
+                ),
+            )
+            // In a list: an empty clipboard's null is an answer, the timeout's null is not.
+            val read = withTimeoutOrNull(CLIPBOARD_MS) { listOf(result.await()) }
+                ?: throw CommandError("device_error", "the app could not come forward to read the clipboard (Android lets only the app in front read it)")
+            return read[0]
+        } finally {
+            if (ClipboardActivity.pending === result) ClipboardActivity.pending = null
+        }
+    }
+
+    // ---- recording and sound ----
+
+    override suspend fun startRecording(seconds: Double, size: Size?, bitRate: Int) = capture.startRecording(seconds, size, bitRate)
+
+    override suspend fun stopRecording(): String? = capture.stopRecording()
+
+    override suspend fun recordAudio(seconds: Double, source: String): String = capture.recordAudio(seconds, source)
+
+    override fun ownFileSize(path: String): Long = File(path).length()
+
+    override fun endCapture() = capture.end()
 
     // ---- sound, power ----
 
@@ -467,5 +522,9 @@ class AndroidDevice(private val context: Context) : Device {
 
     override fun scanFile(path: String) {
         MediaScannerConnection.scanFile(context, arrayOf(path), null, null)
+    }
+
+    private companion object {
+        const val CLIPBOARD_MS = 5_000L
     }
 }

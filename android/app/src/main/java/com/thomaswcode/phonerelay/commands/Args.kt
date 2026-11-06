@@ -86,7 +86,9 @@ fun defaultTimeout(cmd: String, args: JsonObject): Double = when (cmd) {
     "type" -> DEFAULT_TIMEOUT_S + ((args["text"] as? JsonPrimitive)?.content?.length ?: 0) / 10.0
     "swipe", "gesture" -> DEFAULT_TIMEOUT_S + maxOf(args.number("ms") ?: 0.0, 0.0) / 1000
     "wait" -> DEFAULT_TIMEOUT_S + (args.number("seconds") ?: 10.0)
-    "pull", "push" -> TRANSFER_TIMEOUT_S
+    "pull", "push", "record_stop" -> TRANSFER_TIMEOUT_S
+    // As the adb client: twice the recording's length, a minute on top (the consent prompt, the transfer).
+    "record", "audio" -> 2 * DEFAULT_TIMEOUT_S + 2 * (args.number("seconds") ?: 10.0)
     "batch" -> DEFAULT_TIMEOUT_S + ((args["steps"] as? JsonArray) ?: JsonArray(emptyList())).sumOf { step ->
         val obj = step as? JsonObject
         val cmdName = (obj?.get("cmd") as? JsonPrimitive)?.content ?: ""
