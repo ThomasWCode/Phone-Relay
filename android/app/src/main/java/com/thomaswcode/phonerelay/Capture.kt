@@ -30,10 +30,13 @@ import com.thomaswcode.phonerelay.commands.Video
 import com.thomaswcode.phonerelay.commands.Wav
 import java.io.File
 import java.io.RandomAccessFile
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
@@ -69,6 +72,8 @@ class Capture(private val context: Context, private val scope: CoroutineScope) {
     private var session: Session? = null
     private var recording: Recording? = null
     @Volatile private var request: Request? = null
+    /** How many times end() has run: a recording that started across one is not kept. */
+    private var ends = 0
 
     private fun micAllowed() = context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
 
@@ -198,10 +203,11 @@ class Capture(private val context: Context, private val scope: CoroutineScope) {
 
     suspend fun startRecording(seconds: Double, size: Size?, bitRate: Int) {
         drop() // a recording left running or unfetched is dropped, as in the adb client
+        val generation = synchronized(this) { ends }
         val s = acquire(projection = true, label = "recording the screen")
         var recorder: MediaRecorder? = null
         var display: VirtualDisplay? = null
-        try {
+        val rec = try {
             val frame = videoSize(size)
             val file = File(context.cacheDir, "record.mp4").apply { delete() }
             recorder = MediaRecorder(context).apply {
@@ -220,14 +226,22 @@ class Capture(private val context: Context, private val scope: CoroutineScope) {
             ) ?: throw CommandError("device_error", "Android would not mirror the screen for the recording")
             display = mirror
             recorder.start()
-            val rec = Recording(s, recorder, mirror, file)
-            synchronized(this) { recording = rec }
-            rec.timer = scope.launch { delay(Math.round(seconds * 1000)); finish(rec) }
+            Recording(s, recorder, mirror, file)
         } catch (e: Exception) {
             runCatching { recorder?.release() }
             runCatching { display?.release() }
             release(s)
-            throw e as? CommandError ?: CommandError("device_error", "the recording could not start: ${e.message}")
+            throw if (e is CommandError || e is CancellationException) e else CommandError("device_error", "the recording could not start: ${e.message}")
+        }
+        rec.timer = scope.launch { delay(Math.round(seconds * 1000)); finish(rec) }
+        // The connection may have closed while this started (end() found no recording then): checked
+        // against end() under the same lock, so a recording is either seen by end() or not kept.
+        val active = currentCoroutineContext().isActive
+        val kept = synchronized(this) { (active && ends == generation).also { if (it) recording = rec } }
+        if (!kept) {
+            finish(rec)
+            rec.file.delete()
+            throw CommandError("stopped", "the connection closed while the recording started")
         }
     }
 
@@ -351,6 +365,7 @@ class Capture(private val context: Context, private val scope: CoroutineScope) {
 
     /** The owner's kill switches and a closed connection: a recording stops and is deleted, a prompt is given up. */
     fun end() {
+        synchronized(this) { ends++ }
         drop()
         request?.result?.cancel()
         ProjectionActivity.close()
