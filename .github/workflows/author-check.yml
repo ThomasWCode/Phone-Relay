@@ -1,0 +1,42 @@
+# Runs the shared author check from ThomasWCode/author-check on every PR
+# change and every comment or review on a PR. A "/author-check fix" comment
+# from the repo owner also runs the fix, which repairs what the check fails.
+name: author-check
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+  issue_comment:
+    types: [created, edited]
+  pull_request_review:
+    types: [submitted, edited]
+  pull_request_review_comment:
+    types: [created, edited]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+  statuses: write
+
+concurrency:
+  group: author-check-${{ github.event.pull_request.number || github.event.issue.number }}
+
+jobs:
+  check:
+    # Not for a "/author-check fix" comment: the fix runs the check itself once it is done
+    if: >-
+      (github.event_name != 'issue_comment' || github.event.issue.pull_request) &&
+      !(github.event_name == 'issue_comment' && github.event.action == 'created' &&
+      startsWith(github.event.comment.body, '/author-check fix') && github.event.comment.author_association == 'OWNER')
+    uses: ThomasWCode/author-check/.github/workflows/check.yml@main
+  fix:
+    if: >-
+      github.event_name == 'issue_comment' && github.event.action == 'created' && github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/author-check fix') && github.event.comment.author_association == 'OWNER'
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      statuses: write
+    uses: ThomasWCode/author-check/.github/workflows/fix.yml@main
