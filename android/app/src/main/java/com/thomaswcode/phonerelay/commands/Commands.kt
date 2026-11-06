@@ -4,6 +4,7 @@ import java.net.URLConnection
 import java.util.Base64
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.yield
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
@@ -365,7 +366,7 @@ class Commands(
                 val found = UiTree.elements(device.uiRoots()).firstOrNull { UiTree.contains(it, wanted!!) }
                 if (found != null) return result(true) { put("element", found) }
                 if (over()) return result(false)
-                delay(interval)
+                pause(interval)
             }
             "foreground" -> {
                 val first = device.foreground()
@@ -373,7 +374,7 @@ class Commands(
                     val fg = device.foreground()
                     if (if (pkg != null) fg == pkg else fg != first) return result(true) { put("foreground", fg) }
                     if (over()) return result(false) { put("foreground", fg) }
-                    delay(interval)
+                    pause(interval)
                 }
             }
         }
@@ -381,7 +382,7 @@ class Commands(
         var diff = 0.0
         while (true) {
             if (over()) return result(false) { put("diff", round4(diff)) }
-            delay(interval)
+            pause(interval)
             val frame = device.frame()
             diff = frameDiff(reference, frame)
             if ((kind == "change" && diff > threshold) || (kind == "stable" && diff <= threshold)) {
@@ -389,6 +390,11 @@ class Commands(
             }
             if (kind == "stable") reference = frame
         }
+    }
+
+    /** Waits between polls; with no interval it still yields, so the deadline and a disconnect can stop the wait (delay(0) does not suspend). */
+    private suspend fun pause(ms: Long) {
+        if (ms > 0) delay(ms) else yield()
     }
 
     private suspend fun batch(args: JsonObject): JsonObject {
@@ -456,9 +462,25 @@ class Commands(
         return buildJsonObject { put("path", p); put("bytes", size) }
     }
 
+    /**
+     * The upload goes to a hidden .part file beside the destination, which replaces it only once the
+     * whole file has arrived: a failed, cancelled or timed-out upload leaves the old file as it was.
+     */
     private suspend fun push(args: JsonObject, stream: Stream): JsonObject {
         val p = path(args)
-        val size = device.openWrite(p).use { stream.recvFile(it) }
+        val part = p.substringBeforeLast('/') + "/." + p.substringAfterLast('/') + ".part"
+        val size = try {
+            device.openWrite(part).use { stream.recvFile(it) }
+        } catch (e: Throwable) { // a cancellation too
+            runCatching { device.deleteFile(part) }
+            throw e
+        }
+        try {
+            device.moveFile(part, p)
+        } catch (e: Throwable) {
+            runCatching { device.deleteFile(part) }
+            throw e
+        }
         device.scanFile(p)
         return buildJsonObject { put("path", p); put("bytes", size) }
     }

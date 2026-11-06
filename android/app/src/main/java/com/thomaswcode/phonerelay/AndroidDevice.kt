@@ -451,6 +451,20 @@ class AndroidDevice(private val context: Context) : Device {
         throw CommandError("not_found", "${e.message}")
     }
 
+    override fun moveFile(from: String, to: String) {
+        val source = File(from)
+        val target = File(to)
+        if (!source.renameTo(target)) {
+            // renameTo will not replace on every filesystem: replace by hand.
+            if (target.exists() && !target.delete()) throw CommandError("device_error", "could not replace $to")
+            if (!source.renameTo(target)) throw CommandError("device_error", "could not move the upload to $to")
+        }
+    }
+
+    override fun deleteFile(path: String) {
+        File(path).delete()
+    }
+
     override fun scanFile(path: String) {
         MediaScannerConnection.scanFile(context, arrayOf(path), null, null)
     }

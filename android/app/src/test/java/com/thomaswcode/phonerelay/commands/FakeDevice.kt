@@ -158,6 +158,14 @@ class FakeDevice : Device {
         }
     }
 
+    override fun moveFile(from: String, to: String) {
+        written[to] = written.remove(from) ?: throw CommandError("not_found", from)
+    }
+
+    override fun deleteFile(path: String) {
+        written.remove(path)
+    }
+
     override fun scanFile(path: String) {
         scanned += path
     }

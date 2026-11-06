@@ -271,6 +271,33 @@ class CommandsTest {
         assertEquals(1, acks.size)
         assertEquals("invalid_args", error("pull", """{"path": "/sdcard/Download/a.txt"}""").code) // no stream: not over the relay
     }
+
+    @Test
+    fun aFailedUploadLeavesTheOldFileAsItWas() = runTest {
+        device.written["/sdcard/Download/keep.txt"] = "the old file".toByteArray()
+        val stream = Stream("u") { }
+        stream.inbox.trySend(args("""{"type": "chunk", "seq": 0, "data": "${Base64.getEncoder().encodeToString("half".toByteArray())}"}"""))
+        stream.inbox.trySend(args("""{"type": "cancel"}"""))
+        assertEquals("cancelled", assertFailsWith<CommandError> {
+            commands.handle("push", args("""{"path": "/sdcard/Download/keep.txt"}"""), stream)
+        }.code)
+        assertEquals("the old file", String(device.written["/sdcard/Download/keep.txt"]!!))
+        assertEquals(setOf("/sdcard/Download/keep.txt"), device.written.keys) // the .part file is gone
+    }
+
+    @Test
+    fun aZeroIntervalWaitStillStopsAtItsDeadline() = runBlocking {
+        device.fg = "com.android.chrome"
+        val started = System.nanoTime()
+        val e = assertFailsWith<CommandError> {
+            run("wait", """{"for": "foreground", "package": "com.example.app", "interval_ms": 0, "seconds": 3600, "timeout": 0.3}""")
+        }
+        assertEquals("timeout", e.code)
+        assertTrue((System.nanoTime() - started) / 1_000_000 < 3000)
+        assertEquals("timeout", assertFailsWith<CommandError> {
+            run("wait", """{"for": "text", "text": "never", "interval_ms": 0, "seconds": 3600, "timeout": 0.3}""")
+        }.code)
+    }
 }
 
 class StreamTest {

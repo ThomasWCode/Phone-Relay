@@ -120,6 +120,9 @@ interface Device {
     fun stat(path: String): FileEntry
     fun openRead(path: String): InputStream
     fun openWrite(path: String): OutputStream
+    /** Moves a file over another (replacing it), within one filesystem. */
+    fun moveFile(from: String, to: String)
+    fun deleteFile(path: String)
     /** Tells the media library about a file written to shared storage. */
     fun scanFile(path: String)
 }

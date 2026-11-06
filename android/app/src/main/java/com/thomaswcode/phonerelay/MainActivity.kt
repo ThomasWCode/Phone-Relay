@@ -38,9 +38,6 @@ import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -103,7 +100,8 @@ private fun Screen(@Suppress("UNUSED_PARAMETER") tick: Int) {
     val context = LocalContext.current
     val app = RelayApp.of(context)
     val status by app.connection.status.collectAsStateWithLifecycle()
-    var enabled by remember(tick) { mutableStateOf(app.prefs.enabled) }
+    // Shared state: the tile and the notification switch it too, while this screen is open.
+    val enabled by app.enabled.collectAsStateWithLifecycle()
     val askNotifications = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
     Column(
@@ -121,7 +119,6 @@ private fun Screen(@Suppress("UNUSED_PARAMETER") tick: Int) {
                     Switch(checked = enabled, onCheckedChange = { on ->
                         if (on) askNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
                         app.setEnabled(on)
-                        enabled = on
                     })
                 }
                 Text(
