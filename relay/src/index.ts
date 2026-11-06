@@ -3,7 +3,7 @@
 // WebSocket.
 
 import { isAuthorised } from "./auth";
-import { DOC_ROUTES, renderDoc } from "./docs";
+import { DOC_ROUTES, NOTES_DOC, renderDoc, withNotes } from "./docs";
 import { json } from "./http";
 import { AGENT_ROUTES, parseBody, validateCommand } from "./validate";
 import type { DeviceHub } from "./device";
@@ -15,16 +15,14 @@ export interface Env {
   AGENT_TOKEN: string;
   DEVICE_TOKEN: string;
   ADMIN_TOKEN: string;
-  // Optional per-minute rate limits (wrangler vars); defaults in device.ts.
-  RATE_ACTIONS_PER_MIN?: string;
-  RATE_SCREENSHOTS_PER_MIN?: string;
 }
 
-const ADMIN_ROUTES: Record<string, "GET" | "POST"> = {
-  "/admin/disable": "POST",
-  "/admin/enable": "POST",
-  "/admin/status": "GET",
-  "/admin/log": "GET",
+const ADMIN_ROUTES: Record<string, string[]> = {
+  "/admin/disable": ["POST"],
+  "/admin/enable": ["POST"],
+  "/admin/status": ["GET"],
+  "/admin/log": ["GET"],
+  "/admin/notes": ["GET", "PUT"],
 };
 
 const unauthorised = () => json(401, { ok: false, error: "unauthorized" });
@@ -50,8 +48,9 @@ export default {
     // Owner-only endpoints. The agent token never grants these.
     if (path in ADMIN_ROUTES) {
       if (!(await isAuthorised(request, env.ADMIN_TOKEN))) return unauthorised();
-      if (request.method !== ADMIN_ROUTES[path]) return json(405, { ok: false, error: "method_not_allowed" });
-      return hub(env).fetch(new Request(`https://hub${path}${url.search}`, { method: request.method }));
+      if (!ADMIN_ROUTES[path].includes(request.method)) return json(405, { ok: false, error: "method_not_allowed" });
+      const body = request.method === "PUT" ? await request.text() : undefined;
+      return hub(env).fetch(new Request(`https://hub${path}${url.search}`, { method: request.method, body }));
     }
 
     // Everything else needs the agent token, including unknown paths.
@@ -60,7 +59,10 @@ export default {
     // Agent docs: served by the Worker itself, not the phone.
     if (path in DOC_ROUTES) {
       if (request.method !== "GET") return json(405, { ok: false, error: "method_not_allowed" });
-      return new Response(renderDoc(DOC_ROUTES[path], url.host), {
+      let doc = DOC_ROUTES[path];
+      // The phone rules end with the owner's private notes, kept in the Durable Object, not the repository.
+      if (doc === NOTES_DOC) doc = withNotes(doc, await (await hub(env).fetch("https://hub/internal/notes")).text());
+      return new Response(renderDoc(doc, url.host), {
         headers: { "Content-Type": "text/markdown; charset=utf-8", "Cache-Control": "no-store" },
       });
     }
