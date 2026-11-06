@@ -364,6 +364,7 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(st["awake"])
         self.assertEqual(st["battery"], 87)
         self.assertEqual(st["screen"], {"width": 1080, "height": 2340})
+        self.assertEqual(st["client"], "termux-adb")
         self.assertNotIn("allowlist", st)
 
     async def test_state_in_any_app(self):
