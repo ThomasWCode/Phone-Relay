@@ -203,7 +203,7 @@ def transfer(args, state):
 
 def am(cmd, state):
     """`am start` / `am broadcast`, by their -n, -a, -d and -p arguments."""
-    words = shlex.split(cmd)
+    words = shlex.split(cmd.removesuffix(" || true"))
     if words[1] == "broadcast":
         state["last_intent"] = words
         return "Broadcasting: Intent { }\nBroadcast completed: result=0\n"

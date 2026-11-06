@@ -613,7 +613,8 @@ def _extra_args(key: object, value: object) -> list[str]:
 
 
 def _check_am(out: str) -> None:
-    """`am start` prints an error but can still exit 0."""
+    """`am`'s own error line. Its commands are run with `|| true`, as it exits 1 on an unresolvable
+    intent, which adb would report without the reason `am` printed."""
     if re.search(r"^(Error|Exception|java\.)", out, re.MULTILINE):
         raise CommandError("launch_failed", out.strip()[-300:])
 
@@ -913,7 +914,7 @@ class PhoneController:
         )
         component = next((ln.strip() for ln in reversed(out.splitlines()) if ln.strip().startswith(package + "/")), None)
         if component:
-            await self._guarded(f"am start -W -n {shlex.quote(component)}", args)
+            _check_am(await self._guarded(f"am start -W -n {shlex.quote(component)} || true", args))
         else:
             out = await self._guarded(f"monkey -p {shlex.quote(package)} -c android.intent.category.LAUNCHER 1", args)
             if "Events injected: 1" not in out:
@@ -928,7 +929,7 @@ class PhoneController:
         command = f"am start -W -a android.intent.action.VIEW -d {shlex.quote(url)}"
         if package:
             command += f" -p {shlex.quote(package)}"
-        _check_am(await self._guarded(command, args))
+        _check_am(await self._guarded(command + " || true", args))
         return {"url": url, "package": package}
 
     async def cmd_intent(self, args: dict) -> dict:
@@ -964,7 +965,7 @@ class PhoneController:
             parts += _extra_args(key, value)
         if not given:
             raise CommandError("invalid_args", "give at least one of action, data, component or package")
-        out = await self._guarded(" ".join(parts), args)
+        out = await self._guarded(" ".join(parts) + " || true", args)
         if not broadcast:
             _check_am(out)
         return {"output": out.strip()[-500:]}
