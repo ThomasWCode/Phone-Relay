@@ -9,6 +9,9 @@ command as a focus check, so it only runs while one of those apps has focus.
 `ui` (the UI tree) runs `uiautomator dump`, which unbinds every accessibility
 service on the phone for a moment. Nothing else uses it, including --selftest.
 
+Files and screen recordings cross the relay socket in acknowledged chunks
+(see Channel), so their size is not limited by the socket's message size.
+
 Usage:
     python phone_client.py --selftest      # check adb, foreground, input guard, text field, screenshot
     python phone_client.py                 # connect to the relay and serve commands
@@ -19,19 +22,23 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import logging
 import math
+import mimetypes
 import os
 import random
 import re
 import shlex
 import stat
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
+import zipfile
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 # ---- key names and defaults (the relay has its own copy of the key names) ----
 
@@ -58,6 +65,27 @@ TEXT_CHUNK = 1000
 UI_DUMP_PATH = "/data/local/tmp/phone_relay_ui.xml"
 # Printed by a guarded command when the focus check fails, instead of running the action.
 REFUSED_MARKER = "PHONE_RELAY_REFUSED"
+# Printed by a shell command when the path it was given does not exist or cannot be read.
+MISSING_MARKER = "PHONE_RELAY_MISSING"
+# Files and recordings cross the relay socket in chunks of this size, at most STREAM_WINDOW unacknowledged.
+STREAM_CHUNK = 256 * 1024
+STREAM_WINDOW = 8
+# Default deadline for moving a file, and for stopping a recording and fetching it.
+TRANSFER_TIMEOUT_S = 300
+# screenrecord stops each file at 180 s; a longer recording is several files, sent back as a zip.
+RECORD_SEGMENT_S = 180
+RECORD_BIT_RATE = 2_000_000
+RECORD_PREFIX = "/data/local/tmp/phone_relay_rec_"
+RECORD_PID = "/data/local/tmp/phone_relay_rec.pid"  # the recording loop's shell, while it runs
+RECORD_CHILD = "/data/local/tmp/phone_relay_rec.child"  # the screenrecord it is waiting on
+RECORD_STOP = "/data/local/tmp/phone_relay_rec.stop"  # asks the loop not to start another segment
+STATUSBAR_ACTIONS = {"notifications": "expand-notifications", "settings": "expand-settings", "collapse": "collapse"}
+WAIT_KINDS = ("change", "stable", "foreground")
+# A batch may run any command that replies with JSON, plus sleep; not the streaming ones or batch itself.
+BATCH_COMMANDS = ("state", "screenshot", "ui", "tap", "swipe", "type", "key", "launch", "open", "intent",
+                  "notifications", "statusbar", "rotation", "wait", "files", "record_start", "sleep")
+# Side messages of a running command, routed to its Channel rather than queued as commands.
+SIDE_TYPES = ("chunk", "end", "ack", "cancel")
 
 log = logging.getLogger("phone_client")
 
@@ -69,6 +97,57 @@ class CommandError(Exception):
         super().__init__(f"{code}: {detail}" if detail else code)
         self.code = code
         self.detail = detail
+
+
+class Channel:
+    """One command's side messages on the relay socket: file chunks in or out, and their acks.
+
+    A download (pull, record) sends a start message, then chunks, never more than
+    STREAM_WINDOW ahead of the relay's acks. An upload (push) receives chunks, acks
+    each and ends at the relay's end message. The relay sends cancel if the agent goes away.
+    """
+
+    def __init__(self, cid: str, send) -> None:
+        self.id = cid
+        self._send = send
+        self.inbox: asyncio.Queue = asyncio.Queue()
+
+    async def send(self, msg: dict) -> None:
+        await self._send(json.dumps({"id": self.id, **msg}))
+
+    async def _next(self) -> dict:
+        msg = await self.inbox.get()
+        if msg.get("type") == "cancel":
+            raise CommandError("cancelled", "the relay cancelled the transfer")
+        return msg
+
+    async def send_file(self, path: str, mime: str, headers: dict | None = None) -> int:
+        size = os.path.getsize(path)
+        await self.send({"type": "start", "mime": mime, "size": size, "headers": headers or {}})
+        acked, seq = -1, 0
+        with open(path, "rb") as f:
+            while chunk := f.read(STREAM_CHUNK):
+                # Read what has arrived (acks, a cancel); wait only when the window is full.
+                while not self.inbox.empty() or seq - acked > STREAM_WINDOW:
+                    msg = await self._next()
+                    if msg.get("type") == "ack" and isinstance(msg.get("seq"), int):
+                        acked = max(acked, msg["seq"])
+                await self.send({"type": "chunk", "seq": seq, "data": base64.b64encode(chunk).decode("ascii")})
+                seq += 1
+        return size
+
+    async def recv_file(self, path: str) -> int:
+        total = 0
+        with open(path, "wb") as f:
+            while True:
+                msg = await self._next()
+                if msg.get("type") == "end":
+                    return total
+                if msg.get("type") == "chunk":
+                    data = base64.b64decode(msg.get("data") or "")
+                    f.write(data)
+                    total += len(data)
+                    await self.send({"type": "ack", "seq": msg.get("seq")})
 
 
 # ---- adb wrapper ----
@@ -229,6 +308,87 @@ def parse_ui(xml_bytes: bytes) -> list[dict]:
     return elements
 
 
+_NOTIFICATION_RE = re.compile(r"^\s*NotificationRecord\(0x[0-9a-fA-F]+: pkg=(\S+)(.*)$")
+_NOTIFICATION_FIELD_RE = re.compile(r"\b(id|tag|importance|key)=(\S+)")
+_EXTRA_RE = re.compile(r"^\s*android\.(\w+)=(\w+) \((.*)$")
+# Notification extras returned, by their name after "android.".
+NOTIFICATION_EXTRAS = {
+    "title": "title", "text": "text", "bigText": "big_text", "subText": "sub_text", "infoText": "info_text",
+    "summaryText": "summary", "conversationTitle": "conversation", "template": "template",
+}
+
+
+def parse_notifications(dumpsys: str) -> list[dict]:
+    """Notifications from `dumpsys notification --noredact`: key, package, id, tag, title, text, ...
+
+    Each NotificationRecord block is read up to the next one. A value that runs over
+    several lines (a long text) is joined back up. A key already seen is skipped, as
+    the dump can list a record in more than one section.
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    cur: dict | None = None
+    lines = dumpsys.splitlines()
+    i = 0
+    while i < len(lines):
+        m = _NOTIFICATION_RE.match(lines[i])
+        if m:
+            fields = dict(_NOTIFICATION_FIELD_RE.findall(m.group(2)))
+            key = fields.get("key", "").rstrip(":")
+            cur = None
+            if key not in seen:
+                seen.add(key)
+                tag = fields.get("tag")
+                cur = {"key": key, "pkg": m.group(1), "id": int(fields["id"]) if fields.get("id", "").lstrip("-").isdigit() else None,
+                       "tag": None if tag in (None, "null") else tag}
+                out.append(cur)
+        elif cur is not None:
+            e = _EXTRA_RE.match(lines[i])
+            if e and e.group(1) in NOTIFICATION_EXTRAS:
+                value = e.group(3)
+                while (not value.endswith(")") and i + 1 < len(lines)
+                       and not _EXTRA_RE.match(lines[i + 1]) and not _NOTIFICATION_RE.match(lines[i + 1])):
+                    i += 1
+                    value += "\n" + lines[i].strip()
+                cur[NOTIFICATION_EXTRAS[e.group(1)]] = value[:-1] if value.endswith(")") else value
+        i += 1
+    return out
+
+
+_STAT_TYPES = {"regular file": "file", "regular empty file": "file", "directory": "dir", "symbolic link": "link"}
+
+
+def parse_stat(line: str) -> dict | None:
+    """One `stat -c '%F|%s|%Y|%n'` line as {name, type, size, modified (Unix seconds)}."""
+    parts = line.rstrip("\r").split("|", 3)
+    if len(parts) != 4 or not parts[1].isdigit() or not parts[2].isdigit():
+        return None
+    ftype, size, mtime, name = parts
+    return {"name": name, "type": _STAT_TYPES.get(ftype, ftype), "size": int(size), "modified": int(mtime)}
+
+
+def frame_signature(png: bytes):
+    """A small greyscale copy of a screenshot for comparing frames; its hash if Pillow is missing."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return hashlib.sha256(png).digest()
+    img = Image.open(io.BytesIO(png)).convert("L")
+    return img.resize((max(1, img.width // 8), max(1, img.height // 8)))
+
+
+def frame_diff(a, b) -> float:
+    """Fraction of pixels that changed noticeably between two frame signatures (0 or 1 for hashes)."""
+    if isinstance(a, bytes) or isinstance(b, bytes):
+        return 0.0 if a == b else 1.0
+    if a.size != b.size:
+        return 1.0
+    from PIL import ImageChops
+
+    changed = ImageChops.difference(a, b).point(lambda v: 255 if v > 24 else 0).histogram()[255]
+    return changed / (a.width * a.height)
+
+
 def parse_editor_info(dumpsys: str) -> tuple[str, int] | None:
     """(package, inputType) of the text field the keyboard is serving, from `dumpsys input_method`.
 
@@ -384,12 +544,110 @@ def _timeout(args: dict, default: float) -> float:
     return float(v)
 
 
+def _number_arg(args: dict, name: str, default: float, minimum: float = 0) -> float:
+    v = args.get(name, default)
+    if not _is_number(v) or v < minimum:
+        raise CommandError("invalid_args", f"{name} must be a number {minimum:g} or above")
+    return v
+
+
+def _string_arg(args: dict, name: str, required: bool = True) -> str | None:
+    v = args.get(name)
+    if v is None and not required:
+        return None
+    if not isinstance(v, str) or not v:
+        raise CommandError("invalid_args", f"{name} must be a non-empty string")
+    return v
+
+
+def _package_arg(args: dict, name: str = "package") -> str | None:
+    v = args.get(name)
+    if v is not None and (not isinstance(v, str) or not _PACKAGE_RE.match(v)):
+        raise CommandError("invalid_args", f"{name} must be an Android package name")
+    return v
+
+
+def _remote_path(args: dict) -> str:
+    path = _string_arg(args, "path")
+    if not path.startswith("/"):
+        raise CommandError("invalid_args", "path must be absolute, e.g. /sdcard/Download/file.pdf")
+    return path
+
+
+def _extra_args(key: object, value: object) -> list[str]:
+    """`am` arguments for one intent extra, typed by its JSON value."""
+    if not isinstance(key, str) or not key:
+        raise CommandError("invalid_args", "extras keys must be non-empty strings")
+    k = shlex.quote(key)
+    if value is None:
+        return ["--esn", k]
+    if isinstance(value, bool):
+        return ["--ez", k, "true" if value else "false"]
+    if isinstance(value, int):
+        return ["--ei" if -(2**31) <= value < 2**31 else "--el", k, str(value)]
+    if isinstance(value, float):
+        return ["--ef", k, repr(value)]
+    if isinstance(value, str):
+        return ["--es", k, shlex.quote(value)]
+    raise CommandError("invalid_args", "extras values must be strings, numbers, booleans or null")
+
+
+def _check_am(out: str) -> None:
+    """`am start` prints an error but can still exit 0."""
+    if re.search(r"^(Error|Exception|java\.)", out, re.MULTILINE):
+        raise CommandError("launch_failed", out.strip()[-300:])
+
+
+def _record_args(args: dict) -> tuple[float, str | None, int]:
+    seconds = _number_arg(args, "seconds", 10)
+    if seconds <= 0:
+        raise CommandError("invalid_args", "seconds must be above 0")
+    size = args.get("size")
+    if size is not None and (not isinstance(size, str) or not re.fullmatch(r"\d{2,5}x\d{2,5}", size)):
+        raise CommandError("invalid_args", "size must look like 720x1560")
+    bit_rate = args.get("bit_rate", RECORD_BIT_RATE)
+    if not isinstance(bit_rate, int) or isinstance(bit_rate, bool) or bit_rate <= 0:
+        raise CommandError("invalid_args", "bit_rate must be a whole number of bits per second")
+    return seconds, size, bit_rate
+
+
+def _local_temp(suffix: str) -> str:
+    fd, path = tempfile.mkstemp(prefix="phone_relay_", suffix=suffix)
+    os.close(fd)
+    return path
+
+
+def _remove(*paths: str) -> None:
+    for path in paths:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 def default_timeout(cmd: str, args: dict) -> float:
-    """Deadline when the agent sets none: 30 s, plus the time typing or a long swipe itself takes."""
+    """Deadline when the agent sets none: 30 s, plus the time the work itself takes
+    (typing, a long swipe, a wait, a recording, a batch's steps); five minutes for files."""
     if cmd == "type" and isinstance(args.get("text"), str):
         return DEFAULT_TIMEOUT_S + len(args["text"]) / 10
     if cmd == "swipe" and _is_number(args.get("ms")):
         return DEFAULT_TIMEOUT_S + max(args["ms"], 0) / 1000
+    if cmd == "wait":
+        return DEFAULT_TIMEOUT_S + (args["seconds"] if _is_number(args.get("seconds")) else 10)
+    if cmd == "record":
+        return 2 * DEFAULT_TIMEOUT_S + 2 * (args["seconds"] if _is_number(args.get("seconds")) else 10)
+    if cmd in ("pull", "push", "record_stop"):
+        return TRANSFER_TIMEOUT_S
+    if cmd == "batch" and isinstance(args.get("steps"), list):
+        total = DEFAULT_TIMEOUT_S
+        for step in args["steps"]:
+            step_args = step.get("args") if isinstance(step, dict) and isinstance(step.get("args"), dict) else {}
+            if isinstance(step, dict) and step.get("cmd") == "sleep":
+                total += max(step_args.get("ms", 0), 0) / 1000 if _is_number(step_args.get("ms")) else 0
+            elif isinstance(step, dict):
+                t = step_args.get("timeout")
+                total += t if _is_number(t) and t > 0 else default_timeout(str(step.get("cmd")), step_args)
+        return total
     return DEFAULT_TIMEOUT_S
 
 
@@ -483,7 +741,7 @@ class PhoneController:
 
     # ---- commands ----
 
-    async def handle(self, cmd: str, args: dict) -> dict:
+    async def handle(self, cmd: str, args: dict, channel: Channel | None = None) -> dict:
         if self.stopped():
             raise CommandError("stopped", "stop file present")
         if not isinstance(args, dict):
@@ -497,14 +755,32 @@ class PhoneController:
             "type": self.cmd_type,
             "key": self.cmd_key,
             "launch": self.cmd_launch,
+            "open": self.cmd_open,
+            "intent": self.cmd_intent,
+            "notifications": self.cmd_notifications,
+            "statusbar": self.cmd_statusbar,
+            "rotation": self.cmd_rotation,
+            "wait": self.cmd_wait,
+            "batch": self.cmd_batch,
+            "files": self.cmd_files,
+            "record_start": self.cmd_record_start,
         }.get(cmd)
-        if handler is None:
+        # These stream bytes over the relay socket, so they need the command's channel.
+        streaming = {
+            "pull": self.cmd_pull,
+            "push": self.cmd_push,
+            "record": self.cmd_record,
+            "record_stop": self.cmd_record_stop,
+        }.get(cmd)
+        if handler is None and streaming is None:
             raise CommandError("invalid_args", f"unknown command: {cmd}")
+        if streaming is not None and channel is None:
+            raise CommandError("invalid_args", f"{cmd} streams over the relay; it cannot run here")
         _if_foreground(args)  # validates
         timeout = _timeout(args, default_timeout(cmd, args))
         try:
             # The deadline cancels the command; Adb.run kills the adb call it was waiting on.
-            return await asyncio.wait_for(handler(args), timeout)
+            return await asyncio.wait_for(handler(args) if handler else streaming(args, channel), timeout)
         except asyncio.TimeoutError as e:
             raise CommandError("timeout", f"{cmd} took longer than {timeout:g} s; pass a larger timeout") from e
 
@@ -517,6 +793,7 @@ class PhoneController:
             "awake": wake == "Awake",
             "battery": battery,
             "screen": {"width": w, "height": h},
+            "rotation": await self._rotation(),
             "client_version": VERSION,
         }
 
@@ -620,6 +897,264 @@ class PhoneController:
         return {"package": package}
 
 
+    async def cmd_open(self, args: dict) -> dict:
+        """Open a URL with whatever handles it (a browser, a mailto: link in the mail app, a deep link)."""
+        url = _string_arg(args, "url")
+        package = _package_arg(args)
+        command = f"am start -W -a android.intent.action.VIEW -d {shlex.quote(url)}"
+        if package:
+            command += f" -p {shlex.quote(package)}"
+        _check_am(await self._guarded(command, args))
+        return {"url": url, "package": package}
+
+    async def cmd_intent(self, args: dict) -> dict:
+        """Start an activity (or send a broadcast) from an intent's parts, through `am`."""
+        broadcast = args.get("broadcast", False)
+        if not isinstance(broadcast, bool):
+            raise CommandError("invalid_args", "broadcast must be true or false")
+        parts = ["am", "broadcast"] if broadcast else ["am", "start", "-W"]
+        given = False
+        for field, flag in (("action", "-a"), ("data", "-d"), ("type", "-t"), ("component", "-n")):
+            value = _string_arg(args, field, required=False)
+            if value is not None:
+                parts += [flag, shlex.quote(value)]
+                given = True
+        package = _package_arg(args)
+        if package:
+            parts += ["-p", package]
+            given = True
+        categories = args.get("categories", [])
+        if not isinstance(categories, list) or not all(isinstance(c, str) and c for c in categories):
+            raise CommandError("invalid_args", "categories must be a list of strings")
+        for c in categories:
+            parts += ["-c", shlex.quote(c)]
+        flags = args.get("flags")
+        if flags is not None:
+            if not isinstance(flags, int) or isinstance(flags, bool) or flags < 0:
+                raise CommandError("invalid_args", "flags must be a whole number")
+            parts += ["-f", str(flags)]
+        extras = args.get("extras", {})
+        if not isinstance(extras, dict):
+            raise CommandError("invalid_args", "extras must be an object")
+        for key, value in extras.items():
+            parts += _extra_args(key, value)
+        if not given:
+            raise CommandError("invalid_args", "give at least one of action, data, component or package")
+        out = await self._guarded(" ".join(parts), args)
+        if not broadcast:
+            _check_am(out)
+        return {"output": out.strip()[-500:]}
+
+    async def cmd_notifications(self, args: dict) -> dict:
+        items = parse_notifications(await self.adb.shell("dumpsys notification --noredact"))
+        return {"count": len(items), "notifications": items}
+
+    async def cmd_statusbar(self, args: dict) -> dict:
+        action = args.get("action")
+        if action not in STATUSBAR_ACTIONS:
+            raise CommandError("invalid_args", f"action must be one of {', '.join(STATUSBAR_ACTIONS)}")
+        await self._guarded(f"cmd statusbar {STATUSBAR_ACTIONS[action]}", args)
+        return {"action": action}
+
+    async def _rotation(self) -> dict:
+        out = (await self.adb.shell("settings get system accelerometer_rotation; settings get system user_rotation")).split()
+        return {
+            "auto": out[0] == "1" if out else None,
+            "user_rotation": int(out[1]) if len(out) > 1 and out[1].isdigit() else None,
+        }
+
+    async def cmd_rotation(self, args: dict) -> dict:
+        """Lock the screen to a quarter turn (0-3) or let it rotate automatically; the reply has the old setting."""
+        rotation = args.get("rotation")
+        if rotation != "auto" and (isinstance(rotation, bool) or rotation not in (0, 1, 2, 3)):
+            raise CommandError("invalid_args", 'rotation must be 0, 1, 2 or 3 (quarter turns) or "auto"')
+        previous = await self._rotation()
+        if rotation == "auto":
+            await self.adb.shell("settings put system accelerometer_rotation 1")
+        else:
+            await self.adb.shell(f"settings put system accelerometer_rotation 0 && settings put system user_rotation {rotation}")
+        return {"rotation": rotation, "previous": previous}
+
+    async def _frame(self):
+        return frame_signature(await self.adb.exec_out("screencap -p"))
+
+    async def cmd_wait(self, args: dict) -> dict:
+        """Wait until the screen changes, stops changing, or an app comes to the front; met=false at the end of `seconds`."""
+        kind = args.get("for")
+        if kind not in WAIT_KINDS:
+            raise CommandError("invalid_args", f"for must be one of {', '.join(WAIT_KINDS)}")
+        seconds = _number_arg(args, "seconds", 10)
+        interval = _number_arg(args, "interval_ms", 500) / 1000
+        threshold = _number_arg(args, "threshold", 0.005)
+        package = _package_arg(args)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        deadline = started + seconds
+
+        def result(met: bool, **extra) -> dict:
+            return {"met": met, "elapsed_ms": round((loop.time() - started) * 1000), **extra}
+
+        if kind == "foreground":
+            first, _ = await self.foreground_and_wake()
+            fg = first
+            while True:
+                if (fg == package) if package else (fg != first):
+                    return result(True, foreground=fg)
+                if loop.time() >= deadline:
+                    return result(False, foreground=fg)
+                await asyncio.sleep(interval)
+                fg, _ = await self.foreground_and_wake()
+        reference = await self._frame()
+        diff = 0.0
+        while True:
+            if loop.time() >= deadline:
+                return result(False, diff=round(diff, 4))
+            await asyncio.sleep(interval)
+            frame = await self._frame()
+            diff = frame_diff(reference, frame)
+            if (kind == "change" and diff > threshold) or (kind == "stable" and diff <= threshold):
+                return result(True, diff=round(diff, 4))
+            if kind == "stable":
+                reference = frame
+
+    async def cmd_batch(self, args: dict) -> dict:
+        """Run steps in order in one request; each gets its own deadline and the batch's if_foreground unless it sets one."""
+        steps = args.get("steps")
+        if not isinstance(steps, list) or not steps:
+            raise CommandError("invalid_args", "steps must be a non-empty list")
+        for i, step in enumerate(steps):
+            if not isinstance(step, dict) or step.get("cmd") not in BATCH_COMMANDS:
+                raise CommandError("invalid_args", f"step {i}: cmd must be one of {', '.join(BATCH_COMMANDS)}")
+            if not isinstance(step.get("args", {}), dict):
+                raise CommandError("invalid_args", f"step {i}: args must be an object")
+        stop_on_error = args.get("stop_on_error", True)
+        if not isinstance(stop_on_error, bool):
+            raise CommandError("invalid_args", "stop_on_error must be true or false")
+        inherited = {"if_foreground": args["if_foreground"]} if "if_foreground" in args else {}
+        results: list[dict] = []
+        for step in steps:
+            cmd, step_args = step["cmd"], step.get("args") or {}
+            try:
+                if cmd == "sleep":
+                    ms = _number_arg(step_args, "ms", 0)
+                    await asyncio.sleep(ms / 1000)
+                    result = {"ms": ms}
+                else:
+                    result = await self.handle(cmd, {**inherited, **step_args})
+                results.append({"cmd": cmd, "ok": True, "result": result})
+            except CommandError as e:
+                if e.code == "stopped":
+                    raise
+                results.append({"cmd": cmd, "ok": False, "error": e.code, "detail": e.detail[:300]})
+                if stop_on_error:
+                    break
+        return {"results": results, "completed": len(results),
+                "all_ok": len(results) == len(steps) and all(r["ok"] for r in results)}
+
+    async def _stat(self, path: str) -> dict:
+        out = await self.adb.shell(f"stat -c '%F|%s|%Y|%n' -- {shlex.quote(path)} 2>/dev/null || echo {MISSING_MARKER}")
+        entry = next((e for e in map(parse_stat, out.splitlines()) if e), None)
+        if entry is None:
+            raise CommandError("not_found", f"{path} does not exist or cannot be read")
+        return entry
+
+    async def cmd_files(self, args: dict) -> dict:
+        """A directory's entries (name, type, size, modified), or one file's."""
+        path = _remote_path(args)
+        q, fmt = shlex.quote(path), "'%F|%s|%Y|%n'"
+        out = await self.adb.shell(
+            f"if [ -d {q} ]; then cd {q} 2>/dev/null || {{ echo {MISSING_MARKER}; exit 0; }}; "
+            f"for f in * .*; do case \"$f\" in .|..) continue;; esac; "
+            f"[ -e \"$f\" ] || [ -L \"$f\" ] || continue; stat -c {fmt} -- \"$f\"; done; "
+            f"else stat -c {fmt} -- {q} 2>/dev/null || echo {MISSING_MARKER}; fi"
+        )
+        if MISSING_MARKER in out:
+            raise CommandError("not_found", f"{path} does not exist or cannot be read")
+        entries = [e for e in map(parse_stat, out.splitlines()) if e]
+        return {"path": path, "count": len(entries), "entries": entries}
+
+    async def cmd_pull(self, args: dict, channel: Channel) -> dict:
+        path = _remote_path(args)
+        if (await self._stat(path))["type"] == "dir":
+            raise CommandError("invalid_args", f"{path} is a directory; list it with /files")
+        local = _local_temp(os.path.splitext(path)[1])
+        try:
+            await self.adb.run("pull", path, local)
+            mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+            size = await channel.send_file(local, mime, {"X-File-Path": path})
+        finally:
+            _remove(local)
+        return {"path": path, "bytes": size}
+
+    async def cmd_push(self, args: dict, channel: Channel) -> dict:
+        path = _remote_path(args)
+        local = _local_temp(os.path.splitext(path)[1])
+        try:
+            size = await channel.recv_file(local)
+            await self.adb.run("push", local, path)
+        finally:
+            _remove(local)
+        return {"path": path, "bytes": size}
+
+    async def _end_recording(self) -> list[str]:
+        """Stop the recording loop (if it runs) and return its segment files on the phone, in order."""
+        out = await self.adb.shell(
+            f"touch {RECORD_STOP}; [ -e {RECORD_CHILD} ] && kill -INT $(cat {RECORD_CHILD}) 2>/dev/null; "
+            f"n=0; while [ -e {RECORD_PID} ] && [ $n -lt 150 ]; do sleep 0.2; n=$((n+1)); done; "
+            f"rm -f {RECORD_STOP}; ls {RECORD_PREFIX}*.mp4 2>/dev/null; true"
+        )
+        files = [ln.strip() for ln in out.splitlines() if ln.strip().startswith(RECORD_PREFIX) and ln.strip().endswith(".mp4")]
+        return sorted(files, key=lambda f: int(re.sub(r"\D", "", f[len(RECORD_PREFIX):]) or 0))
+
+    async def cmd_record_start(self, args: dict) -> dict:
+        """Start recording the screen in the background, for at most `seconds`; /record/stop returns the video."""
+        seconds, size, bit_rate = _record_args(args)
+        for f in await self._end_recording():  # a recording left running or unfetched is dropped
+            await self.adb.shell(f"rm -f {shlex.quote(f)}")
+        opts = f"--bit-rate {bit_rate}" + (f" --size {size}" if size else "")
+        # One screenrecord per segment (each is capped at RECORD_SEGMENT_S), until the time is up or the stop file appears.
+        loop = (
+            f"echo $$ > {RECORD_PID}; end=$(( $(date +%s) + {math.ceil(seconds)} )); i=0; "
+            f"while [ $(date +%s) -lt $end ] && [ ! -e {RECORD_STOP} ]; do left=$(( end - $(date +%s) )); "
+            f"[ $left -gt {RECORD_SEGMENT_S} ] && left={RECORD_SEGMENT_S}; "
+            f"screenrecord --time-limit $left {opts} {RECORD_PREFIX}$i.mp4 & echo $! > {RECORD_CHILD}; wait $!; "
+            f"i=$((i+1)); done; rm -f {RECORD_CHILD} {RECORD_PID}"
+        )
+        # Detached from this adb shell (its own session), so it outlives the call.
+        await self._guarded(f"{{ setsid nohup sh -c {shlex.quote(loop)} >/dev/null 2>&1 </dev/null & }}", args)
+        return {"recording": True, "max_seconds": seconds}
+
+    async def cmd_record_stop(self, args: dict, channel: Channel) -> dict:
+        """Stop the recording and send it: one MP4, or a zip of MP4 segments past RECORD_SEGMENT_S."""
+        remotes = await self._end_recording()
+        if not remotes:
+            raise CommandError("not_found", "no recording: start one with /record/start")
+        locals_: list[str] = []
+        try:
+            for i, remote in enumerate(remotes):
+                locals_.append(_local_temp(f"_{i}.mp4"))
+                await self.adb.run("pull", remote, locals_[-1])
+            if len(locals_) == 1:
+                size = await channel.send_file(locals_[0], "video/mp4", {"X-Segments": "1"})
+            else:
+                bundle = _local_temp(".zip")
+                locals_.append(bundle)
+                with zipfile.ZipFile(bundle, "w", zipfile.ZIP_STORED) as z:
+                    for i, path in enumerate(locals_[:-1]):
+                        z.write(path, f"segment_{i:03d}.mp4")
+                size = await channel.send_file(bundle, "application/zip", {"X-Segments": str(len(remotes))})
+        finally:
+            _remove(*locals_)
+            await self.adb.shell("rm -f " + " ".join(shlex.quote(r) for r in remotes))
+        return {"segments": len(remotes), "bytes": size}
+
+    async def cmd_record(self, args: dict, channel: Channel) -> dict:
+        """Record for `seconds` and send the video: /record/start, a wait, /record/stop in one command."""
+        started = await self.cmd_record_start(args)
+        await asyncio.sleep(started["max_seconds"] + 1)
+        return await self.cmd_record_stop(args, channel)
+
+
 def _image_result(data: bytes, mime: str, w: int, h: int, rw: int, rh: int, scale: float, fg: str) -> dict:
     return {
         "mime": mime,
@@ -637,15 +1172,31 @@ def _png_size(png: bytes) -> tuple[int, int]:
     return int.from_bytes(png[16:20], "big"), int.from_bytes(png[20:24], "big")
 
 
+def _log_args(cmd: str, args: object) -> object:
+    """Args with typed text replaced by its length, and an intent's extra values by their names."""
+    if not isinstance(args, dict):
+        return args
+    if cmd == "type":
+        text = args.get("text")
+        return {"length": len(text) if isinstance(text, str) else "?"}
+    if cmd == "batch" and isinstance(args.get("steps"), list):
+        steps = [{"cmd": s.get("cmd"), "args": _log_args(str(s.get("cmd")), s.get("args"))} if isinstance(s, dict) else s
+                 for s in args["steps"]]
+        return {**args, "steps": steps}
+    if cmd == "intent" and isinstance(args.get("extras"), dict):
+        return {**args, "extras": sorted(args["extras"])}
+    return args
+
+
 def summarise(cmd: str, args: dict) -> str:
     """Log-safe summary of a command. Typed text is never logged."""
     if cmd == "type":
         text = args.get("text") if isinstance(args, dict) else None
         return f"type length={len(text) if isinstance(text, str) else '?'}"
-    return f"{cmd} {json.dumps(args, sort_keys=True)}"
+    return f"{cmd} {json.dumps(_log_args(cmd, args), sort_keys=True, default=str)}"
 
 
-async def dispatch(controller: PhoneController, raw: str | bytes) -> dict | None:
+async def dispatch(controller: PhoneController, raw: str | bytes, channel: Channel | None = None) -> dict | None:
     """Turn one relay message into a reply. Returns None for messages that need no reply."""
     try:
         msg = json.loads(raw)
@@ -657,7 +1208,7 @@ async def dispatch(controller: PhoneController, raw: str | bytes) -> dict | None
     cmd, args = msg.get("cmd"), msg.get("args") or {}
     log.info("command %s", summarise(str(cmd), args))
     try:
-        result = await controller.handle(str(cmd), args)
+        result = await controller.handle(str(cmd), args, channel)
         return {"id": msg["id"], "ok": True, "result": result}
     except CommandError as e:
         log.info("refused/failed %s: %s", cmd, e.code)
@@ -739,14 +1290,20 @@ async def serve(controller: PhoneController, ws) -> None:
 
     Reading goes on while a command runs, so when the connection closes (the owner's
     disable, the stop file, a network drop) the running command is cancelled, and with
-    it the adb call it was waiting on, instead of carrying on unseen.
+    it the adb call it was waiting on, instead of carrying on unseen. It also lets a
+    running command receive its side messages (file chunks, acks) through its Channel.
     """
     commands: asyncio.Queue = asyncio.Queue()
+    channels: dict[str, Channel] = {}
 
     async def worker() -> None:
         while True:
-            raw = await commands.get()  # one command at a time: adb actions are serialised
-            reply = await dispatch(controller, raw)
+            raw, channel = await commands.get()  # one command at a time: adb actions are serialised
+            try:
+                reply = await dispatch(controller, raw, channel)
+            finally:
+                if channel is not None:
+                    channels.pop(channel.id, None)
             if reply is not None:
                 await ws.send(json.dumps(reply))
             if controller.stopped():
@@ -755,7 +1312,20 @@ async def serve(controller: PhoneController, ws) -> None:
     task = asyncio.create_task(worker())
     try:
         async for raw in ws:
-            commands.put_nowait(raw)
+            try:
+                msg = json.loads(raw)
+            except (ValueError, TypeError):
+                msg = None
+            if isinstance(msg, dict) and msg.get("type") in SIDE_TYPES:
+                channel = channels.get(msg.get("id"))
+                if channel is not None:  # side messages for a finished command are dropped
+                    channel.inbox.put_nowait(msg)
+                continue
+            channel = None
+            if isinstance(msg, dict) and isinstance(msg.get("id"), str):
+                # Registered now, before the command runs, so chunks sent right behind it are kept.
+                channel = channels[msg["id"]] = Channel(msg["id"], ws.send)
+            commands.put_nowait((raw, channel))
     finally:
         task.cancel()
         try:

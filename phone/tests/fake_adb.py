@@ -3,8 +3,12 @@
 
 State is a JSON file named by FAKE_ADB_STATE:
     {"foreground": "com.android.chrome", "awake": true, "popup": false,
-     "password_focused": false, "text_field": true, "keyboard": true, "hang": 0}
+     "password_focused": false, "text_field": true, "keyboard": true, "hang": 0,
+     "shade": 48, "files": {"/sdcard/Download/a.txt": "<base64>"}, "rotation": [1, 0]}
 "hang" makes every invocation sleep that many seconds first (for timeout tests).
+"shade" is the screenshot's grey level, so tests can make the screen change.
+"files" is the phone's storage (path -> base64 content); its folders are implied by the paths.
+"rotation" is [accelerometer_rotation, user_rotation].
 Every invocation is appended to the file named by FAKE_ADB_LOG (one JSON list per line).
 
 Guarded commands (`if <focus guard>; then <action>; else echo PHONE_RELAY_REFUSED; fi`)
@@ -12,9 +16,12 @@ are evaluated by applying the guard's own grep patterns to the fake dumpsys outp
 so the tests exercise the real regexes.
 """
 
+import base64
 import json
+import math
 import os
 import re
+import shlex
 import struct
 import sys
 import time
@@ -27,13 +34,43 @@ COMPONENTS = {
     "com.android.chrome": "com.android.chrome/com.google.android.apps.chrome.Main",
     "com.google.android.gm": "com.google.android.gm/.ConversationListActivityGmail",
 }
+RECORD_PREFIX = "/data/local/tmp/phone_relay_rec_"
+MISSING_MARKER = "PHONE_RELAY_MISSING"
+MTIME = 1700000000
+# Made-up notifications in the shape `dumpsys notification --noredact` prints.
+NOTIFICATION_DUMP = """Current Notification Manager state:
+  Notification List:
+    NotificationRecord(0x0a1b2c3d: pkg=com.google.android.gm user=UserHandle{0} id=4 tag=gig:12345 importance=3 key=0|com.google.android.gm|4|gig:12345|10234: Notification(channel=mail shortcut=null contentView=null vibrate=null sound=null defaults=0x0 flags=0x218 color=0xffdb4437 category=email vis=PRIVATE))
+      uid=10234 userId=0
+      opPkg=com.google.android.gm
+      key=0|com.google.android.gm|4|gig:12345|10234
+      notification=
+        extras={
+          android.title=String (A sender)
+          android.text=SpannableString (Meeting moved)
+          android.bigText=SpannableString (Meeting moved to Thursday.
+Bring the slides (final version).)
+          android.subText=String (someone@example.com)
+          android.showWhen=Boolean (true)
+        }
+    NotificationRecord(0x0d4c3b2a: pkg=com.android.chrome user=UserHandle{0} id=1 tag=null importance=2 key=0|com.android.chrome|1|null|10111: Notification(channel=downloads vis=PRIVATE))
+      notification=
+        extras={
+          android.title=String (report.pdf)
+          android.text=String (Download complete)
+        }
+  Snoozed notifications:
+    NotificationRecord(0x0a1b2c3d: pkg=com.google.android.gm user=UserHandle{0} id=4 tag=gig:12345 importance=3 key=0|com.google.android.gm|4|gig:12345|10234: Notification(channel=mail))
+"""
 GUARD_RE = re.compile(r"^if (?P<guard>.*); then (?P<action>.*); else echo " + REFUSED_MARKER + r"; fi$", re.S)
 GREP_PATTERN_RE = re.compile(r"grep -qE '([^']*)'")
 
 
 def default_state():
     return {"foreground": "com.android.chrome", "awake": True, "popup": False,
-            "password_focused": False, "text_field": True, "keyboard": True, "hang": 0}
+            "password_focused": False, "text_field": True, "keyboard": True, "hang": 0,
+            "shade": 48, "files": {"/sdcard/Download/a.txt": base64.b64encode(b"hello file").decode()},
+            "rotation": [1, 0]}
 
 
 def load_state():
@@ -52,11 +89,11 @@ def save_state(state):
             json.dump(state, f)
 
 
-def png(width, height):
+def png(width, height, shade=48):
     def chunk(kind, data):
         return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
 
-    row = b"\x00" + b"\x30\x60\x90" * width
+    row = b"\x00" + bytes([shade, 0x60, 0x90]) * width
     raw = zlib.compress(row * height, 9)
     ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
     return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", raw) + chunk(b"IEND", b"")
@@ -118,6 +155,75 @@ def guard_passes(guard, state):
     return bool(state.get("awake", True)) and (direct or (popup and focused_app))
 
 
+def folders(files):
+    """Every folder implied by the stored files' paths."""
+    out = {"/", "/sdcard", "/sdcard/Download", "/data/local/tmp"}
+    for path in files:
+        parts = path.split("/")
+        out.update("/".join(parts[:i]) for i in range(2, len(parts)))
+    return out
+
+
+def stat_line(path, files):
+    if path in files:
+        return f"regular file|{len(base64.b64decode(files[path]))}|{MTIME}|{os.path.basename(path)}"
+    if path in folders(files):
+        return f"directory|4096|{MTIME}|{os.path.basename(path) or '/'}"
+    return None
+
+
+def list_command(cmd, state):
+    """The client's folder listing: `if [ -d PATH ]; then ... stat each entry ...; else stat PATH; fi`."""
+    path = shlex.split(cmd[len("if [ -d "):cmd.index(" ]")])[0]
+    files = state.get("files", {})
+    if path in folders(files):
+        prefix = path.rstrip("/") + "/"
+        names = {p[len(prefix):].split("/")[0] for p in list(files) + list(folders(files)) if p.startswith(prefix) and p != prefix}
+        return "".join(stat_line(prefix + n, files) + "\n" for n in sorted(names) if n)
+    line = stat_line(path, files)
+    return (line if line else MISSING_MARKER) + "\n"
+
+
+def transfer(args, state):
+    """`adb pull REMOTE LOCAL` / `adb push LOCAL REMOTE` against the fake storage: (exit code, stderr)."""
+    files = state.setdefault("files", {})
+    if args[0] == "pull":
+        remote, local = args[1], args[2]
+        if remote not in files:
+            return 1, f"adb: error: failed to stat remote object '{remote}': No such file or directory"
+        with open(local, "wb") as f:
+            f.write(base64.b64decode(files[remote]))
+        return 0, ""
+    local, remote = args[1], args[2]
+    with open(local, "rb") as f:
+        files[remote] = base64.b64encode(f.read()).decode()
+    save_state(state)
+    return 0, ""
+
+
+def am(cmd, state):
+    """`am start` / `am broadcast`, by their -n, -a, -d and -p arguments."""
+    words = shlex.split(cmd)
+    if words[1] == "broadcast":
+        state["last_intent"] = words
+        return "Broadcasting: Intent { }\nBroadcast completed: result=0\n"
+    opt = {words[i]: words[i + 1] for i in range(len(words) - 1) if words[i] in ("-n", "-a", "-d", "-p")}
+    state["last_intent"] = words
+    if "-n" in opt:
+        target = opt["-n"].split("/")[0]
+    elif "-p" in opt:
+        target = opt["-p"] if opt["-p"] in COMPONENTS else None
+    else:
+        scheme = opt.get("-d", "").split(":")[0]
+        target = {"http": "com.android.chrome", "https": "com.android.chrome", "mailto": "com.google.android.gm"}.get(scheme)
+    if target is None:
+        return "Starting: Intent { }\nError: Activity not started, unable to resolve Intent { }\n"
+    state["foreground"] = target
+    state["popup"] = False
+    save_state(state)
+    return f"Starting: Intent {{ cmp={target}/.Main }}\nStatus: ok\n"
+
+
 def run(cmd, state):
     """Output of one `adb shell`/`exec-out` command (bytes)."""
     m = GUARD_RE.match(cmd)
@@ -127,10 +233,46 @@ def run(cmd, state):
         return run(m.group("action"), state)
     if cmd.startswith("uiautomator dump"):
         return ui_xml(state).encode()
-    if " && " in cmd:  # several `input` calls chained by type_commands
+    files = state.setdefault("files", {})
+    if "setsid nohup sh -c" in cmd:  # a background recording: its segments appear at once
+        seconds = int(re.search(r"\+ (\d+) \)\)", cmd).group(1))
+        for i in range(math.ceil(seconds / 180)):
+            files[f"{RECORD_PREFIX}{i}.mp4"] = base64.b64encode(f"fake mp4 segment {i}".encode()).decode()
+        save_state(state)
+        return b""
+    if cmd.startswith("touch /data/local/tmp/phone_relay_rec.stop"):  # the recording stopped: list its segments
+        return "".join(f + "\n" for f in sorted(files) if f.startswith(RECORD_PREFIX)).encode()
+    if cmd.startswith("rm -f "):
+        for path in shlex.split(cmd)[2:]:
+            files.pop(path, None)
+        save_state(state)
+        return b""
+    if cmd.startswith("if [ -d "):
+        return list_command(cmd, state).encode()
+    if cmd.startswith("stat -c "):
+        line = stat_line(shlex.split(cmd)[4], files)
+        return ((line if line else MISSING_MARKER) + "\n").encode()
+    if " && " in cmd:  # several `input` calls chained by type_commands, or settings
         return b"".join(run(part, state) for part in cmd.split(" && "))
     if cmd == "screencap -p":
-        return png(WIDTH, HEIGHT)
+        return png(WIDTH, HEIGHT, state.get("shade", 48))
+    if cmd.startswith(("am start", "am broadcast")):
+        return am(cmd, state).encode()
+    if cmd.startswith("dumpsys notification"):
+        return state.get("notification_dump", NOTIFICATION_DUMP).encode()
+    if cmd.startswith("cmd statusbar "):
+        state["statusbar"] = cmd.split()[2]
+        save_state(state)
+        return b""
+    if cmd == "settings get system accelerometer_rotation; settings get system user_rotation":
+        return "{}\n{}\n".format(*state.get("rotation", [1, 0])).encode()
+    if cmd.startswith("settings put system "):
+        name, value = cmd.split()[3], int(cmd.split()[4])
+        rotation = list(state.get("rotation", [1, 0]))
+        rotation[0 if name == "accelerometer_rotation" else 1] = value
+        state["rotation"] = rotation
+        save_state(state)
+        return b""
     if cmd.startswith("echo "):
         return (cmd[5:] + "\n").encode()
     out = ""
@@ -150,12 +292,6 @@ def run(cmd, state):
             out += f"priority=0 preferredOrder=0 match=0x108000 specificIndex=-1 isDefault=false\n{COMPONENTS[pkg]}\n"
         else:
             out += "No activity found\n"
-    if cmd.startswith("am start"):
-        component = cmd.split()[-1].strip("'")
-        state["foreground"] = component.split("/")[0]
-        state["popup"] = False
-        save_state(state)
-        out += f"Starting: Intent {{ cmp={component} }}\nStatus: ok\n"
     if cmd.startswith("monkey"):
         state["foreground"] = cmd.split()[2].strip("'")
         state["popup"] = False
@@ -184,6 +320,10 @@ def main(argv):
     if args[0] == "devices":
         sys.stdout.write("List of devices attached\nlocalhost:5555\tdevice\n")
         return 0
+    if args[0] in ("pull", "push") and len(args) == 3:
+        code, err = transfer(args, state)
+        sys.stderr.write(err)
+        return code
     if args[0] not in ("shell", "exec-out") or len(args) < 2:
         sys.stderr.write("fake adb: unsupported\n")
         return 1
