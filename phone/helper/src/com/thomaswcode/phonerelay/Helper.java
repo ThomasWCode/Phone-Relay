@@ -49,6 +49,9 @@ import java.util.List;
  * Hidden framework APIs are found by reflection, so it builds against the public android.jar.
  * Arguments that carry text or JSON are base64, so no shell quoting touches them, or "@path"
  * for a file holding the text (too long for a command line).
+ *
+ * Its last line of output is always its status: PHONE_RELAY_HELPER_OK, or PHONE_RELAY_HELPER_ERROR
+ * and the reason. Output without either means app_process never reached main.
  */
 public final class Helper {
     static final String VERSION = "1";
@@ -92,6 +95,7 @@ public final class Helper {
                 default:
                     throw new IllegalArgumentException("unknown command: " + args[0]);
             }
+            System.out.println("PHONE_RELAY_HELPER_OK");
         } catch (Throwable t) {
             // One line the client can show: the cause's class and message.
             Throwable cause = t;

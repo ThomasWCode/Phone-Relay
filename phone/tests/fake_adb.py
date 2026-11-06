@@ -238,22 +238,24 @@ def helper_text(arg, files):
 
 
 def helper(cmd, state):
-    """The app_process helper's commands, as phone_client calls them."""
+    """The app_process helper's commands, as phone_client calls them. Like the real helper, its last
+    line is its status: PHONE_RELAY_HELPER_OK, or PHONE_RELAY_HELPER_ERROR and the reason; and like
+    app_process with no jar, it prints neither when the jar is missing."""
     files = state.setdefault("files", {})
     if HELPER_REMOTE not in files:
         return "/system/bin/sh: app_process: Error: Could not find class\n"
     if state.get("helper_error"):
         return f"PHONE_RELAY_HELPER_ERROR {state['helper_error']}\n"
-    args = shlex.split(cmd[len(HELPER_PREFIX):].removesuffix(" || true"))
-    name = args[0]
+    args = shlex.split(cmd[len(HELPER_PREFIX):].removesuffix(" 2>&1 || true"))
+    name, out = args[0], ""
     if name == "version":
-        return "1\n"
-    if name == "ui":
-        return ui_xml(state)
-    if name == "gesture":
+        out = "1\n"
+    elif name == "ui":
+        out = ui_xml(state) + "\n"
+    elif name == "gesture":
         state.setdefault("gestures", []).append(json.loads(helper_text(args[1], files)))
     elif name == "clip-get":
-        return json.dumps({"text": state.get("clipboard")}) + "\n"
+        out = json.dumps({"text": state.get("clipboard")}) + "\n"
     elif name == "clip-set":
         state["clipboard"] = helper_text(args[1], files)
     elif name == "clip-clear":
@@ -265,7 +267,7 @@ def helper(cmd, state):
     else:
         return f"PHONE_RELAY_HELPER_ERROR IllegalArgumentException: unknown command: {name}\n"
     save_state(state)
-    return ""
+    return out + "PHONE_RELAY_HELPER_OK\n"
 
 
 def run(cmd, state):

@@ -1191,6 +1191,29 @@ class HelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("NoSuchMethodException", cm.exception.detail)
         self.assertFalse(any("uiautomator" in c[1] for c in adb.calls if len(c) > 1))
 
+    async def test_a_helper_that_never_started_is_a_failure_not_a_success(self):
+        """app_process failing before the helper's main (a deleted or broken jar) prints no status line."""
+        ctl, adb = controller()
+        await ctl.handle("ui", {})  # pushes the jar
+        for cmd, args in [("gesture", {"pointers": [[[1, 1]]]}), ("clipboard_set", {"text": "x"}),
+                          ("type", {"text": "café"}), ("ui", {})]:
+            adb.state["files"].pop(fake_adb.HELPER_REMOTE, None)  # deleted on the phone behind the client's back
+            ctl._helper_pushed = True  # while the client believes it is still there
+            with self.assertRaises(pc.CommandError, msg=cmd) as cm:
+                await ctl.handle(cmd, args)
+            self.assertEqual(cm.exception.code, "helper_failed", cmd)
+            self.assertIn("did not run", cm.exception.detail)
+        self.assertNotIn("gestures", adb.state)
+        self.assertEqual((await ctl.handle("ui", {}))["count"], 4)  # the failure made it push the jar again
+
+    async def test_content_that_looks_like_a_marker_is_just_content(self):
+        ctl, adb = controller()
+        for text in ["PHONE_RELAY_HELPER_ERROR boom", "PHONE_RELAY_HELPER_OK", "x\nPHONE_RELAY_REFUSED"]:
+            await ctl.handle("clipboard_set", {"text": text})
+            self.assertEqual((await ctl.handle("clipboard_get", {}))["text"], text)
+            res = await ctl.handle("clipboard_get", {"if_foreground": "com.android.chrome"})
+            self.assertEqual(res["text"], text)
+
     async def test_helper_runs_inside_the_guard(self):
         ctl, adb = controller({"foreground": "com.android.settings"})
         with self.assertRaises(pc.CommandError) as cm:

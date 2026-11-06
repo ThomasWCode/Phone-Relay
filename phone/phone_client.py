@@ -97,7 +97,10 @@ SELF_GUARDED = ("screenshot", "ui", "tap", "swipe", "type", "key", "launch", "op
 HELPER_JAR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "helper", "phone-relay-helper.jar")
 HELPER_REMOTE = "/data/local/tmp/phone-relay-helper.jar"
 HELPER_CLASS = "com.thomaswcode.phonerelay.Helper"
-HELPER_ERROR = "PHONE_RELAY_HELPER_ERROR"  # the helper's one-line failure report
+# The helper's last line: success, or failure and its reason. Only the last line counts, so content
+# that happens to contain these words (clipboard text, a screen's text) is never mistaken for them.
+HELPER_OK = "PHONE_RELAY_HELPER_OK"
+HELPER_ERROR = "PHONE_RELAY_HELPER_ERROR"
 # Text longer than this goes to the helper in a file, not on its command line.
 HELPER_ARG_LIMIT = 4000
 HELPER_TEXT_REMOTE = "/data/local/tmp/phone_relay_text.txt"
@@ -769,15 +772,24 @@ class PhoneController:
             if remote != [local]:
                 await self.adb.run("push", self.helper_jar, HELPER_REMOTE)
             self._helper_pushed = True
-        # `|| true`: the helper exits 1 on failure, which adb would report without the reason it printed.
-        return f"CLASSPATH={HELPER_REMOTE} app_process / {HELPER_CLASS} " + " ".join(shlex.quote(a) for a in args) + " || true"
+        # `2>&1 || true`: app_process reports a missing class on stderr, and the helper exits 1 on failure,
+        # which adb would report without the reason; the status line (see _helper) says how it went.
+        return (f"CLASSPATH={HELPER_REMOTE} app_process / {HELPER_CLASS} " + " ".join(shlex.quote(a) for a in args)
+                + " 2>&1 || true")
 
     async def _helper(self, args: dict, *helper_args: str) -> str:
-        """Run the helper (inside the if_foreground guard if asked); its failure becomes helper_failed."""
+        """Run the helper (inside the if_foreground guard if asked) and return its output without the status
+        line. Its failure, or output without a status line (app_process never reached the helper: a missing
+        or broken jar), becomes helper_failed."""
         out = await self._guarded(await self._helper_command(*helper_args), args)
-        if HELPER_ERROR in out:
-            raise CommandError("helper_failed", out.split(HELPER_ERROR, 1)[1].strip()[:300])
-        return out
+        lines = out.splitlines()
+        last = lines[-1].strip() if lines else ""
+        if last == HELPER_OK:
+            return "\n".join(lines[:-1]) + "\n"
+        if last.startswith(HELPER_ERROR):
+            raise CommandError("helper_failed", last[len(HELPER_ERROR):].strip()[:300])
+        self._helper_pushed = False  # check the phone's copy (and push it again) on the next call
+        raise CommandError("helper_failed", "the helper did not run: " + (out.strip()[-300:] or "no output"))
 
     async def _helper_text_arg(self, text: str) -> tuple[str, bool]:
         """The helper's argument for `text`: base64, or "@file" pushed to the phone when it is long.
@@ -833,7 +845,7 @@ class PhoneController:
         if packages is None:
             return await self.adb.shell(action)
         out = await self.adb.shell(guarded(action, packages))
-        if REFUSED_MARKER in out:
+        if out.strip() == REFUSED_MARKER:  # the refusal is all a refused command prints
             raise await self._mismatch(packages)
         return out
 
@@ -1578,8 +1590,8 @@ async def selftest(controller: PhoneController) -> int:
         ok = False
         print("FAIL if_foreground guard:", probe.strip()[:200], "/", refused.strip()[:200])
     try:
-        version = (await controller.adb.shell(await controller._helper_command("version"))).strip().splitlines()[-1:]
-        print("helper: version", version[0] if version else "?", "(app_process works)")
+        version = (await controller._helper({}, "version")).strip()
+        print("helper: version", version or "?", "(app_process works)")
     except CommandError as e:
         ok = False
         print("FAIL helper:", e)
