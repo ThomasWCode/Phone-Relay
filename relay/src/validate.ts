@@ -27,18 +27,23 @@ const WAIT_KINDS = ["change", "stable", "foreground", "text"];
 const TYPE_METHODS = ["keys", "paste"];
 const UI_ENGINES = ["helper", "uiautomator"];
 const AUDIO_SOURCES = ["output", "mic"];
+const DEVTOOLS_SOCKET_RE = /^[\w.-]{1,100}$/;
+const CDP_METHOD_RE = /^[A-Za-z]+\.[A-Za-z]+$/;
+const TAB_ID_RE = /^[\w-]{1,100}$/;
 // Commands a batch may run (the JSON ones, plus sleep). Same list as the phone client.
 export const BATCH_COMMANDS = [
   "state", "screenshot", "ui", "tap", "swipe", "type", "key", "launch", "open", "intent",
   "notifications", "statusbar", "rotation", "wait", "files", "record_start", "gesture",
-  "clipboard_get", "clipboard_set", "sleep",
+  "clipboard_get", "clipboard_set", "chrome_tabs", "chrome_eval", "chrome_cdp", "chrome_new",
+  "chrome_close", "chrome_activate", "sleep",
 ];
 
 export type CommandName =
   | "state" | "screenshot" | "ui" | "tap" | "swipe" | "type" | "key" | "launch"
   | "open" | "intent" | "notifications" | "statusbar" | "rotation" | "wait" | "batch"
   | "files" | "pull" | "push" | "record" | "record_start" | "record_stop"
-  | "gesture" | "clipboard_get" | "clipboard_set" | "audio";
+  | "gesture" | "clipboard_get" | "clipboard_set" | "audio"
+  | "chrome_sockets" | "chrome_tabs" | "chrome_eval" | "chrome_cdp" | "chrome_new" | "chrome_close" | "chrome_activate";
 // Commands whose reply is a file streamed from the phone, and the one that streams a file to it.
 export const DOWNLOAD_COMMANDS: readonly CommandName[] = ["pull", "record", "record_stop", "audio"];
 export const UPLOAD_COMMAND: CommandName = "push";
@@ -85,6 +90,13 @@ export const AGENT_ROUTES: Record<string, Route | Route[]> = {
   "/gesture": { method: "POST", cmd: "gesture" },
   "/clipboard": [{ method: "GET", cmd: "clipboard_get" }, { method: "POST", cmd: "clipboard_set" }],
   "/audio": { method: "GET", cmd: "audio" },
+  "/chrome/sockets": { method: "GET", cmd: "chrome_sockets" },
+  "/chrome/tabs": { method: "GET", cmd: "chrome_tabs" },
+  "/chrome/eval": { method: "POST", cmd: "chrome_eval" },
+  "/chrome/cdp": { method: "POST", cmd: "chrome_cdp" },
+  "/chrome/new": { method: "POST", cmd: "chrome_new" },
+  "/chrome/close": { method: "POST", cmd: "chrome_close" },
+  "/chrome/activate": { method: "POST", cmd: "chrome_activate" },
 };
 
 // The route for a path and method: null for no such path, "method" for a path without that method.
@@ -121,6 +133,13 @@ const FIELDS: Record<CommandName, string[]> = {
   clipboard_get: [],
   clipboard_set: ["text"],
   audio: ["seconds", "source"],
+  chrome_sockets: [],
+  chrome_tabs: ["socket"],
+  chrome_eval: ["expression", "tab", "await_promise", "socket"],
+  chrome_cdp: ["method", "params", "tab", "socket"],
+  chrome_new: ["url", "socket"],
+  chrome_close: ["tab", "socket"],
+  chrome_activate: ["tab", "socket"],
 };
 // Query-string fields read as numbers.
 const NUMERIC_QUERY_FIELDS = ["scale", "timeout", "seconds", "bit_rate"];
@@ -217,6 +236,44 @@ function recordArgs(src: Fields): Fields | string {
   return out;
 }
 
+// Chrome DevTools commands: socket (another DevTools socket), tab (an id, an index, or "browser"), and their own.
+function chromeArgs(cmd: CommandName, src: Fields): Fields | string {
+  const out: Fields = {};
+  if (src.socket !== undefined) {
+    if (typeof src.socket !== "string" || !DEVTOOLS_SOCKET_RE.test(src.socket)) return "socket must be a DevTools socket name";
+    out.socket = src.socket;
+  }
+  const takesTab = cmd === "chrome_eval" || cmd === "chrome_cdp" || cmd === "chrome_close" || cmd === "chrome_activate";
+  if (takesTab && src.tab !== undefined) {
+    const t = src.tab;
+    const browserOk = cmd === "chrome_eval" || cmd === "chrome_cdp";
+    const valid = (typeof t === "number" && Number.isInteger(t) && t >= 0) || (typeof t === "string" && (TAB_ID_RE.test(t) || (browserOk && t === "browser")));
+    if (!valid || (!browserOk && t === "browser")) return browserOk ? 'tab must be a tab id, an index, or "browser"' : "tab must be a tab id or an index";
+    out.tab = t;
+  }
+  if (cmd === "chrome_eval") {
+    if (typeof src.expression !== "string" || src.expression.length === 0) return "expression must be a non-empty string";
+    out.expression = src.expression;
+    if (src.await_promise !== undefined) {
+      if (typeof src.await_promise !== "boolean") return "await_promise must be true or false";
+      out.await_promise = src.await_promise;
+    }
+  }
+  if (cmd === "chrome_cdp") {
+    if (typeof src.method !== "string" || !CDP_METHOD_RE.test(src.method)) return "method must look like Domain.method, e.g. Page.navigate";
+    out.method = src.method;
+    if (src.params !== undefined) {
+      if (src.params === null || typeof src.params !== "object" || Array.isArray(src.params)) return "params must be an object";
+      out.params = src.params;
+    }
+  }
+  if (cmd === "chrome_new") {
+    if (typeof src.url !== "string" || src.url.length === 0) return "url must be a non-empty string";
+    out.url = src.url;
+  }
+  return out;
+}
+
 // A batch's steps, each validated as its own command; their unknown fields are reported as steps[i].field.
 function batchArgs(src: Fields, ignored: string[]): Fields | string {
   if (!Array.isArray(src.steps) || src.steps.length === 0) return "steps must be a non-empty list";
@@ -274,7 +331,16 @@ function commandArgs(cmd: CommandName, src: Fields, ignored: string[]): Fields |
     case "notifications":
     case "record_stop":
     case "clipboard_get":
+    case "chrome_sockets":
       return {};
+
+    case "chrome_tabs":
+    case "chrome_eval":
+    case "chrome_cdp":
+    case "chrome_new":
+    case "chrome_close":
+    case "chrome_activate":
+      return chromeArgs(cmd, src);
 
     case "ui": {
       if (src.engine === undefined) return {};
@@ -501,5 +567,8 @@ function summarise(cmd: string, args: Fields): Fields {
     return { ...args, steps: (args.steps as Fields[]).map((s) => ({ cmd: s.cmd, args: summarise(String(s.cmd), (s.args ?? {}) as Fields) })) };
   }
   if (cmd === "intent" && args.extras && typeof args.extras === "object") return { ...args, extras: Object.keys(args.extras) };
+  // A page's script and a DevTools call's parameters can carry typed text: their size and names only.
+  if (cmd === "chrome_eval") return { ...args, expression: undefined, expression_length: String(args.expression ?? "").length };
+  if (cmd === "chrome_cdp") return { ...args, params: Object.keys((args.params ?? {}) as object) };
   return { ...args };
 }

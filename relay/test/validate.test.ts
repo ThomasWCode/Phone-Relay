@@ -201,6 +201,35 @@ describe("helper commands", () => {
   });
 });
 
+describe("Chrome DevTools commands", () => {
+  it("take tabs by id, index or the browser, and keep scripts out of the log", () => {
+    expect(args(v("chrome_tabs"))).toEqual({ timeout: 30 });
+    expect(args(v("chrome_tabs", null, "socket=webview_devtools_remote_123"))).toEqual({ socket: "webview_devtools_remote_123", timeout: 30 });
+    expect(args(v("chrome_eval", { expression: "document.title", tab: 1, await_promise: false }))).toEqual({
+      expression: "document.title", tab: 1, await_promise: false, timeout: 30,
+    });
+    expect(v("chrome_eval", { expression: "1", tab: "browser" }).ok).toBe(true);
+    expect(args(v("chrome_cdp", { method: "Page.navigate", params: { url: "https://example.com/" }, tab: "ABC-123" }))).toEqual({
+      method: "Page.navigate", params: { url: "https://example.com/" }, tab: "ABC-123", timeout: 30,
+    });
+    expect(v("chrome_new", { url: "https://example.com/" }).ok).toBe(true);
+    expect(v("chrome_close", { tab: "T1" }).ok).toBe(true);
+    for (const [cmd, body] of [
+      ["chrome_eval", {}], ["chrome_eval", { expression: "1", tab: -1 }], ["chrome_eval", { expression: "1", tab: "a b" }],
+      ["chrome_eval", { expression: "1", await_promise: "no" }], ["chrome_cdp", { method: "navigate" }],
+      ["chrome_cdp", { method: "Page.navigate", params: [] }], ["chrome_new", {}], ["chrome_close", { tab: "browser" }],
+      ["chrome_tabs", { socket: "bad name!" }],
+    ] as [CommandName, Record<string, unknown>][]) {
+      expect(v(cmd, body).ok, `${cmd} ${JSON.stringify(body)}`).toBe(false);
+    }
+    expect(summariseArgs({ cmd: "chrome_eval", args: { expression: "secret()", tab: 0 } })).toEqual({ tab: 0, expression_length: 8 });
+    expect(summariseArgs({ cmd: "chrome_cdp", args: { method: "Input.insertText", params: { text: "secret" } } }))
+      .toEqual({ method: "Input.insertText", params: ["text"] });
+    expect(v("batch", { steps: [{ cmd: "chrome_eval", args: { expression: "1" } }] }).ok).toBe(true);
+    expect(v("batch", { steps: [{ cmd: "chrome_sockets" }] }).ok).toBe(false);
+  });
+});
+
 describe("parseBody", () => {
   it("accepts only JSON objects, of any size", () => {
     expect(parseBody('{"a":1}')).toEqual({ a: 1 });
