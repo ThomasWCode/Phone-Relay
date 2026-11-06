@@ -14,8 +14,8 @@ android {
         // phone with (screenshots, the shade's dismissal, the d-pad actions), with no version checks.
         minSdk = 34
         targetSdk = 36
-        versionCode = 2
-        versionName = "1.1.0"
+        versionCode = 3
+        versionName = "1.2.0"
     }
 
     signingConfigs {
@@ -66,6 +66,9 @@ dependencies {
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.okhttp)
+    implementation(libs.libadb.android)
+    implementation(libs.bouncycastle.pkix)
+    implementation(libs.conscrypt.android)
 
     testImplementation(libs.junit)
     testImplementation(libs.kotlin.test.junit)
