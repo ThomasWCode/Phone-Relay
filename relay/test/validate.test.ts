@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { AGENT_ROUTES, parseBody, summariseArgs, validateCommand, validateText, type CommandName } from "../src/validate";
+import { AGENT_ROUTES, findRoute, parseBody, summariseArgs, validateCommand, validateText, type CommandName } from "../src/validate";
 
 const q = (s = "") => new URLSearchParams(s);
 const v = (cmd: CommandName, body: Record<string, unknown> | null = null, query = "") => validateCommand(cmd, q(query), body);
@@ -36,12 +36,16 @@ describe("validateCommand", () => {
     for (const ms of [-1, "300", true]) expect(v("swipe", { ...base, ms }).ok, String(ms)).toBe(false);
   });
 
-  it("type takes ASCII of any length, newlines and tabs included", () => {
+  it("type takes any text: keys for ASCII, pasted otherwise", () => {
     expect(v("type", { text: "Hello, world! (test) $x `y`" }).ok).toBe(true);
     expect(v("type", { text: "100% and %s" }).ok).toBe(true);
     expect(v("type", { text: "line one\nline two\ttabbed\r\n" }).ok).toBe(true);
     expect(args(v("type", { text: "x".repeat(10000) }))?.timeout).toBe(1030);
-    for (const text of ["", "café", "bell\u0007", 5, null]) expect(v("type", { text }).ok, JSON.stringify(text)).toBe(false);
+    for (const text of ["café", "日本語 😀", "bell\u0007"]) expect(v("type", { text }).ok, text).toBe(true);
+    expect(args(v("type", { text: "ascii", method: "paste" }))).toEqual({ text: "ascii", method: "paste", timeout: 30.5 });
+    for (const body of [{ text: "café", method: "keys" }, { text: "x", method: "voice" }, { text: "" }, { text: 5 }, { text: null }]) {
+      expect(v("type", body).ok, JSON.stringify(body)).toBe(false);
+    }
   });
 
   it("key takes short names, any KEYCODE_* name and key numbers", () => {
@@ -155,6 +159,45 @@ describe("app, file and control commands", () => {
     expect(args(v("record_start", { seconds: 600 }))?.timeout).toBe(30);
     expect(args(v("record_stop"))?.timeout).toBe(300);
     for (const q of ["seconds=0", "seconds=-1", "size=big", "bit_rate=1.5"]) expect(v("record", null, q).ok, q).toBe(false);
+  });
+});
+
+describe("helper commands", () => {
+  it("routes by path and method", () => {
+    expect(findRoute("/clipboard", "GET")).toEqual({ method: "GET", cmd: "clipboard_get" });
+    expect(findRoute("/clipboard", "POST")).toEqual({ method: "POST", cmd: "clipboard_set" });
+    expect(findRoute("/clipboard", "PUT")).toBe("method");
+    expect(findRoute("/tap", "GET")).toBe("method");
+    expect(findRoute("/nope", "GET")).toBeNull();
+  });
+
+  it("gesture takes 1 to 10 paths of [x, y] points", () => {
+    const pinch = { pointers: [[[500, 1000], [300, 800]], [[580, 1080], [780, 1280]]], ms: 400 };
+    expect(args(v("gesture", pinch))).toEqual({ ...pinch, scale: 1, timeout: 30.4 });
+    for (const bad of [{}, { pointers: [] }, { pointers: [[]] }, { pointers: [[[1]]] }, { pointers: [[["1", 2]]] },
+      { pointers: Array(11).fill([[1, 1]]) }, { pointers: [[[1, 1]]], ms: -1 }, { pointers: [[[1, 1]]], scale: 0 }]) {
+      expect(v("gesture", bad).ok, JSON.stringify(bad)).toBe(false);
+    }
+  });
+
+  it("clipboard, audio, ui engine and waiting for text", () => {
+    expect(args(v("clipboard_get"))).toEqual({ timeout: 30 });
+    expect(v("clipboard_set", { text: "" }).ok).toBe(true);
+    expect(v("clipboard_set", { text: 5 }).ok).toBe(false);
+    expect(v("clipboard_set", { text: null }).ok).toBe(true);
+    expect(v("clipboard_set", {}).ok).toBe(false);
+    expect(args(v("audio", null, "seconds=5&source=mic"))).toEqual({ seconds: 5, source: "mic", timeout: 70 });
+    for (const q of ["source=speaker", "seconds=0"]) expect(v("audio", null, q).ok, q).toBe(false);
+    expect(args(v("ui", null, "engine=uiautomator"))).toEqual({ engine: "uiautomator", timeout: 30 });
+    expect(v("ui", null, "engine=x").ok).toBe(false);
+    expect(args(v("wait", { for: "text", text: "Sign in" }))).toEqual({ for: "text", text: "Sign in", timeout: 40 });
+    expect(v("wait", { for: "text" }).ok).toBe(false);
+    expect(v("batch", { steps: [{ cmd: "gesture", args: { pointers: [[[1, 1]]] } }, { cmd: "clipboard_get" }] }).ok).toBe(true);
+    expect(v("batch", { steps: [{ cmd: "audio" }] }).ok).toBe(false);
+  });
+
+  it("keeps clipboard text out of the log", () => {
+    expect(summariseArgs({ cmd: "clipboard_set", args: { text: "secret", timeout: 30 } })).toEqual({ length: 6 });
   });
 });
 
