@@ -9,17 +9,18 @@ The owner's rules in [PHONE_RULES.md](PHONE_RULES.md) and the rules in [AGENT_IN
 
 ## Two clients
 
-The phone side is either the **Android app** (always on; it drives the phone through its accessibility service) or the **adb client** (`phone_client.py` over wireless debugging; it drives the phone as the shell user). `/state` says which is connected (`client`: `android-app` or `termux-adb`) and, for the app, lists the commands it runs (`capabilities`). Everything below applies to both, except:
+The phone side is either the **Android app** (always on; it drives the phone through its accessibility service) or the **adb client** (`phone_client.py` over wireless debugging; it drives the phone as the shell user). `/state` says which is connected (`client`: `android-app` or `termux-adb`) and, for the app, lists the commands it runs (`capabilities`). Only one is connected at a time: a new phone connection replaces the old one (the relay closes it with `replaced`) and neither client gives way, so run the adb client only with the app switched off. Everything below applies to both, except:
 
 | | Android app | adb client |
 |---|---|---|
-| Runs | Always, on any network; back by itself after a reboot or an update | Only while wireless debugging is on (Wi-Fi); started again after each reboot |
+| Runs | Always, on any network; back by itself after an update, and after a reboot once the phone has first been unlocked (Android starts apps only then; not yet tested) | Only while wireless debugging is on (Wi-Fi); started again after each reboot |
 | Off switch on the phone | Quick Settings tile, notification, the app | The stop file |
 | `if_foreground` | Checked just before the action, milliseconds ahead of it | Checked in the same shell command as the action, which still leaves a gap: `input` (a Java program) takes a moment to start |
-| Typing | Into the focused field only (409 `no_text_field` otherwise), through the app's own input connection, as a keyboard types | Anywhere, as key events (`input text`), pasting what is not ASCII |
+| Typing | Into the focused field through the app's own input connection, as a keyboard types; with none focused, ASCII only, through the shell bridge (409 `no_text_field` otherwise) | Anywhere, as key events (`input text`), pasting what is not ASCII |
 | Keys | Back, Home, Recents, the shade, power (locks; held: the power menu), wake, d-pad, volume, media, page up/down; while a field is focused, any key; any other key through the shell bridge (below) | Any key |
 | UI tree | Every window of the main user, as the accessibility framework gives it; `engine=uiautomator` gives the same tree and unbinds nothing | The same through the helper, or `uiautomator` |
 | Screenshots | Through the accessibility service (about 3 a second at most) | `screencap` |
+| Files, notifications | Files: shared storage (the owner grants All files access) and the app's own folders. Notifications: through its notification listener (the owner grants notification access) | Files: whatever the shell user can read and write. Notifications: `dumpsys notification --noredact` |
 | Gestures | Up to 10 fingers, any length (past Android's 60 s, as strokes that continue each other, the fingers staying down) | Up to 10 fingers, any length |
 | Reading the clipboard | An invisible window of the app comes forward for a moment (Android lets only the app in front read it) | Through the helper |
 | Screen recording, audio | MediaProjection: Android's consent prompt shows for a moment before each, and the app answers it; the status bar shows the capture. One MP4 at any length. The sound output is captured as it plays, without apps that refuse capture (and calls) | `screenrecord` (MP4 segments past 180 s) and the helper (the output goes quiet on the phone meanwhile) |
@@ -30,7 +31,7 @@ The phone side is either the **Android app** (always on; it drives the phone thr
 
 ### See
 - **Screenshot** of whatever is on the screen (any app, the home screen, the notification shade, the lock screen) at any scale above 0, as JPEG. Scales above 1 give the full-size image. Headers give the image size, screen size, scale and app in front.
-- **UI tree** (`/ui`): every element on the screen from every package (status bar, keyboard and overlays included): text (password fields' text too, as Android reports it), content descriptions, resource ids, classes, flags (clickable, scrollable, editable, focused, password, checked) and real-pixel bounds and centres. It comes from the helper (see below), which connects to the accessibility framework with `FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES`, so the phone's own accessibility services stay bound. `engine=uiautomator` uses `uiautomator dump` instead, which unbinds them all for a moment; nothing else calls it. Only what is on the screen is in the tree. Apps running in another profile (a work profile, Secure Folder, cloned apps) are not in it at all, as Android's accessibility framework serves each user separately; screenshots and input still reach them.
+- **UI tree** (`/ui`): every element on the screen from every package (status bar, keyboard and overlays included): text (password fields' text too, as Android reports it), content descriptions, resource ids, classes, flags (clickable, scrollable, editable, focused, password, checked) and real-pixel bounds and centres. With the adb client it comes from the helper (see below), which connects to the accessibility framework with `FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES`, so the phone's own accessibility services stay bound. With the adb client, `engine=uiautomator` uses `uiautomator dump` instead, which unbinds them all for a moment; nothing else calls it. The app reads the tree from its accessibility service, and both engines give that. Only what is on the screen is in the tree. Apps running in another profile (a work profile, Secure Folder, cloned apps) are not in it at all, as Android's accessibility framework serves each user separately; screenshots and input still reach them.
 - **State**: app in front, screen awake, battery, screen size, client version.
 
 ### Touch
@@ -41,7 +42,7 @@ The phone side is either the **Android app** (always on; it drives the phone thr
 - Taps on the on-screen keyboard, password fields included.
 
 ### Type
-- Any text of any length. ASCII is typed as keys (`input text`; `%` and `%s` included, newlines and tabs as Enter and Tab). Anything else (accented letters, other scripts, emoji) is pasted through the clipboard, and the clipboard's earlier text is put back afterwards. `method` forces either way.
+- Any text of any length. ASCII is typed as keys (`input text`; `%` and `%s` included, newlines and tabs as Enter and Tab). Anything else (accented letters, other scripts, emoji) is pasted through the clipboard, and the clipboard's earlier text is put back afterwards. `method` forces either way. With the app and no field focused, only ASCII can be typed (through the shell bridge).
 - Into any field, password fields included, or with no field focused. The reply gives the focused field's package, `inputType` and whether it is a password field.
 
 ### Keys
@@ -54,20 +55,20 @@ The phone side is either the **Android app** (always on; it drives the phone thr
 - **Send any intent** (`/intent`): start an activity or send a broadcast with an action, data, MIME type, component, package, categories, flags and typed extras (a particular Settings screen, a share to an app, ...).
 - **Use** any app, Settings, the notification shade and quick settings, and the lock screen's own controls. Unlocking a locked phone needs its PIN or biometrics, which the agent does not have.
 - In a browser, anything a person can do by touch and typing: open any URL, use sites where the phone is signed in, download files, pick saved passwords from the browser's own autofill dropdown.
-- **Chrome's pages from the inside**, through Chrome DevTools (`/chrome/*`): list the tabs, run JavaScript in any tab and get its value (`/chrome/eval`), call any DevTools protocol method on a tab or the browser (`/chrome/cdp`: navigate, read the DOM, cookies and storage, network, screenshots of a page, input events, ...), and open, bring to front or close tabs. The page's own session applies: what the signed-in user's Chrome can do, the script can do. Chrome lists no tabs while it is in the background with its pages frozen; bring it to the front first. Debuggable WebViews in other apps have DevTools sockets too (`/chrome/sockets`), usable with `socket=`.
+- **Chrome's pages from the inside**, through Chrome DevTools (`/chrome/*`): list the tabs, run JavaScript in any tab and get its value (`/chrome/eval`), call any DevTools protocol method on a tab or the browser (`/chrome/cdp`: navigate, read the DOM, cookies and storage, network, screenshots of a page, input events, ...), and open, bring to front or close tabs. The page's own session applies: what the signed-in user's Chrome can do, the script can do. Chrome lists no tabs while it is in the background with its pages frozen, and has no DevTools socket at all while it is not running (a 502 `devtools_unavailable`); `/launch` it first. Debuggable WebViews in other apps have DevTools sockets too (`/chrome/sockets`), usable with `socket=`.
 - In email and messaging apps: read, search, compose, send, forward, delete, switch accounts.
 
 ### Clipboard
 - **Read** the clipboard's text, **set** it, Unicode included, or **empty** it (`/clipboard`).
 
 ### Notifications and system UI
-- **Read notifications** as data (`/notifications`): each one's package, key, id, tag, title, text, big text, sub text and summary, from `dumpsys notification --noredact`. Nothing is redacted.
+- **Read notifications** as data (`/notifications`): each one's package, key, id, tag, title, text, big text, sub text and summary, from `dumpsys notification --noredact` (the adb client) or the app's notification listener. Nothing is redacted.
 - **Open or close** the notification shade and quick settings (`/statusbar`).
 - **Rotation**: lock the screen to a quarter turn or let it rotate automatically (`/rotation`); the reply gives the old setting, and `/state` reports the current one.
 
 ### Files
 - **List** a folder, or one file (`/files`): names, types, sizes, modified times.
-- **Pull** any file the shell can read (`/files/pull`), and **push** a file anywhere the shell can write (`/files/push`), of any size. Files cross the relay in acknowledged 256 KiB chunks and are streamed, never held whole in memory. A pushed file is not added to the media library, so a gallery app may not show it straight away.
+- **Pull** any file the shell can read (`/files/pull`), and **push** a file anywhere the shell can write (`/files/push`), of any size (with the app: shared storage, which the owner's All files access reaches, and the app's own folders). Files cross the relay in acknowledged 256 KiB chunks and are streamed, never held whole in memory. A pushed file is not added to the media library, so a gallery app may not show it straight away.
 
 ### Screen recording
 - **Record** the screen as MP4: for a set time (`/record?seconds=`), or around other commands (`/record/start`, then anything, then `/record/stop`, which returns the video). With the adb client Android stops each file at 180 s, so a longer recording comes back as a zip of consecutive MP4 segments; the app's is one MP4. The video has no sound.
@@ -77,7 +78,7 @@ The phone side is either the **Android app** (always on; it drives the phone thr
 - **Wait** (`/wait`) until the screen changes, stops changing (an animation or page load has settled), an app comes to the front, or some text appears in the UI tree. Screens are compared at 1/8 scale, so a blinking cursor does not count as a change.
 - **Batch** (`/batch`): several commands in one request, with sleeps between them. Each step has its own deadline and takes the batch's `if_foreground` unless it sets its own. A batch stops at the first error unless told not to.
 
-### The helper
+### The helper (adb client)
 Gestures, the clipboard, pasted text, audio and the UI tree go through a small Java helper (`phone/helper/`), which the phone client pushes to `/data/local/tmp` on first use and runs as the shell user with `app_process`, as scrcpy does. It reaches hidden framework APIs by reflection; if a future Android changes one, that command fails with 502 `helper_failed` and its reason, and nothing falls back silently.
 
 ### Control
@@ -90,10 +91,10 @@ Gestures, the clipboard, pasted text, audio and the UI tree go through a small J
 | # | Restriction | Where | Why |
 |---|---|---|---|
 | 1 | Tokens: the agent token cannot use the admin or device endpoints | Worker | The agent cannot switch the relay back on, read the log, change the owner's notes or pose as the phone |
-| 2 | Owner kill switches: `/admin/disable`, and the stop file next to the client | Worker + client | The owner's off switch |
-| 3 | One phone, one command at a time | Worker + client | adb actions must not interleave |
+| 2 | Owner kill switches: `/admin/disable`, the app's switch (tile, notification, app) and the adb client's stop file | Worker + client | The owner's off switch. They end the relay's path to the phone, not `adb` from the owner's own computer |
+| 3 | One phone, one command at a time | Worker + client | Actions must not interleave; a second phone connection replaces the first |
 
-Requests are still checked for shape, in the Worker and again on the phone: numbers must be numbers, package and key names must match their patterns, and text must be ASCII (Unicode is not built yet). That keeps values out of the shell's syntax; it refuses no action.
+Requests are still checked for shape, in the Worker and again on the phone: numbers must be numbers, package and key names must match their patterns, and text typed as keys (`method: keys`) must be ASCII; anything else is pasted. That keeps values out of the shell's syntax; it refuses no action.
 
 Typed text is never logged, only its length. That limits what is recorded, not what the agent can do.
 

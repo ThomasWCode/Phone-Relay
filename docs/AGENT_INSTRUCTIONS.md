@@ -7,7 +7,7 @@ The relay serves this file to the agent: `curl -sS https://<WORKER_HOST>/` (with
 ## Access
 
 - Relay: `https://<WORKER_HOST>` (replace with the real host).
-- Authentication is added by the environment's network secret. Do not add an `Authorization` header yourself, and do not look for a token: none exists inside the session.
+- Authentication is added by the environment's network secret. Do not add an `Authorization` header yourself, and do not look for a token: none exists inside the session. (Only a session on the owner's own computer, outside the cloud environment, holds the agent token, in the environment variable `PHONE_RELAY_AGENT_TOKEN`; it calls the API with `python scripts/phone.py GET /state` instead of `curl`, and never prints the token.)
 - Call the API with `curl`. From Python or another HTTP library, set your own `User-Agent` header: Cloudflare rejects some default ones, Python's `urllib` among them, with `403 error code: 1010`. Examples:
 
 ```bash
@@ -39,10 +39,10 @@ curl -sS -X POST $R/chrome/eval -H 'Content-Type: application/json' -d '{"expres
 |---|---|
 | `GET /state` | Foreground app, awake, battery, screen size |
 | `GET /screenshot?scale=0.5` | JPEG of the screen (default scale 0.5; above 1 gives full size). Headers: `X-Image-Width/Height`, `X-Screen-Width/Height`, `X-Scale`, `X-Foreground` |
-| `GET /ui?engine=` | Every element on the screen, from every app (text, ids, flags, `bounds` and `center` in real screen pixels). `engine=uiautomator` only if the helper fails: it briefly unbinds the phone's accessibility services |
+| `GET /ui?engine=` | Every element on the screen, from every app (text, ids, flags, `bounds` and `center` in real screen pixels). With the adb client, `engine=uiautomator` only if the helper fails: it briefly unbinds the phone's accessibility services. The app has one tree, and both engines give it |
 | `POST /tap {x,y,scale?}` | Tap |
 | `POST /swipe {x1,y1,x2,y2,ms?,scale?}` | Swipe or drag (`ms` from 0, default 300). Same start and end with `ms` ≥ 500 is a long press |
-| `POST /type {text,method?}` | Type into the focused field: any text, any length. ASCII goes as keys (`\n` is Enter, `\t` is Tab); anything else is pasted through the clipboard, which gets its old text back afterwards. `method`: `keys` or `paste` to choose. The reply gives `method`, `field_package`, `field_input_type` (`null` or `0` if no field was focused) and `password_field` |
+| `POST /type {text,method?}` | Type into the focused field: any text, any length. ASCII goes as keys (`\n` is Enter, `\t` is Tab); anything else is pasted through the clipboard, which gets its old text back afterwards. `method`: `keys` or `paste` to choose. With the app and no field focused, only ASCII can be typed (through its shell bridge); anything else needs a field, so tap one first (409 `no_text_field`). The reply gives `method`, `field_package`, `field_input_type` (`null` or `0` if no field was focused) and `password_field` |
 | `POST /key {key,longpress?}` | `back`, `home`, `recents`, `enter`, `tab`, `delete`, any `KEYCODE_*` name or a key number |
 | `POST /launch {package}` | Start any installed app by package name |
 | `POST /open {url,package?}` | Open a URL with whatever handles it: a web page, a `mailto:` link (a new email; `?subject=...&body=...` fill it in), a deep link |
@@ -76,10 +76,10 @@ What you can and cannot do, in full: [CAPABILITIES.md](CAPABILITIES.md). From th
 
 ## How to work
 
-- **Which client is connected**: `/state`'s `client` is `android-app` (the owner's always-on app) or `termux-adb` (the adb client). The app lists what it runs in `capabilities`; it types only into a focused text field (tap one first), brings an invisible window forward for a moment to read the clipboard, and answers Android's consent prompt itself before each recording or audio capture (it shows for a moment). Chrome DevTools, other keys and typing with no field focused go through its shell bridge, which works on Wi-Fi only: a 503 `shell_unavailable` says why it cannot now (not paired, or wireless debugging is off), and only the owner can fix that. [CAPABILITIES.md](CAPABILITIES.md) has the full comparison.
+- **Which client is connected**: `/state`'s `client` is `android-app` (the owner's always-on app) or `termux-adb` (the adb client). The app lists what it runs in `capabilities`; it types into the focused text field through its own input connection (with none focused, ASCII goes through its shell bridge; anything else needs a field, so tap one first), brings an invisible window forward for a moment to read the clipboard, and answers Android's consent prompt itself before each recording or audio capture (it shows for a moment). Chrome DevTools, other keys and typing with no field focused go through its shell bridge, which works on Wi-Fi only: a 503 `shell_unavailable` says why it cannot now (not paired, or wireless debugging is off), and only the owner can fix that. [CAPABILITIES.md](CAPABILITIES.md) has the full comparison.
 - You decide how to read the screen and check your actions.
 - **Screenshots** have no side effects. If you read a coordinate off a scaled screenshot, pass the same `scale` with the tap (or multiply by `X-Screen-Width / X-Image-Width` yourself).
-- **`/ui`** gives exact element centres and text. It leaves the phone's accessibility services alone; only `engine=uiautomator` unbinds them for a moment, so use that only if the default fails (502 `helper_failed`), and say so.
+- **`/ui`** gives exact element centres and text. It leaves the phone's accessibility services alone; only `engine=uiautomator` unbinds them for a moment, so, with the adb client, use that only if the default fails (502 `helper_failed`), and say so; the app has one tree.
 - There are no rate limits. One command runs at a time; a slow one (a long `/wait`, `/record`, a big file) holds up the next. To record what your own actions do, use `/record/start` and `/record/stop`: the recording runs on the phone while your other commands go through.
 - `/wait {"for":"stable"}` after a tap that loads something is cheaper than polling screenshots yourself.
 
@@ -89,11 +89,11 @@ What you can and cannot do, in full: [CAPABILITIES.md](CAPABILITIES.md). From th
 |---|---|---|
 | 400 | `invalid_args` | Fix the request |
 | 401 | `unauthorized` | Stop and tell the user (network secret missing or wrong host) |
-| 404 | `not_found` | The file or folder does not exist (or the shell cannot read it), or `/record/stop` found no recording |
-| 409 | `no_text_field`, `gesture_cancelled` | The app: tap a text field before typing; a gesture Android cancelled (a real touch, the screen changed) can be retried once |
+| 404 | `not_found` | The file or folder does not exist (or the phone's shell, or the app, cannot read it), or `/record/stop` found no recording |
+| 409 | `no_text_field`, `gesture_cancelled` | The app: tap a text field before typing non-ASCII text (or when the shell bridge is unavailable); a gesture Android cancelled (a real touch, the screen changed) can be retried once |
 | 409 | `foreground_mismatch` | The app you named with `if_foreground` was not in front (or the screen was off). Take a screenshot and work out why before you retry |
 | 422 | `launch_failed` | Nothing on the phone handles that URL or intent |
-| 502 | `helper_failed`, `helper_missing` | The helper could not do it (its reason is in `detail`). Tell the user; for `/ui`, `engine=uiautomator` is the fallback |
+| 502 | `helper_failed`, `helper_missing` | The adb client's helper could not do it (its reason is in `detail`). Tell the user; for `/ui`, `engine=uiautomator` is the fallback |
 | 502 | `devtools_unavailable`, `devtools_failed` | Chrome is not running or not in front (`/launch` it), or DevTools refused the call (`detail` has its error) |
 | 501 | `unsupported` | The connected client cannot do this (`detail` says why). Find another way, or tell the user |
 | 503 | `device_offline`, `disabled`, `stopped` | Stop and tell the user. The owner may have turned the relay off on the phone |
