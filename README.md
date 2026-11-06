@@ -121,6 +121,7 @@ The stop file is `~/STOP_PHONE_AGENT` on the computer (`$HOME\STOP_PHONE_AGENT` 
    curl -sS -X POST https://WORKER_HOST/launch -H 'Content-Type: application/json' -d '{"package":"com.android.chrome"}'
    env | grep -ci bearer     # expect 0: the token is not in the session
    ```
+   A `403` with `error code: 1010` (not the relay's JSON `401`) is Cloudflare's bot check rejecting the client's `User-Agent`. Python's `urllib` default is rejected; `curl` and the phone client are not. Set a `User-Agent` header.
 5. Give Claude [docs/AGENT_INSTRUCTIONS.md](docs/AGENT_INSTRUCTIONS.md). For example, copy it into the CLAUDE.md of the repository you start phone sessions from, with `WORKER_HOST` filled in.
 
 ## 4. Owner controls (admin token: run these from your own machine, never in a Claude session)
@@ -189,7 +190,9 @@ Checked on a Galaxy S24 (Android 17) with real input in Chrome and Gmail:
 - refusals: typing into a password field, keyboard taps on a password field, taps on the home screen;
 - launch from Chrome and from the home screen.
 
-`/ui` was not run on that phone.
+- `/ui` once in Chrome; all accessibility services were still enabled afterwards and logcat showed no crashes.
+
+Also checked through the deployed Worker on `workers.dev`, with the client running on a PC over wireless adb: `/state`, `/launch`, `/screenshot`, `/swipe` and `/key`, plus refusals on the home screen (about 0.2-1.4 s per action).
 
 Not yet tested, because it needs the real phone and account (phase 4 of the plan): reboot and Wi-Fi-drop recovery, token rotation, and the prompt-injection test with a hostile email and web page.
 
