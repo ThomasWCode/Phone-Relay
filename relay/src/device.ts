@@ -5,18 +5,23 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./index";
 import { json } from "./http";
-import { DEFAULT_TIMEOUT_S, summariseArgs, type Command } from "./validate";
+import { DEFAULT_TIMEOUT_S, DOWNLOAD_COMMANDS, UPLOAD_COMMAND, summariseArgs, type Command } from "./validate";
 
 const LOG_KEEP = 1000;
 // The phone enforces each command's `timeout` itself and replies "timeout". The relay waits this much
 // longer before giving up on a reply that never comes (a lost message, a wedged client).
 const REPLY_GRACE_MS = 10_000;
 const MAX_TIMER_MS = 2 ** 31 - 1; // setTimeout's limit (about 24.8 days); longer waits are capped here
+// Files cross the phone's socket in chunks of this size, at most STREAM_WINDOW unacknowledged (as the phone client).
+const STREAM_CHUNK = 256 * 1024;
+const STREAM_WINDOW = 8;
 
 // Device error code -> HTTP status. Unknown codes become 502.
 const DEVICE_ERROR_STATUS: Record<string, number> = {
   invalid_args: 400,
+  not_found: 404,
   foreground_mismatch: 409,
+  launch_failed: 422,
   timeout: 504,
   stopped: 503,
 };
@@ -24,6 +29,8 @@ const DEVICE_ERROR_STATUS: Record<string, number> = {
 interface Pending {
   resolve: (msg: DeviceReply) => void;
   timer: ReturnType<typeof setTimeout>;
+  // A streaming command's side messages from the phone (start, chunk, ack).
+  side?: (msg: Record<string, unknown>) => void;
 }
 
 interface DeviceReply {
@@ -44,6 +51,43 @@ function base64ToBytes(b64: string): Uint8Array {
   const bin = atob(b64);
   const out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+
+// The body cut into STREAM_CHUNK pieces, whatever sizes the network delivers it in.
+async function* chunks(body: ReadableStream<Uint8Array> | null): AsyncGenerator<Uint8Array> {
+  if (!body) return;
+  const reader = body.getReader();
+  let buf = new Uint8Array(0);
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (value) {
+      const joined = new Uint8Array(buf.length + value.length);
+      joined.set(buf);
+      joined.set(value, buf.length);
+      buf = joined;
+      while (buf.length >= STREAM_CHUNK) {
+        yield buf.slice(0, STREAM_CHUNK);
+        buf = buf.slice(STREAM_CHUNK);
+      }
+    }
+    if (done) break;
+  }
+  if (buf.length) yield buf;
+}
+
+// Headers the phone may set on a download: its own X- headers only.
+function phoneHeaders(h: unknown): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (h && typeof h === "object") {
+    for (const [k, v] of Object.entries(h)) if (/^X-[A-Za-z-]{1,40}$/.test(k)) out[k] = String(v).slice(0, 512);
+  }
   return out;
 }
 
@@ -129,6 +173,9 @@ export class DeviceHub extends DurableObject<Env> {
         return this.acceptDevice();
       case "/internal/command":
         return this.runCommand((await request.json()) as Command);
+      case "/internal/push":
+        // An upload: the command rides in a header, the file is the body, streamed to the phone.
+        return this.runCommand(JSON.parse(request.headers.get("X-Command") ?? "{}") as Command, request.body);
       case "/internal/notes":
         return new Response(this.notes(), { headers: { "Content-Type": "text/markdown; charset=utf-8" } });
       case "/admin/notes": {
@@ -194,7 +241,45 @@ export class DeviceHub extends DurableObject<Env> {
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  private async runCommand(command: Command): Promise<Response> {
+  // Send a command to the phone. The promise settles with its final reply, or with device_timeout /
+  // device_offline; `side` receives a streaming command's other messages meanwhile.
+  private dispatch(ws: WebSocket, command: Command, side?: Pending["side"]): { id: string; reply: Promise<DeviceReply> } {
+    const id = crypto.randomUUID();
+    const timeoutS = Number(command.args.timeout ?? DEFAULT_TIMEOUT_S);
+    const timeoutMs = Math.min(timeoutS * 1000 + REPLY_GRACE_MS, MAX_TIMER_MS);
+    const reply = new Promise<DeviceReply>((resolve) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        resolve({ id, ok: false, error: "device_timeout" });
+      }, timeoutMs);
+      this.pending.set(id, { resolve, timer, side });
+      try {
+        ws.send(JSON.stringify({ id, cmd: command.cmd, args: command.args }));
+      } catch (e) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        resolve({ id, ok: false, error: "device_offline", detail: String(e) });
+      }
+    });
+    return { id, reply };
+  }
+
+  // A side message to the phone for a running command; a closed socket is already failing it.
+  private sendSide(ws: WebSocket, id: string, msg: Record<string, unknown>): void {
+    try {
+      ws.send(JSON.stringify({ id, ...msg }));
+    } catch {
+      // closed
+    }
+  }
+
+  private failure(reply: DeviceReply): [number, string, Record<string, unknown>] {
+    const error = reply.error ?? "device_error";
+    const status = error === "device_timeout" ? 504 : error === "device_offline" ? 503 : (DEVICE_ERROR_STATUS[error] ?? 502);
+    return [status, error, reply.detail ? { detail: reply.detail } : {}];
+  }
+
+  private async runCommand(command: Command, body: ReadableStream<Uint8Array> | null = null): Promise<Response> {
     const started = Date.now();
     const detail = summariseArgs(command);
     // Fields the command does not take are dropped; say which, so a typo does not pass unnoticed.
@@ -208,29 +293,10 @@ export class DeviceHub extends DurableObject<Env> {
     const ws = this.openSockets()[0];
     if (!ws) return done(503, "device_offline");
 
-    const id = crypto.randomUUID();
-    const timeoutS = Number(command.args.timeout ?? DEFAULT_TIMEOUT_S);
-    const timeoutMs = Math.min(timeoutS * 1000 + REPLY_GRACE_MS, MAX_TIMER_MS);
-    const reply = await new Promise<DeviceReply>((resolve) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        resolve({ id, ok: false, error: "device_timeout" });
-      }, timeoutMs);
-      this.pending.set(id, { resolve, timer });
-      try {
-        ws.send(JSON.stringify({ id, cmd: command.cmd, args: command.args }));
-      } catch (e) {
-        clearTimeout(timer);
-        this.pending.delete(id);
-        resolve({ id, ok: false, error: "device_offline", detail: String(e) });
-      }
-    });
+    if (DOWNLOAD_COMMANDS.includes(command.cmd)) return this.download(ws, command, done);
+    const reply = await (command.cmd === UPLOAD_COMMAND ? this.upload(ws, command, body) : this.dispatch(ws, command)).reply;
 
-    if (!reply.ok) {
-      const error = reply.error ?? "device_error";
-      const status = error === "device_timeout" ? 504 : error === "device_offline" ? 503 : (DEVICE_ERROR_STATUS[error] ?? 502);
-      return done(status, error, reply.detail ? { detail: reply.detail } : {});
-    }
+    if (!reply.ok) return done(...this.failure(reply));
 
     const result = reply.result ?? {};
     if (command.cmd === "screenshot") {
@@ -253,6 +319,99 @@ export class DeviceHub extends DurableObject<Env> {
       });
     }
     return done(200, undefined, result);
+  }
+
+  // A file from the phone (a pull, a recording), streamed to the agent as it arrives. The response
+  // starts at the phone's start message; each chunk is acked once the agent's side has taken it, so
+  // the phone never runs more than STREAM_WINDOW chunks ahead of a slow reader.
+  private download(ws: WebSocket, command: Command, done: (s: number, e?: string, x?: Record<string, unknown>) => Response): Promise<Response> {
+    const started = Date.now();
+    let respond!: (r: Response) => void;
+    const response = new Promise<Response>((resolve) => (respond = resolve));
+    let writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
+    let bytes = 0;
+    const { id, reply } = this.dispatch(ws, command, (msg) => {
+      if (msg.type === "start" && !writer) {
+        const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+        writer = writable.getWriter();
+        respond(
+          new Response(readable, {
+            status: 200,
+            headers: {
+              "Content-Type": String(msg.mime ?? "application/octet-stream"),
+              "Cache-Control": "no-store",
+              "X-File-Size": String(msg.size ?? ""),
+              ...phoneHeaders(msg.headers),
+              ...(command.ignored?.length ? { "X-Ignored-Fields": command.ignored.join(",") } : {}),
+            },
+          }),
+        );
+      } else if (msg.type === "chunk" && writer && typeof msg.data === "string") {
+        const data = base64ToBytes(msg.data);
+        bytes += data.length;
+        writer.write(data).then(
+          () => this.sendSide(ws, id, { type: "ack", seq: msg.seq }),
+          () => this.sendSide(ws, id, { type: "cancel" }), // the agent went away
+        );
+      }
+    });
+    void reply.then((r) => {
+      // The relay gave up (the command sat queued behind a slow one, say): stop the phone sending.
+      if (!r.ok && r.error === "device_timeout") this.sendSide(ws, id, { type: "cancel" });
+      if (!writer) {
+        // Nothing was streamed: an error before the start (or a reply with no file at all).
+        respond(r.ok ? done(502, "device_error", { detail: "the phone sent no file" }) : done(...this.failure(r)));
+        return;
+      }
+      this.log("agent", command.cmd, { ...summariseArgs(command), bytes }, r.ok, r.ok ? undefined : r.error, Date.now() - started);
+      // A failure after the start cuts the body short, so the agent sees an incomplete transfer, not a whole file.
+      if (r.ok) void writer.close().catch(() => {});
+      else void writer.abort(r.error ?? "device_error").catch(() => {});
+    });
+    return response;
+  }
+
+  // A file from the agent streamed to the phone in chunks, at most STREAM_WINDOW ahead of its acks,
+  // then an end message. Stops early if the phone replies first (an error) or the body breaks.
+  private upload(ws: WebSocket, command: Command, body: ReadableStream<Uint8Array> | null): { id: string; reply: Promise<DeviceReply> } {
+    let acked = -1;
+    let finished = false;
+    let ended = false;
+    let wake: (() => void) | null = null;
+    const sent = this.dispatch(ws, command, (msg) => {
+      if (msg.type === "ack" && typeof msg.seq === "number") {
+        acked = Math.max(acked, msg.seq);
+        wake?.();
+      }
+    });
+    void sent.reply.then(() => {
+      finished = true;
+      wake?.();
+      // A reply before the end message (an error, or the relay's own deadline): the phone may still be
+      // waiting on chunks, or have the upload queued, so tell it to stop.
+      if (!ended) this.sendSide(ws, sent.id, { type: "cancel" });
+    });
+    const pump = async () => {
+      let seq = 0;
+      let total = 0;
+      try {
+        for await (const piece of chunks(body)) {
+          while (seq - acked > STREAM_WINDOW && !finished) await new Promise<void>((r) => (wake = r));
+          if (finished) return;
+          ws.send(JSON.stringify({ id: sent.id, type: "chunk", seq, data: bytesToBase64(piece) }));
+          seq++;
+          total += piece.length;
+        }
+        if (!finished) {
+          ws.send(JSON.stringify({ id: sent.id, type: "end", bytes: total }));
+          ended = true;
+        }
+      } catch {
+        this.sendSide(ws, sent.id, { type: "cancel" });
+      }
+    };
+    void pump();
+    return sent;
   }
 
   // ---- hibernation API handlers ----
@@ -278,6 +437,10 @@ export class DeviceHub extends DurableObject<Env> {
     if (typeof msg.id === "string") {
       const p = this.pending.get(msg.id);
       if (!p) return; // late reply after timeout
+      if (typeof msg.type === "string") {
+        p.side?.(msg); // a running command's start, chunk or ack
+        return;
+      }
       clearTimeout(p.timer);
       this.pending.delete(msg.id);
       p.resolve(msg as unknown as DeviceReply);

@@ -6,6 +6,7 @@ Run from the repository root:
 
 import asyncio
 import base64
+import io
 import json
 import logging
 import os
@@ -16,6 +17,7 @@ import sys
 import tempfile
 import time
 import unittest
+import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -54,6 +56,11 @@ class InProcessAdb:
         self.calls.append(list(args))
         if self.state.get("hang"):
             await asyncio.sleep(self.state["hang"])
+        if args[0] in ("pull", "push"):
+            code, err = fake_adb.transfer(list(args), self.state)
+            if code:
+                raise pc.CommandError("adb_failed", err)
+            return b""
         cmd = " ".join(args[1:])
         m = fake_adb.GUARD_RE.match(cmd)
         if m is None:
@@ -717,6 +724,426 @@ class DispatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any("topsecretvalue" in line for line in logs.output))
 
 
+class FakeRelay(pc.Channel):
+    """A command's channel with the relay side faked: chunks sent are recorded and acked at once,
+    and `incoming` (chunks, end, cancel) is what the relay sends."""
+
+    def __init__(self, incoming=(), ack=True):
+        super().__init__("t", self._record)
+        self.sent = []
+        self.ack = ack
+        for msg in incoming:
+            self.inbox.put_nowait(msg)
+
+    async def _record(self, raw):
+        msg = json.loads(raw)
+        self.sent.append(msg)
+        if self.ack and msg.get("type") == "chunk":
+            self.inbox.put_nowait({"type": "ack", "seq": msg["seq"]})
+
+    def received(self):
+        """The bytes of the chunks sent to the relay, joined."""
+        return b"".join(base64.b64decode(m["data"]) for m in self.sent if m["type"] == "chunk")
+
+    def start(self):
+        return next(m for m in self.sent if m["type"] == "start")
+
+
+def upload(data, chunk=5):
+    """The messages the relay sends for an upload of `data`."""
+    msgs = [{"type": "chunk", "seq": i, "data": base64.b64encode(data[o:o + chunk]).decode()}
+            for i, o in enumerate(range(0, len(data), chunk))]
+    return msgs + [{"type": "end", "bytes": len(data)}]
+
+
+class NewParsingTests(unittest.TestCase):
+    def test_notifications(self):
+        items = pc.parse_notifications(fake_adb.NOTIFICATION_DUMP)
+        self.assertEqual(len(items), 2)  # the snoozed copy of the first record is skipped
+        gm, chrome = items
+        self.assertEqual(gm["key"], "0|com.google.android.gm|4|gig:12345|10234")
+        self.assertEqual((gm["pkg"], gm["id"], gm["tag"]), ("com.google.android.gm", 4, "gig:12345"))
+        self.assertEqual((gm["title"], gm["text"]), ("A sender", "Meeting moved"))
+        self.assertEqual(gm["big_text"], "Meeting moved to Thursday.\nBring the slides (final version).")
+        self.assertEqual(gm["sub_text"], "someone@example.com")
+        self.assertNotIn("showWhen", gm)
+        self.assertEqual((chrome["tag"], chrome["title"]), (None, "report.pdf"))
+
+    def test_notification_text_with_parentheses_over_several_lines(self):
+        dump = fake_adb.NOTIFICATION_DUMP.replace(
+            "Meeting moved to Thursday.\nBring the slides (final version).)",
+            "Meeting moved (Thursday)\nBring the slides (final version).\n\n  indented (a quote))")
+        gm = pc.parse_notifications(dump)[0]
+        self.assertEqual(gm["big_text"], "Meeting moved (Thursday)\nBring the slides (final version).\n\n  indented (a quote)")
+        self.assertEqual(gm["sub_text"], "someone@example.com")  # the next extra is still read
+        last = pc.parse_notifications(dump)[1]
+        self.assertEqual(last["text"], "Download complete")  # the last extra ends at the closing brace
+
+    def test_stat(self):
+        self.assertEqual(pc.parse_stat("regular file|12|1700000000|a b|c.txt"),
+                         {"name": "a b|c.txt", "type": "file", "size": 12, "modified": 1700000000})
+        self.assertEqual(pc.parse_stat("directory|4096|1|Download")["type"], "dir")
+        self.assertEqual(pc.parse_stat("regular empty file|0|1|e")["type"], "file")
+        self.assertIsNone(pc.parse_stat(pc.MISSING_MARKER))
+        self.assertIsNone(pc.parse_stat("x|y|z|w"))
+
+    def test_frame_diff(self):
+        a = pc.frame_signature(fake_adb.png(80, 160, 40))
+        self.assertEqual(pc.frame_diff(a, pc.frame_signature(fake_adb.png(80, 160, 40))), 0)
+        self.assertEqual(pc.frame_diff(a, pc.frame_signature(fake_adb.png(80, 160, 200))), 1)
+        self.assertEqual(pc.frame_diff(b"x", b"x"), 0)
+        self.assertEqual(pc.frame_diff(b"x", b"y"), 1)
+
+    def test_default_timeouts(self):
+        self.assertEqual(pc.default_timeout("wait", {"seconds": 100}), 130)
+        self.assertEqual(pc.default_timeout("record", {"seconds": 10}), 80)
+        self.assertEqual(pc.default_timeout("pull", {}), pc.TRANSFER_TIMEOUT_S)
+        steps = [{"cmd": "tap", "args": {}}, {"cmd": "sleep", "args": {"ms": 2000}}, {"cmd": "key", "args": {"timeout": 5}}]
+        self.assertEqual(pc.default_timeout("batch", {"steps": steps}), 30 + 30 + 2 + 5)
+
+
+class ChannelTests(unittest.IsolatedAsyncioTestCase):
+    async def test_send_file_keeps_to_the_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "big.bin")
+            data = os.urandom(pc.STREAM_CHUNK * 20 + 7)
+            with open(path, "wb") as f:
+                f.write(data)
+            relay = FakeRelay(ack=False)
+            task = asyncio.create_task(relay.send_file(path, "application/octet-stream"))
+            await asyncio.sleep(0.05)
+            chunks = [m for m in relay.sent if m["type"] == "chunk"]
+            self.assertEqual(len(chunks), pc.STREAM_WINDOW)  # no more until the relay acks
+            relay.ack = True
+            for m in chunks:
+                relay.inbox.put_nowait({"type": "ack", "seq": m["seq"]})
+            self.assertEqual(await task, len(data))
+            self.assertEqual(relay.received(), data)
+            self.assertEqual(relay.start()["size"], len(data))
+
+    async def test_cancel_stops_a_download(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "big.bin")
+            with open(path, "wb") as f:
+                f.write(b"x" * pc.STREAM_CHUNK * 30)
+            relay = FakeRelay(ack=False)
+            task = asyncio.create_task(relay.send_file(path, "application/octet-stream"))
+            await asyncio.sleep(0.05)
+            relay.inbox.put_nowait({"type": "cancel"})
+            with self.assertRaises(pc.CommandError) as cm:
+                await task
+            self.assertEqual(cm.exception.code, "cancelled")
+
+    async def test_recv_file_acks_each_chunk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "in.bin")
+            relay = FakeRelay(upload(b"hello there, phone"))
+            self.assertEqual(await relay.recv_file(path), 18)
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), b"hello there, phone")
+            self.assertEqual([m["seq"] for m in relay.sent if m["type"] == "ack"], [0, 1, 2, 3])
+
+
+class AppCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_open_url(self):
+        ctl, adb = controller({"foreground": fake_adb.LAUNCHER})
+        await ctl.handle("open", {"url": "https://example.com/a?b=1&c=2"})
+        self.assertEqual(adb.state["foreground"], "com.android.chrome")
+        self.assertEqual(adb.state["last_intent"][-1], "https://example.com/a?b=1&c=2")
+
+    async def test_open_mailto(self):
+        ctl, adb = controller()
+        await ctl.handle("open", {"url": "mailto:someone@example.com?subject=Hi%20there&body=Line"})
+        self.assertEqual(adb.state["foreground"], "com.google.android.gm")
+
+    async def test_open_with_package_and_guard(self):
+        ctl, adb = controller()
+        await ctl.handle("open", {"url": "https://example.com", "package": "com.android.chrome",
+                                  "if_foreground": "com.android.chrome"})
+        self.assertIn("-p", adb.state["last_intent"])
+        with self.assertRaises(pc.CommandError) as cm:
+            await ctl.handle("open", {"url": "https://example.com", "if_foreground": "com.android.settings"})
+        self.assertEqual(cm.exception.code, "foreground_mismatch")
+
+    async def test_open_unresolvable(self):
+        ctl, _ = controller()
+        with self.assertRaises(pc.CommandError) as cm:
+            await ctl.handle("open", {"url": "nosuchscheme:x"})
+        self.assertEqual(cm.exception.code, "launch_failed")
+        for bad in [{"url": ""}, {}, {"url": "https://x", "package": "a b"}]:
+            with self.assertRaises(pc.CommandError, msg=repr(bad)):
+                await ctl.handle("open", bad)
+
+    async def test_intent(self):
+        ctl, adb = controller()
+        await ctl.handle("intent", {"action": "android.intent.action.SEND", "type": "text/plain",
+                                    "package": "com.google.android.gm", "categories": ["android.intent.category.DEFAULT"],
+                                    "flags": 268435456, "extras": {"android.intent.extra.TEXT": "it's here", "n": 5,
+                                                                   "big": 2**40, "f": 1.5, "b": True, "none": None}})
+        words = adb.state["last_intent"]
+        self.assertEqual(words[:3], ["am", "start", "-W"])
+        for seq in (["-a", "android.intent.action.SEND"], ["-t", "text/plain"], ["-f", "268435456"],
+                    ["--es", "android.intent.extra.TEXT", "it's here"], ["--ei", "n", "5"], ["--el", "big", str(2**40)],
+                    ["--ef", "f", "1.5"], ["--ez", "b", "true"], ["--esn", "none"]):
+            i = words.index(seq[0], words.index(seq[0]) if seq[0] not in ("--es", "--ei", "--el", "--ef", "--ez", "--esn") else 0)
+            self.assertEqual(words[i:i + len(seq)], seq)
+
+    async def test_intent_broadcast_and_bad_values(self):
+        ctl, adb = controller()
+        res = await ctl.handle("intent", {"action": "com.example.PING", "broadcast": True})
+        self.assertIn("Broadcast completed", res["output"])
+        for bad in [{}, {"action": ""}, {"action": "x", "extras": {"k": [1]}}, {"action": "x", "flags": -1},
+                    {"action": "x", "categories": "c"}, {"action": "x", "broadcast": "yes"}]:
+            with self.assertRaises(pc.CommandError, msg=repr(bad)) as cm:
+                await ctl.handle("intent", bad)
+            self.assertEqual(cm.exception.code, "invalid_args")
+
+    async def test_notifications(self):
+        ctl, _ = controller()
+        res = await ctl.handle("notifications", {})
+        self.assertEqual(res["count"], 2)
+        self.assertEqual(res["notifications"][1]["text"], "Download complete")
+
+    async def test_statusbar(self):
+        ctl, adb = controller()
+        for action, verb in pc.STATUSBAR_ACTIONS.items():
+            await ctl.handle("statusbar", {"action": action})
+            self.assertEqual(adb.state["statusbar"], verb)
+        with self.assertRaises(pc.CommandError):
+            await ctl.handle("statusbar", {"action": "open"})
+
+    async def test_rotation(self):
+        ctl, adb = controller({"rotation": [1, 0]})
+        res = await ctl.handle("rotation", {"rotation": 1})
+        self.assertEqual(res["previous"], {"auto": True, "user_rotation": 0})
+        self.assertEqual(adb.state["rotation"], [0, 1])
+        self.assertEqual((await ctl.handle("state", {}))["rotation"], {"auto": False, "user_rotation": 1})
+        await ctl.handle("rotation", {"rotation": "auto"})
+        self.assertEqual(adb.state["rotation"][0], 1)
+        for bad in [4, -1, True, "left", None]:
+            with self.assertRaises(pc.CommandError, msg=repr(bad)):
+                await ctl.handle("rotation", {"rotation": bad})
+
+    async def test_every_command_honours_if_foreground(self):
+        """Commands without a guarded action of their own are checked before they start."""
+        ctl, adb = controller({"foreground": "com.android.settings", "rotation": [1, 0]})
+        guard = {"if_foreground": "com.android.chrome"}
+        for cmd, args in [("rotation", {"rotation": 1}), ("state", {}), ("notifications", {}),
+                          ("files", {"path": "/sdcard"}), ("wait", {"for": "change", "seconds": 0})]:
+            with self.assertRaises(pc.CommandError, msg=cmd) as cm:
+                await ctl.handle(cmd, {**args, **guard})
+            self.assertEqual(cm.exception.code, "foreground_mismatch", cmd)
+        with self.assertRaises(pc.CommandError) as cm:
+            await ctl.handle("push", {"path": "/sdcard/Download/x", **guard}, FakeRelay(upload(b"data")))
+        self.assertEqual(cm.exception.code, "foreground_mismatch")
+        self.assertEqual(adb.state["rotation"], [1, 0])
+        self.assertNotIn("/sdcard/Download/x", adb.state["files"])
+        await ctl.handle("rotation", {"rotation": 1, "if_foreground": "com.android.settings"})
+        self.assertEqual(adb.state["rotation"], [0, 1])
+
+    async def test_rotation_guard_is_in_the_same_command(self):
+        ctl, adb = controller({"rotation": [1, 0]})
+        original = adb.run
+
+        async def run(*args, timeout=None):
+            if "settings put" in args[1]:
+                adb.state["foreground"] = "com.android.settings"
+            return await original(*args, timeout=timeout)
+
+        adb.run = run
+        with self.assertRaises(pc.CommandError):
+            await ctl.handle("rotation", {"rotation": 2, "if_foreground": "com.android.chrome"})
+        self.assertEqual(adb.state["rotation"], [1, 0])
+
+
+class WaitBatchTests(unittest.IsolatedAsyncioTestCase):
+    def after_calls(self, adb, n, **change):
+        """Change the fake phone's state once `n` more adb calls have run."""
+        original, count = adb.run, [0]
+
+        async def run(*args, timeout=None):
+            count[0] += 1
+            if count[0] == n:
+                adb.state.update(change)
+            return await original(*args, timeout=timeout)
+
+        adb.run = run
+
+    async def test_wait_for_foreground(self):
+        ctl, adb = controller()
+        self.after_calls(adb, 3, foreground="com.google.android.gm")
+        res = await ctl.handle("wait", {"for": "foreground", "package": "com.google.android.gm", "interval_ms": 0})
+        self.assertTrue(res["met"])
+        self.assertEqual(res["foreground"], "com.google.android.gm")
+
+    async def test_wait_for_any_foreground_change(self):
+        ctl, adb = controller()
+        self.after_calls(adb, 2, foreground="com.android.settings")
+        res = await ctl.handle("wait", {"for": "foreground", "interval_ms": 0})
+        self.assertEqual((res["met"], res["foreground"]), (True, "com.android.settings"))
+
+    async def test_wait_for_change_and_stable(self):
+        ctl, adb = controller()
+        self.after_calls(adb, 3, shade=220)
+        res = await ctl.handle("wait", {"for": "change", "interval_ms": 0})
+        self.assertTrue(res["met"])
+        self.assertGreater(res["diff"], 0.5)
+        res = await ctl.handle("wait", {"for": "stable", "interval_ms": 0})
+        self.assertEqual((res["met"], res["diff"]), (True, 0))
+
+    async def test_wait_ends_unmet(self):
+        ctl, _ = controller()
+        res = await ctl.handle("wait", {"for": "change", "seconds": 0.3, "interval_ms": 50})
+        self.assertFalse(res["met"])
+        self.assertGreaterEqual(res["elapsed_ms"], 300)
+        for bad in [{"for": "text"}, {"for": "change", "seconds": -1}, {"for": "foreground", "package": "x y"}]:
+            with self.assertRaises(pc.CommandError, msg=repr(bad)):
+                await ctl.handle("wait", bad)
+
+    async def test_batch(self):
+        ctl, adb = controller()
+        res = await ctl.handle("batch", {"steps": [
+            {"cmd": "tap", "args": {"x": 1, "y": 2}},
+            {"cmd": "sleep", "args": {"ms": 10}},
+            {"cmd": "type", "args": {"text": "hi"}},
+            {"cmd": "state"},
+        ]})
+        self.assertTrue(res["all_ok"])
+        self.assertEqual([r["cmd"] for r in res["results"]], ["tap", "sleep", "type", "state"])
+        self.assertEqual(adb.inputs(), ["input tap 1 2", "input text hi"])
+
+    async def test_batch_stops_on_error_unless_told_not_to(self):
+        steps = [{"cmd": "tap", "args": {"x": 1, "y": 1}}, {"cmd": "launch", "args": {"package": "x y"}},
+                 {"cmd": "tap", "args": {"x": 2, "y": 2}}]
+        ctl, adb = controller()
+        res = await ctl.handle("batch", {"steps": steps})
+        self.assertEqual((res["completed"], res["all_ok"]), (2, False))
+        self.assertEqual(res["results"][1]["error"], "invalid_args")
+        ctl, adb = controller()
+        res = await ctl.handle("batch", {"steps": steps, "stop_on_error": False})
+        self.assertEqual(res["completed"], 3)
+        self.assertEqual(adb.inputs(), ["input tap 1 1", "input tap 2 2"])
+
+    async def test_batch_passes_if_foreground_to_its_steps(self):
+        ctl, adb = controller({"foreground": "com.android.settings"})
+        res = await ctl.handle("batch", {"if_foreground": "com.android.chrome", "steps": [
+            {"cmd": "tap", "args": {"x": 1, "y": 1}},
+            {"cmd": "tap", "args": {"x": 2, "y": 2, "if_foreground": "com.android.settings"}},
+        ], "stop_on_error": False})
+        self.assertEqual([r["ok"] for r in res["results"]], [False, True])
+        self.assertEqual(adb.inputs(), ["input tap 2 2"])
+
+    async def test_batch_rejects_streaming_steps_and_halts_on_stop(self):
+        ctl, _ = controller()
+        for bad in [[{"cmd": "pull", "args": {"path": "/x"}}], [{"cmd": "batch"}], [], [{"cmd": "tap", "args": 5}]]:
+            with self.assertRaises(pc.CommandError, msg=repr(bad)):
+                await ctl.handle("batch", {"steps": bad})
+        with tempfile.TemporaryDirectory() as tmp:
+            stop = os.path.join(tmp, "STOP")
+            ctl, adb = controller(stop_file=stop)
+            original = adb.run
+
+            async def run(*args, timeout=None):
+                out = await original(*args, timeout=timeout)
+                open(stop, "w").close()
+                return out
+
+            adb.run = run
+            with self.assertRaises(pc.CommandError) as cm:
+                await ctl.handle("batch", {"steps": [{"cmd": "tap", "args": {"x": 1, "y": 1}}] * 3})
+            self.assertEqual(cm.exception.code, "stopped")
+            self.assertEqual(len(adb.inputs()), 1)
+
+
+class FileAndRecordTests(unittest.IsolatedAsyncioTestCase):
+    async def test_list_folder_and_file(self):
+        ctl, _ = controller()
+        res = await ctl.handle("files", {"path": "/sdcard/Download"})
+        self.assertEqual(res["entries"], [{"name": "a.txt", "type": "file", "size": 10, "modified": fake_adb.MTIME}])
+        res = await ctl.handle("files", {"path": "/sdcard"})
+        self.assertEqual([(e["name"], e["type"]) for e in res["entries"]], [("Download", "dir")])
+        res = await ctl.handle("files", {"path": "/sdcard/Download/a.txt"})
+        self.assertEqual(res["count"], 1)
+        with self.assertRaises(pc.CommandError) as cm:
+            await ctl.handle("files", {"path": "/sdcard/nope"})
+        self.assertEqual(cm.exception.code, "not_found")
+        with self.assertRaises(pc.CommandError) as cm:
+            await ctl.handle("files", {"path": "sdcard"})
+        self.assertEqual(cm.exception.code, "invalid_args")
+
+    async def test_pull(self):
+        ctl, _ = controller()
+        relay = FakeRelay()
+        res = await ctl.handle("pull", {"path": "/sdcard/Download/a.txt"}, relay)
+        self.assertEqual(res, {"path": "/sdcard/Download/a.txt", "bytes": 10})
+        self.assertEqual(relay.received(), b"hello file")
+        self.assertEqual(relay.start()["mime"], "text/plain")
+        self.assertEqual(relay.start()["headers"], {"X-File-Path": "/sdcard/Download/a.txt"})
+
+    async def test_pull_refusals(self):
+        ctl, _ = controller()
+        for path, code in [("/sdcard/missing.pdf", "not_found"), ("/sdcard/Download", "invalid_args")]:
+            with self.assertRaises(pc.CommandError, msg=path) as cm:
+                await ctl.handle("pull", {"path": path}, FakeRelay())
+            self.assertEqual(cm.exception.code, code)
+        with self.assertRaises(pc.CommandError) as cm:
+            await ctl.handle("pull", {"path": "/sdcard/Download/a.txt"})  # no relay channel
+        self.assertEqual(cm.exception.code, "invalid_args")
+
+    async def test_push(self):
+        ctl, adb = controller()
+        data = bytes(range(256)) * 3
+        res = await ctl.handle("push", {"path": "/sdcard/Download/new file.bin"}, FakeRelay(upload(data, 100)))
+        self.assertEqual(res["bytes"], len(data))
+        self.assertEqual(base64.b64decode(adb.state["files"]["/sdcard/Download/new file.bin"]), data)
+
+    async def test_push_empty_file(self):
+        ctl, adb = controller()
+        await ctl.handle("push", {"path": "/sdcard/Download/empty"}, FakeRelay(upload(b"")))
+        self.assertEqual(adb.state["files"]["/sdcard/Download/empty"], "")
+
+    async def test_record_start_and_stop(self):
+        ctl, adb = controller()
+        res = await ctl.handle("record_start", {"seconds": 30, "size": "720x1560", "bit_rate": 4000000})
+        self.assertEqual(res, {"recording": True, "max_seconds": 30})
+        started = next(c for c in adb.executed if "setsid nohup sh -c" in c)
+        self.assertIn("--size 720x1560", started)
+        self.assertIn("--bit-rate 4000000", started)
+        self.assertTrue(started.startswith("{ ") and started.endswith("& }"))
+        relay = FakeRelay()
+        res = await ctl.handle("record_stop", {}, relay)
+        self.assertEqual(res["segments"], 1)
+        self.assertEqual(relay.start()["mime"], "video/mp4")
+        self.assertEqual(relay.received(), b"fake mp4 segment 0")
+        self.assertFalse(any(p.startswith(fake_adb.RECORD_PREFIX) for p in adb.state["files"]))  # cleaned up
+
+    async def test_long_recording_comes_back_as_a_zip(self):
+        ctl, _ = controller()
+        await ctl.handle("record_start", {"seconds": 400})
+        relay = FakeRelay()
+        res = await ctl.handle("record_stop", {}, relay)
+        self.assertEqual(res["segments"], 3)
+        self.assertEqual(relay.start()["mime"], "application/zip")
+        with zipfile.ZipFile(io.BytesIO(relay.received())) as z:
+            self.assertEqual(z.namelist(), ["segment_000.mp4", "segment_001.mp4", "segment_002.mp4"])
+            self.assertEqual(z.read("segment_002.mp4"), b"fake mp4 segment 2")
+
+    async def test_record_in_one_command(self):
+        ctl, _ = controller()
+        relay = FakeRelay()
+        res = await ctl.handle("record", {"seconds": 0.1}, relay)
+        self.assertEqual(res["segments"], 1)
+
+    async def test_record_stop_without_a_recording(self):
+        ctl, _ = controller()
+        with self.assertRaises(pc.CommandError) as cm:
+            await ctl.handle("record_stop", {}, FakeRelay())
+        self.assertEqual(cm.exception.code, "not_found")
+        for bad in [{"seconds": 0}, {"size": "big"}, {"bit_rate": 1.5}]:
+            with self.assertRaises(pc.CommandError, msg=repr(bad)):
+                await ctl.handle("record_start", bad)
+
+
 class FakeSocket:
     """The relay side of the connection: messages queued for the client, replies recorded."""
 
@@ -763,12 +1190,62 @@ class ServeTests(unittest.IsolatedAsyncioTestCase):
         ws.incoming.put_nowait(json.dumps({"id": "a", "cmd": "tap", "args": {"x": 1, "y": 1, "timeout": 600}}))
         task = asyncio.create_task(pc.serve(ctl, ws))
         await asyncio.sleep(0.2)  # the tap is now waiting on adb
+        adb.state["hang"] = 0  # (only that call hangs; the cleanup after it does not)
         started = time.monotonic()
         ws.incoming.put_nowait(None)  # the relay closes the connection
         await asyncio.wait_for(task, 5)
         self.assertLess(time.monotonic() - started, 2)
         self.assertEqual(adb.inputs(), [])
         self.assertEqual(ws.sent, [])
+
+    async def test_closing_the_connection_ends_a_background_recording(self):
+        """The owner's disable or stop file closes the socket; a detached recording must stop with it."""
+        ctl, adb = controller()
+        ws = FakeSocket()
+        ws.incoming.put_nowait(json.dumps({"id": "r", "cmd": "record_start", "args": {"seconds": 600}}))
+        task = asyncio.create_task(pc.serve(ctl, ws))
+        while not ws.sent:
+            await asyncio.sleep(0.01)
+        self.assertTrue(any(p.startswith(fake_adb.RECORD_PREFIX) for p in adb.state["files"]))
+        ws.incoming.put_nowait(None)
+        await task
+        self.assertTrue(any(c[1].startswith("touch /data/local/tmp/phone_relay_rec.stop") for c in adb.calls))
+        self.assertFalse(any(p.startswith(fake_adb.RECORD_PREFIX) for p in adb.state["files"]))
+
+    async def test_a_cancel_sent_while_a_transfer_waits_in_the_queue_ends_it_at_once(self):
+        """The relay gave up on a queued upload: it must not hold the queue waiting for chunks."""
+        ctl, adb = controller()
+        ws = FakeSocket()
+        ws.incoming.put_nowait(json.dumps({"id": "slow", "cmd": "wait", "args": {"for": "change", "seconds": 0.5}}))
+        ws.incoming.put_nowait(json.dumps({"id": "up", "cmd": "push", "args": {"path": "/sdcard/Download/u", "timeout": 300}}))
+        ws.incoming.put_nowait(json.dumps({"id": "up", "type": "chunk", "seq": 0, "data": base64.b64encode(b"part").decode()}))
+        ws.incoming.put_nowait(json.dumps({"id": "up", "type": "cancel"}))
+        task = asyncio.create_task(pc.serve(ctl, ws))
+        started = time.monotonic()
+        while not any(m.get("id") == "up" and "ok" in m for m in ws.sent):
+            await asyncio.sleep(0.01)
+        self.assertLess(time.monotonic() - started, 5)
+        reply = next(m for m in ws.sent if m.get("id") == "up" and "ok" in m)
+        self.assertEqual(reply["error"], "cancelled")
+        ws.incoming.put_nowait(None)
+        await task
+
+    async def test_upload_chunks_sent_right_behind_the_command_reach_it(self):
+        ctl, adb = controller()
+        ws = FakeSocket()
+        ws.incoming.put_nowait(json.dumps({"id": "u", "cmd": "push", "args": {"path": "/sdcard/Download/up.txt"}}))
+        for msg in upload(b"uploaded through the socket", 4):
+            ws.incoming.put_nowait(json.dumps({"id": "u", **msg}))
+        ws.incoming.put_nowait(json.dumps({"id": "other", "type": "chunk", "seq": 0, "data": ""}))  # no such command
+        task = asyncio.create_task(pc.serve(ctl, ws))
+        while not any(m.get("ok") is not None for m in ws.sent):
+            await asyncio.sleep(0.01)
+        ws.incoming.put_nowait(None)
+        await task
+        reply = next(m for m in ws.sent if "ok" in m)
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(base64.b64decode(adb.state["files"]["/sdcard/Download/up.txt"]), b"uploaded through the socket")
+        self.assertEqual(len([m for m in ws.sent if m.get("type") == "ack"]), 7)
 
 
 class SubprocessAdbTests(unittest.IsolatedAsyncioTestCase):

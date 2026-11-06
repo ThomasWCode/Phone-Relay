@@ -8,6 +8,7 @@ Cloudflare account and no phone. Run from the repository root after
     python scripts/e2e_test.py
 """
 
+import io
 import json
 import os
 import secrets
@@ -18,7 +19,9 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RELAY = os.path.join(ROOT, "relay")
@@ -33,7 +36,7 @@ ADMIN = secrets.token_hex(32)
 failures = []
 
 
-def request(method, path, token=AGENT, body=None, raw=None):
+def request(method, path, token=AGENT, body=None, raw=None, timeout=60):
     data = json.dumps(body).encode() if body is not None else raw
     req = urllib.request.Request(BASE + path, data=data, method=method)
     if token:
@@ -41,7 +44,7 @@ def request(method, path, token=AGENT, body=None, raw=None):
     if body is not None:
         req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, dict(resp.headers), resp.read()
     except urllib.error.HTTPError as e:
         return e.code, dict(e.headers), e.read()
@@ -255,11 +258,86 @@ def main():
         st = j(request("GET", "/admin/status", token=ADMIN)[2])
         check("status has no rate fields", "rate_limits" not in st and st.get("notes_length") == len(notes), str(st))
 
+        # ---- apps: open, intents, notifications, status bar, rotation ----
+        set_fake(state_path, foreground="com.sec.android.app.launcher")
+        s, _, b = request("POST", "/open", body={"url": "https://example.com/?q=1&r=2"})
+        check("open a URL", s == 200 and j(request("GET", "/state")[2]).get("foreground") == "com.android.chrome", f"{s} {b[:200]}")
+        s, _, b = request("POST", "/open", body={"url": "mailto:someone@example.com?subject=Hi"})
+        check("open a mailto: link", s == 200 and j(request("GET", "/state")[2]).get("foreground") == "com.google.android.gm",
+              f"{s} {b[:200]}")
+        s, _, b = request("POST", "/open", body={"url": "nosuchscheme:x"})
+        check("open with nothing to handle it -> 422", s == 422 and j(b).get("error") == "launch_failed", f"{s} {b[:200]}")
+        s, _, b = request("POST", "/intent", body={"action": "android.intent.action.SEND", "type": "text/plain",
+                                                   "package": "com.google.android.gm",
+                                                   "extras": {"android.intent.extra.TEXT": "intentsecret"}})
+        check("intent", s == 200, f"{s} {b[:200]}")
+        s, _, b = request("GET", "/notifications")
+        n = j(b)
+        check("notifications", s == 200 and n.get("count") == 2 and n["notifications"][0].get("title") == "A sender",
+              f"{s} {b[:300]}")
+        check("statusbar", request("POST", "/statusbar", body={"action": "notifications"})[0] == 200)
+        s, _, b = request("POST", "/rotation", body={"rotation": 1})
+        check("rotation returns the old setting", s == 200 and j(b).get("previous") == {"auto": True, "user_rotation": 0},
+              f"{s} {b[:200]}")
+        check("state shows the rotation",
+              j(request("GET", "/state")[2]).get("rotation") == {"auto": False, "user_rotation": 1})
+        request("POST", "/rotation", body={"rotation": "auto"})
+
+        # ---- wait and batch ----
+        set_fake(state_path, foreground="com.android.chrome")
+        s, _, b = request("POST", "/wait", body={"for": "foreground", "package": "com.android.chrome"})
+        check("wait for an app already in front", s == 200 and j(b).get("met") is True, f"{s} {b[:200]}")
+        s, _, b = request("POST", "/wait", body={"for": "change", "seconds": 1, "interval_ms": 200})
+        check("wait for a change that never comes", s == 200 and j(b).get("met") is False, f"{s} {b[:200]}")
+        s, _, b = request("POST", "/batch", body={"steps": [
+            {"cmd": "tap", "args": {"x": 1, "y": 1}}, {"cmd": "sleep", "args": {"ms": 50}},
+            {"cmd": "type", "args": {"text": "batchsecret"}}, {"cmd": "screenshot", "args": {"scale": 0.1}}]})
+        res = j(b)
+        check("batch", s == 200 and res.get("all_ok") is True and res["results"][3]["result"].get("mime") == "image/jpeg",
+              f"{s} {b[:300]}")
+        s, _, b = request("POST", "/batch", body={"if_foreground": "com.android.settings",
+                                                  "steps": [{"cmd": "tap", "args": {"x": 1, "y": 1}}]})
+        check("batch passes if_foreground down", s == 200 and j(b)["results"][0].get("error") == "foreground_mismatch",
+              f"{s} {b[:300]}")
+
+        # ---- files ----
+        s, _, b = request("GET", "/files?path=/sdcard/Download")
+        check("list a folder", s == 200 and [e["name"] for e in j(b).get("entries", [])] == ["a.txt"], f"{s} {b[:200]}")
+        big = os.urandom(3 * 1024 * 1024 + 123)  # 13 chunks: more than the 8-chunk window
+        path = urllib.parse.quote("/sdcard/Download/big file.bin")
+        s, _, b = request("POST", f"/files/push?path={path}", raw=big, timeout=120)
+        check("push 3 MB", s == 200 and j(b).get("bytes") == len(big), f"{s} {b[:200]}")
+        s, h, b = request("GET", f"/files/pull?path={path}", timeout=120)
+        check("pull it back intact", s == 200 and b == big, f"{s} {len(b)} bytes")
+        check("pull headers", h.get("X-File-Size") == str(len(big)) and h.get("X-File-Path") == "/sdcard/Download/big file.bin"
+              and h.get("Content-Type") == "application/octet-stream", str(h))
+        s, _, b = request("POST", "/files/push?path=/sdcard/Download/empty.txt", raw=b"")
+        check("push an empty file", s == 200 and j(b).get("bytes") == 0, f"{s} {b[:200]}")
+        s, h, b = request("GET", "/files/pull?path=/sdcard/Download/empty.txt")
+        check("pull an empty file", s == 200 and b == b"" and h.get("Content-Type") == "text/plain", f"{s} {h}")
+        s, _, b = request("GET", "/files/pull?path=/sdcard/Download/missing.pdf")
+        check("pull a missing file -> 404", s == 404 and j(b).get("error") == "not_found", f"{s} {b[:200]}")
+        check("pull a folder -> 400", request("GET", "/files/pull?path=/sdcard/Download")[0] == 400)
+        check("relative path -> 400", request("GET", "/files?path=sdcard")[0] == 400)
+
+        # ---- screen recording ----
+        s, h, b = request("GET", "/record?seconds=1")
+        check("record one second", s == 200 and h.get("Content-Type") == "video/mp4" and b == b"fake mp4 segment 0",
+              f"{s} {h.get('Content-Type')} {b[:60]}")
+        check("start a long recording", request("POST", "/record/start", body={"seconds": 400})[0] == 200)
+        s, h, b = request("POST", "/record/stop", body={})
+        names = zipfile.ZipFile(io.BytesIO(b)).namelist() if s == 200 and h.get("Content-Type") == "application/zip" else []
+        check("a recording past 180 s comes back as a zip of segments", len(names) == 3 and h.get("X-Segments") == "3",
+              f"{s} {h}")
+        s, _, b = request("POST", "/record/stop", body={})
+        check("stop with no recording -> 404", s == 404, f"{s} {b[:200]}")
+
         # ---- log ----
         s, _, b = request("GET", "/admin/log?n=100", token=ADMIN)
         entries = j(b).get("entries", [])
         check("admin log readable", s == 200 and len(entries) > 10, f"{s}")
-        check("typed text not logged", b"hello world" not in b and b"hunter2" not in b)
+        check("typed text not logged", b"hello world" not in b and b"hunter2" not in b and b"batchsecret" not in b
+              and b"intentsecret" not in b)
         check("type logged as length", any(e.get("action") == "type" and e.get("detail") == {"length": 11} for e in entries))
 
         # ---- kill switch (admin) ----

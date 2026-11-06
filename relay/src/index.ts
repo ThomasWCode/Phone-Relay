@@ -72,13 +72,24 @@ export default {
     if (request.method !== route.method) return json(405, { ok: false, error: "method_not_allowed" });
 
     let body: Record<string, unknown> | null = null;
-    if (route.method === "POST") {
+    if (route.method === "POST" && !route.raw) {
       body = parseBody(await request.text());
       if (!body) return json(400, { ok: false, error: "invalid_args", detail: "JSON object body required" });
     }
 
     const result = validateCommand(route.cmd, url.searchParams, body);
     if (!result.ok) return json(400, { ok: false, error: "invalid_args", detail: result.error });
+
+    if (route.raw) {
+      // The body is the file: streamed through to the phone, never read whole into memory.
+      return hub(env).fetch(
+        new Request("https://hub/internal/push", {
+          method: "POST",
+          headers: { "X-Command": JSON.stringify(result.command) },
+          body: request.body,
+        }),
+      );
+    }
 
     return hub(env).fetch(
       new Request("https://hub/internal/command", {
