@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Phone Relay</string>
+    <string name="accessibility_description">Lets the owner\'s agent, through their Phone Relay, see the screen, touch, type and use apps on this phone, while the relay is on. Turn the relay off from the Quick Settings tile, the notification or the app.</string>
+    <string name="channel_name">Relay</string>
+    <string name="channel_description">Shown while the relay is on</string>
+    <string name="notification_title">Phone Relay is on</string>
+    <string name="turn_off">Turn off</string>
+    <string name="off">Off</string>
+</resources>

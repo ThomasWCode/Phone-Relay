@@ -8,3 +8,10 @@ __pycache__/
 selftest_screenshot.*
 private/
 .venv/
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.kotlin/
+# The app's own signing key: kept out of the public repository (see android/app/build.gradle.kts)
+android/app/debug.keystore
