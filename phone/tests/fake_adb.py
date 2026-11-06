@@ -9,6 +9,8 @@ State is a JSON file named by FAKE_ADB_STATE:
 "shade" is the screenshot's grey level, so tests can make the screen change.
 "files" is the phone's storage (path -> base64 content); its folders are implied by the paths.
 "rotation" is [accelerometer_rotation, user_rotation].
+"devtools_port" is where `adb forward ... localabstract:chrome_devtools_remote` points
+(a FakeDevTools server); "forwards" lists the forwards still open.
 The app_process helper is played too: "clipboard" holds its text, "pasted" and "gestures"
 collect what it was given, and "helper_error" makes it fail with that message.
 Every invocation is appended to the file named by FAKE_ADB_LOG (one JSON list per line).
@@ -207,6 +209,24 @@ def transfer(args, state):
     return 0, ""
 
 
+def forward(args, state):
+    """`adb forward tcp:0 localabstract:NAME` (prints the port) and `adb forward --remove tcp:PORT`: (code, out)."""
+    forwards = state.setdefault("forwards", [])
+    if args[1] == "--remove":
+        port = int(args[2].split(":")[1])
+        if port not in forwards:
+            return 1, ""
+        forwards.remove(port)
+        save_state(state)
+        return 0, ""
+    port = state.get("devtools_port")
+    if port is None:
+        return 1, ""
+    forwards.append(port)
+    save_state(state)
+    return 0, f"{port}\n"
+
+
 def am(cmd, state):
     """`am start` / `am broadcast`, by their -n, -a, -d and -p arguments."""
     words = shlex.split(cmd.removesuffix(" || true"))
@@ -282,6 +302,11 @@ def run(cmd, state):
     files = state.setdefault("files", {})
     if cmd.startswith(HELPER_PREFIX):
         return helper(cmd, state).encode()
+    if cmd == "cat /proc/net/unix":
+        return ("Num       RefCount Protocol Flags    Type St Inode Path\n"
+                "0000000000000000: 00000002 00000000 00010000 0001 01 123 @chrome_devtools_remote\n"
+                "0000000000000000: 00000002 00000000 00010000 0001 01 124 @webview_devtools_remote_4321\n"
+                "0000000000000000: 00000002 00000000 00010000 0001 01 125 /dev/socket/other\n").encode()
     if cmd.startswith("sha256sum "):  # `sha256sum PATH 2>/dev/null; true`
         path = cmd.split()[1]
         if path not in files:
@@ -373,6 +398,10 @@ def main(argv):
     if args[0] == "devices":
         sys.stdout.write("List of devices attached\nlocalhost:5555\tdevice\n")
         return 0
+    if args[0] == "forward":
+        code, out = forward(args, state)
+        sys.stdout.write(out)
+        return code
     if args[0] in ("pull", "push") and len(args) == 3:
         code, err = transfer(args, state)
         sys.stderr.write(err)

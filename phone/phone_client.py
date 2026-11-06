@@ -16,6 +16,9 @@ for a moment. Nothing else uses uiautomator, including --selftest.
 Files and screen recordings cross the relay socket in acknowledged chunks
 (see Channel), so their size is not limited by the socket's message size.
 
+Chrome's pages are reached through Chrome DevTools: `adb forward` maps Chrome's
+DevTools socket to a local port for the length of one command, then removes it.
+
 Usage:
     python phone_client.py --selftest      # check adb, foreground, input guard, text field, screenshot
     python phone_client.py                 # connect to the relay and serve commands
@@ -39,10 +42,13 @@ import shlex
 import stat
 import sys
 import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 # ---- key names and defaults (the relay has its own copy of the key names) ----
 
@@ -88,7 +94,8 @@ WAIT_KINDS = ("change", "stable", "foreground", "text")
 # A batch may run any command that replies with JSON, plus sleep; not the streaming ones or batch itself.
 BATCH_COMMANDS = ("state", "screenshot", "ui", "tap", "swipe", "type", "key", "launch", "open", "intent",
                   "notifications", "statusbar", "rotation", "wait", "files", "record_start", "gesture",
-                  "clipboard_get", "clipboard_set", "sleep")
+                  "clipboard_get", "clipboard_set", "chrome_tabs", "chrome_eval", "chrome_cdp", "chrome_new",
+                  "chrome_close", "chrome_activate", "sleep")
 # Commands that run their action inside the if_foreground guard themselves (in the same shell command).
 # Any other command given if_foreground is checked against the foreground before it starts.
 SELF_GUARDED = ("screenshot", "ui", "tap", "swipe", "type", "key", "launch", "open", "intent", "statusbar",
@@ -108,6 +115,10 @@ AUDIO_REMOTE = "/data/local/tmp/phone_relay_audio.wav"
 AUDIO_SOURCES = ("output", "mic")
 TYPE_METHODS = ("keys", "paste")
 UI_ENGINES = ("helper", "uiautomator")
+# Chrome DevTools: the abstract socket Chrome listens on (only the shell user, i.e. adb, can connect).
+DEVTOOLS_SOCKET = "chrome_devtools_remote"
+_DEVTOOLS_SOCKET_RE = re.compile(r"^[\w.-]{1,100}$")
+_CDP_METHOD_RE = re.compile(r"^[A-Za-z]+\.[A-Za-z]+$")
 # Side messages of a running command, routed to its Channel rather than queued as commands.
 SIDE_TYPES = ("chunk", "end", "ack", "cancel")
 
@@ -877,6 +888,13 @@ class PhoneController:
             "gesture": self.cmd_gesture,
             "clipboard_get": self.cmd_clipboard_get,
             "clipboard_set": self.cmd_clipboard_set,
+            "chrome_sockets": self.cmd_chrome_sockets,
+            "chrome_tabs": self.cmd_chrome_tabs,
+            "chrome_eval": self.cmd_chrome_eval,
+            "chrome_cdp": self.cmd_chrome_cdp,
+            "chrome_new": self.cmd_chrome_new,
+            "chrome_close": self.cmd_chrome_close,
+            "chrome_activate": self.cmd_chrome_activate,
         }.get(cmd)
         # These stream bytes over the relay socket, so they need the command's channel.
         streaming = {
@@ -1367,6 +1385,179 @@ class PhoneController:
         return await self.cmd_record_stop(args, channel)
 
 
+    # ---- Chrome DevTools ----
+
+    async def _devtools(self, args: dict, work):
+        """Run `work(port)` with the DevTools socket forwarded to a local port, then remove the forward.
+
+        `socket` picks another DevTools socket (a debuggable WebView's, say; /chrome/sockets lists them).
+        A page can only be reached while Chrome is running: in the background it may list no tabs.
+        """
+        socket = args.get("socket", DEVTOOLS_SOCKET)
+        if not isinstance(socket, str) or not _DEVTOOLS_SOCKET_RE.match(socket):
+            raise CommandError("invalid_args", "socket must be a DevTools socket name, e.g. chrome_devtools_remote")
+        out = (await self.adb.run("forward", "tcp:0", f"localabstract:{socket}")).decode(errors="replace").strip()
+        if not out.isdigit():
+            raise CommandError("devtools_unavailable", f"adb forward gave {out[:100]!r}")
+        port = int(out)
+        try:
+            return await work(port)
+        finally:
+            try:
+                await asyncio.wait_for(self.adb.run("forward", "--remove", f"tcp:{port}"), 10)
+            except (CommandError, asyncio.TimeoutError):
+                log.warning("could not remove the DevTools forward on port %d", port)
+
+    @staticmethod
+    async def _devtools_http(port: int, path: str, method: str = "GET"):
+        """One request to DevTools' HTTP endpoint (/json/list, /json/new, ...), as JSON or text."""
+        def fetch():
+            req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method=method,
+                                         headers={"User-Agent": f"phone-relay-client/{VERSION}"})
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    body = resp.read().decode("utf-8", errors="replace")
+            except urllib.error.HTTPError as e:
+                raise CommandError("devtools_failed", f"{method} {path}: HTTP {e.code} {e.read()[:200]!r}") from e
+            except (urllib.error.URLError, OSError) as e:
+                raise CommandError("devtools_unavailable", f"is Chrome running? {type(e).__name__}: {e}") from e
+            try:
+                return json.loads(body)
+            except ValueError:
+                return body
+
+        return await asyncio.to_thread(fetch)
+
+    @staticmethod
+    def _tab_list(raw: object) -> list[dict]:
+        if not isinstance(raw, list):
+            raise CommandError("devtools_failed", "DevTools did not list targets")
+        return [{"id": t.get("id"), "type": t.get("type"), "title": t.get("title"), "url": t.get("url")}
+                for t in raw if isinstance(t, dict)]
+
+    async def _pick_tab(self, port: int, args: dict) -> str:
+        """The WebSocket path of the target named by `tab`: a tab id, an index into /chrome/tabs' pages,
+        or "browser" for the browser itself. By default the first page (Chrome lists the one in front first)."""
+        tab = args.get("tab", 0)
+        if tab == "browser":
+            version = await self._devtools_http(port, "/json/version")
+            url = version.get("webSocketDebuggerUrl", "") if isinstance(version, dict) else ""
+            if "/devtools/browser/" not in url:
+                raise CommandError("devtools_failed", "no browser target")
+            return "/devtools/browser/" + url.split("/devtools/browser/", 1)[1]
+        pages = [t for t in self._tab_list(await self._devtools_http(port, "/json/list")) if t["type"] == "page"]
+        if isinstance(tab, int) and not isinstance(tab, bool):
+            if not 0 <= tab < len(pages):
+                raise CommandError("not_found", f"no tab {tab}: {len(pages)} open (Chrome in the background lists none)")
+            return f"/devtools/page/{pages[tab]['id']}"
+        if isinstance(tab, str) and re.fullmatch(r"[\w-]{1,100}", tab):
+            if not any(t["id"] == tab for t in pages):
+                raise CommandError("not_found", f"no tab with id {tab}")
+            return f"/devtools/page/{tab}"
+        raise CommandError("invalid_args", 'tab must be a tab id, an index, or "browser"')
+
+    @staticmethod
+    async def _cdp(port: int, path: str, method: str, params: dict) -> dict:
+        """One DevTools protocol call on a target's WebSocket; its result, or devtools_failed with its error."""
+        try:
+            from websockets.asyncio.client import connect  # websockets >= 13
+        except ImportError:
+            from websockets import connect  # legacy API
+        reply = None
+        try:
+            async with connect(f"ws://127.0.0.1:{port}{path}", max_size=None, open_timeout=15) as ws:
+                await ws.send(json.dumps({"id": 1, "method": method, "params": params}))
+                async for raw in ws:  # events may come first; the reply carries id 1
+                    msg = json.loads(raw)
+                    if msg.get("id") == 1:
+                        reply = msg
+                        break
+            # (raised out here, so the socket closes normally rather than with an error code)
+        except Exception as e:  # refused, closed, a bad handshake: DevTools is not there for this target
+            raise CommandError("devtools_unavailable", f"{type(e).__name__}: {e}") from e
+        if reply is None:
+            raise CommandError("devtools_failed", "the target closed before replying")
+        if "error" in reply:
+            raise CommandError("devtools_failed", json.dumps(reply["error"])[:300])
+        return reply.get("result", {})
+
+    async def cmd_chrome_sockets(self, args: dict) -> dict:
+        """DevTools sockets on the phone: Chrome's, and those of any debuggable WebView."""
+        out = await self.adb.shell("cat /proc/net/unix")
+        names = sorted({ln.split("@", 1)[1].strip() for ln in out.splitlines() if "@" in ln and "devtools_remote" in ln})
+        return {"sockets": names}
+
+    async def cmd_chrome_tabs(self, args: dict) -> dict:
+        tabs = await self._devtools(args, lambda port: self._devtools_http(port, "/json/list"))
+        tabs = self._tab_list(tabs)
+        return {"count": len(tabs), "tabs": tabs}
+
+    async def cmd_chrome_eval(self, args: dict) -> dict:
+        """JavaScript in a page (Runtime.evaluate): its value as JSON, or the exception it threw."""
+        expression = _string_arg(args, "expression")
+        await_promise = args.get("await_promise", True)
+        if not isinstance(await_promise, bool):
+            raise CommandError("invalid_args", "await_promise must be true or false")
+
+        async def work(port):
+            return await self._cdp(port, await self._pick_tab(port, args), "Runtime.evaluate", {
+                "expression": expression, "returnByValue": True, "awaitPromise": await_promise, "userGesture": True})
+
+        result = await self._devtools(args, work)
+        if "exceptionDetails" in result:
+            details = result["exceptionDetails"]
+            text = (details.get("exception") or {}).get("description") or details.get("text") or "exception"
+            return {"threw": True, "exception": str(text)[:2000]}
+        value = result.get("result", {})
+        return {"threw": False, "type": value.get("type"), "value": value.get("value"),
+                "description": value.get("description")}
+
+    async def cmd_chrome_cdp(self, args: dict) -> dict:
+        """Any DevTools protocol method on a tab (or the browser): its result as DevTools returns it."""
+        method = _string_arg(args, "method")
+        if not _CDP_METHOD_RE.match(method):
+            raise CommandError("invalid_args", "method must look like Domain.method, e.g. Page.navigate")
+        params = args.get("params", {})
+        if not isinstance(params, dict):
+            raise CommandError("invalid_args", "params must be an object")
+
+        async def work(port):
+            return await self._cdp(port, await self._pick_tab(port, args), method, params)
+
+        return {"result": await self._devtools(args, work)}
+
+    async def cmd_chrome_new(self, args: dict) -> dict:
+        url = _string_arg(args, "url")
+        # Newer Chrome wants PUT for /json/new; older Chrome took GET.
+        async def work(port):
+            path = "/json/new?" + urllib.parse.quote(url, safe=":/?&=%#@+,;!$'()*[]~")
+            try:
+                return await self._devtools_http(port, path, "PUT")
+            except CommandError:
+                return await self._devtools_http(port, path, "GET")
+
+        tab = await self._devtools(args, work)
+        return {"tab": self._tab_list([tab])[0] if isinstance(tab, dict) else None}
+
+    async def _tab_action(self, args: dict, action: str) -> dict:
+        async def work(port):
+            tab_id = (await self._pick_tab(port, args)).rsplit("/", 1)[1]
+            return tab_id, await self._devtools_http(port, f"/json/{action}/{tab_id}")
+
+        tab_id, out = await self._devtools(args, work)
+        return {"tab": tab_id, "reply": out if isinstance(out, str) else json.dumps(out)[:200]}
+
+    async def cmd_chrome_close(self, args: dict) -> dict:
+        if args.get("tab") == "browser":
+            raise CommandError("invalid_args", "close takes a tab, not the browser")
+        return await self._tab_action(args, "close")
+
+    async def cmd_chrome_activate(self, args: dict) -> dict:
+        if args.get("tab") == "browser":
+            raise CommandError("invalid_args", "activate takes a tab, not the browser")
+        return await self._tab_action(args, "activate")
+
+
 def _image_result(data: bytes, mime: str, w: int, h: int, rw: int, rh: int, scale: float, fg: str) -> dict:
     return {
         "mime": mime,
@@ -1397,6 +1588,12 @@ def _log_args(cmd: str, args: object) -> object:
         return {**args, "steps": steps}
     if cmd == "intent" and isinstance(args.get("extras"), dict):
         return {**args, "extras": sorted(args["extras"])}
+    if cmd == "chrome_eval":
+        expression = args.get("expression")
+        return {**{k: v for k, v in args.items() if k != "expression"},
+                "expression_length": len(expression) if isinstance(expression, str) else "?"}
+    if cmd == "chrome_cdp" and isinstance(args.get("params"), dict):
+        return {**args, "params": sorted(args["params"])}
     return args
 
 
