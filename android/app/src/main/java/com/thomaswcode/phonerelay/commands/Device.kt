@@ -121,8 +121,12 @@ interface Device {
     fun ownFileSize(path: String): Long
     /** Stops any recording and deletes it: the owner's kill switches and a closed connection end capture. */
     fun endCapture()
-    /** Runs a command as the shell user through the app's own adb connection (the shell bridge); its output. */
-    suspend fun shell(command: String): String
+    /**
+     * Runs a command as the shell user through the app's own adb connection (the shell bridge); its
+     * output. `guard` runs once the connection is up, immediately before the command is started, and
+     * throws to refuse it (the foreground check: setting the bridge up can take seconds).
+     */
+    suspend fun shell(command: String, guard: (() -> Unit)? = null): String
     /** Runs `work` on a DevTools socket (chrome_devtools_remote, or a debuggable WebView's) through the shell bridge. */
     suspend fun <T> devtools(socket: String, work: suspend (DevToolsLink) -> T): T
     /** AudioManager.ADJUST_RAISE (1), ADJUST_LOWER (-1), ADJUST_TOGGLE_MUTE (101). */

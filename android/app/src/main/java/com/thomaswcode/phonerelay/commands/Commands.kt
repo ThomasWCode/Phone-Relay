@@ -54,7 +54,7 @@ class Commands(
         "record" to { a, s -> record(a, s ?: noStream("record")) },
         "audio" to { a, s -> audio(a, s ?: noStream("audio")) },
         "chrome_sockets" to { _, _ ->
-            buildJsonObject { put("sockets", JsonArray(DevTools.sockets(device.shell("cat /proc/net/unix")).map { JsonPrimitive(it) })) }
+            buildJsonObject { put("sockets", JsonArray(DevTools.sockets(device.shell("cat /proc/net/unix", null)).map { JsonPrimitive(it) })) }
         },
         "chrome_tabs" to { a, _ -> device.devtools(DevTools.socket(a)) { DevTools.tabs(it) } },
         "chrome_eval" to { a, _ -> device.devtools(DevTools.socket(a)) { DevTools.eval(it, a) } },
@@ -211,9 +211,11 @@ class Commands(
     }
 
     /** Runs a shell command (the shell bridge) for what the app cannot do; `instead` is the error without it. */
-    private suspend fun shell(command: String, instead: CommandError): String {
+    private suspend fun shell(command: String, instead: CommandError, args: JsonObject): String {
+        // Global input: the app in front is checked again once the bridge is connected, just before the command.
+        val packages = args.ifForeground()
         val out = try {
-            device.shell(command)
+            device.shell(command, if (packages == null) null else ({ requireForeground(packages) }))
         } catch (e: CommandError) {
             if (e.code != "shell_unavailable") throw e
             throw CommandError(instead.code, "${instead.detail} (the shell bridge would do it: ${e.detail})")
@@ -225,12 +227,12 @@ class Commands(
     }
 
     /** Typing with no text field focused: `input text` through the shell bridge, ASCII only, as the adb client types. */
-    private suspend fun shellType(text: String, method: String): JsonObject {
+    private suspend fun shellType(text: String, method: String, args: JsonObject): JsonObject {
         val noField = CommandError("no_text_field", "no text field has focus: tap one first")
         if (method != "keys" || !ShellText.canType(text)) {
             throw CommandError("no_text_field", "no text field has focus: tap one first (with none, only ASCII can be typed, as keys)")
         }
-        for (command in ShellText.commands(text)) shell(command, noField)
+        for (command in ShellText.commands(text)) shell(command, noField, args)
         return buildJsonObject {
             put("length", text.length)
             put("method", method)
@@ -245,7 +247,7 @@ class Commands(
         val text = args.stringArg("text")!!
         val method = args.stringArg("method", required = false) ?: "keys"
         if (method != "keys" && method != "paste") throw CommandError("invalid_args", "method must be keys or paste")
-        val first = device.focusedField() ?: return shellType(text, method)
+        val first = device.focusedField() ?: return shellType(text, method, args)
         var via = "paste"
         if (method == "paste") {
             device.paste(text)
@@ -288,7 +290,7 @@ class Commands(
             // What the app cannot press (or has no field for) goes to the shell, as `input keyevent`.
             if (e.code != "unsupported" && e.code != "no_text_field") throw e
             if (!SHELL_KEY.matches(name)) throw e
-            shell("input keyevent ${if (args.boolArg("longpress", false)) "--longpress " else ""}$name", e)
+            shell("input keyevent ${if (args.boolArg("longpress", false)) "--longpress " else ""}$name", e, args)
         }
         return buildJsonObject { put("key", raw) }
     }

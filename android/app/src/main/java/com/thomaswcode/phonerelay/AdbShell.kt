@@ -124,35 +124,49 @@ class AdbShell(private val context: Context) {
             Log.i(TAG, "switched wireless debugging on for the shell bridge")
             delay(1500) // adbd takes a moment to listen and announce itself
         }
-        withContext(Dispatchers.IO) {
-            val last = prefs.getInt("port", -1)
-            val ok = (last > 0 && runCatching { m.connect(LOCALHOST, last) }.getOrDefault(false)) || run {
-                val port = discover(AdbMdns.SERVICE_TYPE_TLS_CONNECT, DISCOVER_MS)
-                if (port <= 0) {
-                    throw CommandError("shell_unavailable", "wireless debugging is not answering on this phone (not on Wi-Fi, or a network not allowed for it)")
-                }
-                prefs.edit().putInt("port", port).apply()
-                try {
-                    m.connect(LOCALHOST, port)
-                } catch (e: AdbPairingRequiredException) {
-                    prefs.edit().putBoolean("paired", false).apply()
-                    throw CommandError("shell_unavailable", "wireless debugging no longer knows the app: pair it again (the app's own screen)")
-                }
-            }
-            if (!ok) throw CommandError("shell_unavailable", "wireless debugging refused the app's key")
-        }
+        connect(m)
         m
     }
 
-    /** Opens an adb service on this phone: "exec:<command>", "localabstract:<socket>", ... */
-    suspend fun open(destination: String): AdbStream {
+    /** Connects to this phone's adbd: the port it used last, else the one it announces over mDNS. */
+    private suspend fun connect(m: Manager) = withContext(Dispatchers.IO) {
+        val last = prefs.getInt("port", -1)
+        val ok = (last > 0 && runCatching { m.connect(LOCALHOST, last) }.getOrDefault(false)) || run {
+            val port = discover(AdbMdns.SERVICE_TYPE_TLS_CONNECT, DISCOVER_MS)
+            if (port <= 0) {
+                throw CommandError("shell_unavailable", "wireless debugging is not answering on this phone (not on Wi-Fi, or a network not allowed for it)")
+            }
+            prefs.edit().putInt("port", port).apply()
+            try {
+                m.connect(LOCALHOST, port)
+            } catch (e: AdbPairingRequiredException) {
+                prefs.edit().putBoolean("paired", false).apply()
+                throw CommandError("shell_unavailable", "wireless debugging no longer knows the app: pair it again (the app's own screen)")
+            }
+        }
+        if (!ok) throw CommandError("shell_unavailable", "wireless debugging refused the app's key")
+    }
+
+    /**
+     * Opens an adb service on this phone: "exec:<command>", "localabstract:<socket>", ... `guard`
+     * runs once the connection is up, immediately before the service is requested (and again before
+     * a second try): it throws to refuse, and what it throws is not retried.
+     */
+    suspend fun open(destination: String, guard: (() -> Unit)? = null): AdbStream {
         val m = connected()
+        guard?.invoke()
         return try {
-            withContext(Dispatchers.IO) { m.openStream(destination) }
+            runInterruptible(Dispatchers.IO) { m.openStream(destination) }
+        } catch (e: CommandError) {
+            throw e
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
         } catch (e: Exception) {
             // A connection gone stale (wireless debugging restarted): once more on a fresh one.
             lock.withLock { runCatching { m.disconnect() } }
-            withContext(Dispatchers.IO) { connected().openStream(destination) }
+            val fresh = connected()
+            guard?.invoke()
+            runInterruptible(Dispatchers.IO) { fresh.openStream(destination) }
         }
     }
 
@@ -161,8 +175,8 @@ class AdbShell(private val context: Context) {
      * `adb exec-out` uses): raw pipes. The shell service runs a command on a pty, which cut /proc/net/unix
      * (55 KB) off after 8 KB on the phone and hung the first call for 30 s.
      */
-    suspend fun run(command: String): String {
-        val stream = open("exec:$command")
+    suspend fun run(command: String, guard: (() -> Unit)? = null): String {
+        val stream = open("exec:$command", guard)
         return try {
             runInterruptible(Dispatchers.IO) { readAll(stream) }.also {
                 // Sizes only: what is typed through here must stay out of the log.
@@ -206,11 +220,18 @@ class AdbShell(private val context: Context) {
     suspend fun pairingShowing(): Boolean = withContext(Dispatchers.IO) { discover(AdbMdns.SERVICE_TYPE_TLS_PAIRING, 1500) > 0 }
 
     /**
-     * An InputStream over an adb stream, working around two libadb 3.1.1 faults found on the phone:
-     * AdbInputStream.read returns -1 as soon as the peer has closed the stream, dropping what a large
-     * payload still holds in its buffer (a 55 KB output came out as its first 8 KB), so this calls
-     * AdbStream.read, which looks at the buffer first; and AdbStream.read ends a closed stream by
-     * throwing IOException("Stream closed.") where an InputStream returns -1, which this gives.
+     * An InputStream over an adb stream, working around three libadb 3.1.1 faults found on the phone:
+     * - AdbInputStream.read returns -1 as soon as the peer has closed the stream, dropping what a large
+     *   payload still holds in its buffer (a 55 KB output came out as its first 8 KB), so this calls
+     *   AdbStream.read, which looks at the buffer first;
+     * - AdbStream.read ends a closed stream by throwing IOException("Stream closed.") where an
+     *   InputStream returns -1, which this gives;
+     * - when the peer's close arrives while payloads are still queued, AdbStream sets mPendingClose and
+     *   its read, once the queue is drained, waits for a wake-up that never comes (half of the calls that
+     *   printed more than a few bytes hung for the command's whole deadline: the close beat the reader).
+     *   Nothing more can arrive after a close, so with it pending and nothing left to read, this ends
+     *   the stream. mPendingClose is private: it is read by reflection, and if that is ever not
+     *   possible the hang is back, not an error.
      */
     class EndAwareInput(private val stream: AdbStream) : java.io.InputStream() {
         override fun read(): Int {
@@ -219,7 +240,8 @@ class AdbShell(private val context: Context) {
         }
 
         override fun read(b: ByteArray, off: Int, len: Int): Int = try {
-            stream.read(b, off, len)
+            if (pendingClose?.getBoolean(stream) == true && stream.available() == 0) -1
+            else stream.read(b, off, len)
         } catch (e: java.io.IOException) {
             if (stream.isClosed && e.message == "Stream closed.") -1 else throw e
         }
@@ -229,6 +251,11 @@ class AdbShell(private val context: Context) {
     }
 
     private companion object {
+        /** AdbStream.mPendingClose: the peer has closed the stream, and payloads are still queued. */
+        val pendingClose: java.lang.reflect.Field? = runCatching {
+            AdbStream::class.java.getDeclaredField("mPendingClose").apply { isAccessible = true }
+        }.getOrNull()
+
         const val TAG = "PhoneRelay"
         const val ADB_WIFI_ENABLED = "adb_wifi_enabled"
         const val LOCALHOST = "127.0.0.1"

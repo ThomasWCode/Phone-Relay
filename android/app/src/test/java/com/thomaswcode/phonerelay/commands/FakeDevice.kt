@@ -147,8 +147,12 @@ class FakeDevice : Device {
     val shellCommands = mutableListOf<String>()
     val devtoolsSockets = mutableListOf<String>()
     val chrome = FakeChrome()
-    override suspend fun shell(command: String): String {
+    /** Runs while the bridge is "set up", before the guard: a test changes the foreground there. */
+    var duringShellSetup: (() -> Unit)? = null
+    override suspend fun shell(command: String, guard: (() -> Unit)?): String {
         if (!shellPaired) throw CommandError("shell_unavailable", "pair the app with wireless debugging first")
+        duringShellSetup?.invoke()
+        guard?.invoke()
         shellCommands += command
         return if (command == "cat /proc/net/unix") UNIX_SOCKETS else ""
     }

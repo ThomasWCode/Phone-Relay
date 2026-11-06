@@ -14,9 +14,8 @@ import java.net.SocketAddress
 import java.util.concurrent.TimeUnit
 import javax.net.SocketFactory
 import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -24,6 +23,9 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.put
+import kotlin.coroutines.resumeWithException
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.ConnectionPool
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -48,22 +50,39 @@ class DevToolsBridge(private val adb: AdbShell, socket: String, private val vers
         .readTimeout(0, TimeUnit.MILLISECONDS) // the command's own deadline stops a slow call
         .build()
 
-    override suspend fun http(path: String, method: String): JsonElement = withContext(Dispatchers.IO) {
+    /**
+     * Cancelling the coroutine (the command's deadline, a closed connection) cancels the call, which
+     * closes its stream and so ends a blocked connect, request or body read: a Chrome that accepts the
+     * connection and never answers cannot hold the command queue.
+     */
+    override suspend fun http(path: String, method: String): JsonElement = suspendCancellableCoroutine { cont ->
         val request = Request.Builder()
             .url("http://127.0.0.1$path")
             .method(method, if (method == "PUT" || method == "POST") ByteArray(0).toRequestBody() else null)
             .header("User-Agent", "phone-relay-app/$version")
             .build()
-        val response: Response = try {
-            client.newCall(request).execute()
-        } catch (e: IOException) {
-            throw devtoolsError(e)
-        }
-        response.use {
-            val body = it.body?.string().orEmpty()
-            if (!it.isSuccessful) throw CommandError("devtools_failed", "$method $path: HTTP ${it.code} ${body.take(200)}")
-            runCatching { Json.parseToJsonElement(body) }.getOrElse { JsonPrimitive(body) }
-        }
+        val call = client.newCall(request)
+        cont.invokeOnCancellation { call.cancel() }
+        call.enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                if (cont.isActive) cont.resumeWithException(devtoolsError(e))
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                response.use {
+                    val result = try {
+                        val body = it.body?.string().orEmpty() // a cancelled call ends this read with an IOException
+                        if (!it.isSuccessful) throw CommandError("devtools_failed", "$method $path: HTTP ${it.code} ${body.take(200)}")
+                        Result.success(runCatching { Json.parseToJsonElement(body) }.getOrElse { JsonPrimitive(body) })
+                    } catch (e: IOException) {
+                        Result.failure(devtoolsError(e))
+                    } catch (e: CommandError) {
+                        Result.failure(e)
+                    }
+                    if (cont.isActive) cont.resumeWith(result)
+                }
+            }
+        })
     }
 
     override suspend fun cdp(path: String, method: String, params: JsonObject): JsonObject {

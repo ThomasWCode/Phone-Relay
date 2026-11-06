@@ -223,6 +223,26 @@ class CommandsTest {
     }
 
     @Test
+    fun theForegroundGuardHoldsThroughTheShellBridgesSetup() = runTest {
+        device.shellPaired = true
+        device.field = null
+        // The owner switches apps while the bridge is being set up: nothing is typed or pressed.
+        device.duringShellSetup = { device.fg = "com.example.other" }
+        for ((cmd, a) in listOf("type" to """{"text": "abc"""", "key" to """{"key": "KEYCODE_CAMERA"""")) {
+            assertEquals("foreground_mismatch", error(cmd, "$a, \"if_foreground\": \"com.android.chrome\"}").code, cmd)
+        }
+        device.fg = "com.android.chrome"
+        assertTrue(device.shellCommands.isEmpty(), device.shellCommands.toString())
+        // Long text goes in several commands; the guard is checked before each, not once.
+        device.duringShellSetup = null
+        var calls = 0
+        device.duringShellSetup = { if (++calls == 2) device.fg = "com.example.other" }
+        val long = "x".repeat(5000)
+        assertEquals("foreground_mismatch", error("type", """{"text": "$long", "if_foreground": "com.android.chrome"}""").code)
+        assertEquals(1, device.shellCommands.size) // the first chunk went; the second was refused
+    }
+
+    @Test
     fun chromeDevToolsThroughTheShellBridge() = runTest {
         assertEquals("shell_unavailable", error("chrome_tabs").code)
         device.shellPaired = true

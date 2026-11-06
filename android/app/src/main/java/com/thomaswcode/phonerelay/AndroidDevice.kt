@@ -390,7 +390,7 @@ class AndroidDevice(
 
     // ---- the shell bridge ----
 
-    override suspend fun shell(command: String): String = adb.run(command)
+    override suspend fun shell(command: String, guard: (() -> Unit)?): String = adb.run(command, guard)
 
     override suspend fun <T> devtools(socket: String, work: suspend (DevToolsLink) -> T): T {
         val bridge = DevToolsBridge(adb, socket, version)
