@@ -7,7 +7,9 @@ import type { Env } from "./index";
 import { json } from "./http";
 import { summariseArgs, type Command } from "./validate";
 
-export const RATE_LIMITS = { action: 60, screenshot: 20 } as const;
+// Per-minute limits; override with the RATE_ACTIONS_PER_MIN / RATE_SCREENSHOTS_PER_MIN vars.
+// They only catch runaway loops: an agent working normally stays far below them.
+export const DEFAULT_RATE_LIMITS = { action: 300, screenshot: 120 } as const;
 const RATE_WINDOW_MS = 60_000;
 const LOG_KEEP = 1000;
 // The phone gives each adb call up to 20 s (uiautomator and typing can be slow).
@@ -19,7 +21,6 @@ const DEVICE_ERROR_STATUS: Record<string, number> = {
   invalid_args: 400,
   foreground_not_allowed: 409,
   password_field: 409,
-  no_text_field: 409,
   screen_off: 409,
   stopped: 503,
 };
@@ -95,12 +96,23 @@ export class DeviceHub extends DurableObject<Env> {
     this.sql.exec(`DELETE FROM log WHERE id <= (SELECT MAX(id) FROM log) - ?`, LOG_KEEP);
   }
 
+  private rateLimits(): Record<keyof typeof DEFAULT_RATE_LIMITS, number> {
+    const pick = (v: string | undefined, fallback: number) => {
+      const n = Number(v);
+      return Number.isInteger(n) && n > 0 ? n : fallback;
+    };
+    return {
+      action: pick(this.env.RATE_ACTIONS_PER_MIN, DEFAULT_RATE_LIMITS.action),
+      screenshot: pick(this.env.RATE_SCREENSHOTS_PER_MIN, DEFAULT_RATE_LIMITS.screenshot),
+    };
+  }
+
   // Sliding one-minute window, persisted so it survives hibernation.
-  private takeRateToken(kind: keyof typeof RATE_LIMITS): boolean {
+  private takeRateToken(kind: keyof typeof DEFAULT_RATE_LIMITS): boolean {
     const now = Date.now();
     this.sql.exec(`DELETE FROM rate WHERE ts <= ?`, now - RATE_WINDOW_MS);
     const row = this.sql.exec(`SELECT COUNT(*) AS n FROM rate WHERE kind = ?`, kind).one();
-    if (Number(row.n) >= RATE_LIMITS[kind]) return false;
+    if (Number(row.n) >= this.rateLimits()[kind]) return false;
     this.sql.exec(`INSERT INTO rate (kind, ts) VALUES (?, ?)`, kind, now);
     return true;
   }
@@ -166,7 +178,7 @@ export class DeviceHub extends DurableObject<Env> {
           device: ws ? (ws.deserializeAttachment() as DeviceInfo | null) : null,
           pending: this.pending.size,
           rate_last_minute: this.rateCounts(),
-          rate_limits: RATE_LIMITS,
+          rate_limits: this.rateLimits(),
         });
       }
       case "/admin/log": {
@@ -216,7 +228,7 @@ export class DeviceHub extends DurableObject<Env> {
     if (!ws) return done(503, "device_offline");
 
     const kind = command.cmd === "screenshot" ? "screenshot" : "action";
-    if (!this.takeRateToken(kind)) return done(429, "rate_limited", { limit_per_minute: RATE_LIMITS[kind] }, { "Retry-After": "60" });
+    if (!this.takeRateToken(kind)) return done(429, "rate_limited", { limit_per_minute: this.rateLimits()[kind] }, { "Retry-After": "60" });
 
     const id = crypto.randomUUID();
     const timeoutMs = command.cmd === "type" ? TYPE_TIMEOUT_MS : DEFAULT_TIMEOUT_MS;

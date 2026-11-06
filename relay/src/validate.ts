@@ -4,6 +4,20 @@
 
 export const ALLOWED_PACKAGES = ["com.google.android.gm", "com.android.chrome"] as const;
 export const ALLOWED_KEYS = ["back", "home", "recents", "enter", "tab", "delete"] as const;
+// Any other key by its Android name, except keys that act outside the app in front
+// (power and sleep, calls, camera, assistant, volume, brightness, media). Same list as the phone client.
+const RAW_KEY_RE = /^KEYCODE_[A-Z0-9_]{1,40}$/;
+const DENIED_KEY_PREFIXES = [
+  "KEYCODE_POWER", "KEYCODE_SLEEP", "KEYCODE_SOFT_SLEEP", "KEYCODE_WAKEUP", "KEYCODE_CALL",
+  "KEYCODE_ENDCALL", "KEYCODE_CAMERA", "KEYCODE_VOICE_ASSIST", "KEYCODE_ASSIST", "KEYCODE_VOLUME_",
+  "KEYCODE_MUTE", "KEYCODE_BRIGHTNESS_", "KEYCODE_MEDIA_", "KEYCODE_HEADSETHOOK", "KEYCODE_SYSRQ",
+];
+
+export function isAllowedKey(key: unknown): key is string {
+  if (typeof key !== "string") return false;
+  if ((ALLOWED_KEYS as readonly string[]).includes(key)) return true;
+  return RAW_KEY_RE.test(key) && !DENIED_KEY_PREFIXES.some((p) => key.startsWith(p));
+}
 
 export const MAX_COORD = 10000;
 export const MIN_SCALE = 0.1;
@@ -15,7 +29,7 @@ export const DEFAULT_SWIPE_MS = 300;
 export const MAX_TEXT_LENGTH = 500;
 export const MAX_BODY_BYTES = 4096;
 
-export type CommandName = "state" | "screenshot" | "tap" | "swipe" | "type" | "key" | "launch";
+export type CommandName = "state" | "screenshot" | "ui" | "tap" | "swipe" | "type" | "key" | "launch";
 
 export interface Command {
   cmd: CommandName;
@@ -33,6 +47,7 @@ interface Route {
 export const AGENT_ROUTES: Record<string, Route> = {
   "/state": { method: "GET", cmd: "state" },
   "/screenshot": { method: "GET", cmd: "screenshot" },
+  "/ui": { method: "GET", cmd: "ui" },
   "/tap": { method: "POST", cmd: "tap" },
   "/swipe": { method: "POST", cmd: "swipe" },
   "/type": { method: "POST", cmd: "type" },
@@ -77,7 +92,6 @@ export function validateText(text: unknown): string | null {
   if (typeof text !== "string" || text.length === 0) return "text must be a non-empty string";
   if (text.length > MAX_TEXT_LENGTH) return `text longer than ${MAX_TEXT_LENGTH} characters`;
   if (!TEXT_RE.test(text)) return "text must be printable ASCII";
-  if (text.includes("%")) return "text must not contain %";
   return null;
 }
 
@@ -88,6 +102,7 @@ export function validateCommand(
 ): ValidationResult {
   switch (cmd) {
     case "state":
+    case "ui":
       return { ok: true, command: { cmd, args: {} } };
 
     case "screenshot": {
@@ -137,8 +152,8 @@ export function validateCommand(
       if (!body) return fail("JSON object body required");
       const bad = checkKeys(body, ["key"]);
       if (bad) return fail(bad);
-      if (typeof body.key !== "string" || !(ALLOWED_KEYS as readonly string[]).includes(body.key)) {
-        return fail(`key must be one of: ${ALLOWED_KEYS.join(", ")}`);
+      if (!isAllowedKey(body.key)) {
+        return fail(`key must be one of ${ALLOWED_KEYS.join(", ")} or a KEYCODE_* name (not power, calls, volume, media)`);
       }
       return { ok: true, command: { cmd, args: { key: body.key } } };
     }

@@ -145,15 +145,16 @@ All endpoints need `Authorization: Bearer <AGENT_TOKEN>`, which the network secr
 |---|---|
 | `GET /state` | foreground, foreground_allowed, awake, battery, screen, allowlist |
 | `GET /screenshot?scale=0.5` | JPEG (PNG if Pillow is missing on the phone). Headers `X-Image-*`, `X-Screen-*`, `X-Scale`, `X-Foreground` |
-| `POST /tap` `{x,y,scale?}` | |
-| `POST /swipe` `{x1,y1,x2,y2,ms?,scale?}` | ms 50-5000 |
-| `POST /type` `{text}` | 1-500 printable ASCII, no `%`; refused unless an allowed app's text field is focused, and refused in password fields |
-| `POST /key` `{key}` | back, home, recents, enter, tab, delete; all of them, Home included, only while an allowed app is in front |
+| `GET /ui` | Elements from allowed packages only; password text is blanked. Runs `uiautomator dump`, which unbinds every accessibility service on the phone for a moment |
+| `POST /tap` `{x,y,scale?}` | Refused while the keyboard is open on a password field |
+| `POST /swipe` `{x1,y1,x2,y2,ms?,scale?}` | ms 50-5000; same password-keyboard rule as tap |
+| `POST /type` `{text}` | 1-500 printable ASCII, `%` included; refused in password fields; the reply gives the focused field's `inputType` |
+| `POST /key` `{key}` | back, home, recents, enter, tab, delete, or any `KEYCODE_*` except power, calls, camera, assistant, volume, brightness and media; only while an allowed app is in front |
 | `POST /launch` `{package}` | Gmail or Chrome only, started from an allowed app or the home screen |
 
-There is no `/ui` endpoint. It needed `uiautomator dump`, which unbinds every accessibility service on the phone for a moment, so the agent reads the screen from screenshots.
+Errors: 400 `invalid_args`, 401 `unauthorized`, 404, 405, 409 `foreground_not_allowed` / `screen_off` / `password_field`, 429 `rate_limited`, 503 `device_offline` / `disabled` / `stopped`, 504 `device_timeout`, 502 other device errors.
 
-Errors: 400 `invalid_args`, 401 `unauthorized`, 404, 405, 409 `foreground_not_allowed` / `screen_off` / `password_field` / `no_text_field`, 429 `rate_limited`, 503 `device_offline` / `disabled` / `stopped`, 504 `device_timeout`, 502 other device errors.
+The full list of what the agent can do, what is actively restricted and what is just not built is in [docs/CAPABILITIES.md](docs/CAPABILITIES.md).
 
 ## 6. Tests
 
@@ -179,20 +180,28 @@ python3 -m unittest discover -s phone/tests -v
 python3 scripts/e2e_test.py
 ```
 
-What the end-to-end test covers: token separation (agent, device and admin tokens cannot stand in for each other), validation, every endpoint, the allowlist (Settings, Teams, lock screen, launcher), in-app popups, screen off, password-field and no-text-field refusals, Home and launch refused over other apps, launch from the home screen, the screenshot rate limit, the admin kill switch and reconnect, the stop file, a bad device token, and that typed text never reaches the log.
+What the end-to-end test covers: token separation (agent, device and admin tokens cannot stand in for each other), validation, every endpoint, the allowlist (Settings, Teams, lock screen, launcher), in-app popups, screen off, password-field refusals (typing, and keyboard taps), typing `%`, `KEYCODE_*` keys and denied keys, Home and launch refused over other apps, launch from the home screen, the screenshot rate limit, the admin kill switch and reconnect, the stop file, a bad device token, and that typed text never reaches the log.
 
-Checked on a Galaxy S24 (Android 17), read-only: the `mCurrentFocus`/`mWakefulness` formats, the `curEditorInfo` block of `dumpsys input_method`, and the input guard in the phone's own shell (refuses on the home screen, passes for an allowed package).
+Checked on a Galaxy S24 (Android 17) with real input in Chrome and Gmail:
+- the self-test;
+- taps, swipes and typing (`%` and `%s` included);
+- `KEYCODE_*` keys, with `KEYCODE_POWER` refused;
+- refusals: typing into a password field, keyboard taps on a password field, taps on the home screen;
+- launch from Chrome and from the home screen.
+
+`/ui` was not run on that phone.
 
 Not yet tested, because it needs the real phone and account (phase 4 of the plan): reboot and Wi-Fi-drop recovery, token rotation, and the prompt-injection test with a hostile email and web page.
 
 ## 7. Security notes and known gaps
 
 - **Allowlist**: enforced by the client (it checks the foreground app before every action, and again after screenshots) and in the Worker (`/launch`, keys). Every input, screenshot and launch also runs inside a shell guard on the phone: `if <allowed app focused and screen awake>; then <action>; else echo PHONE_RELAY_REFUSED; fi`. The check and the action run in the same command, so a focus change between the client's check and the action is refused. A change in the milliseconds inside that one command is still possible. Focused in-app popups (`PopupWindow:…`, e.g. Chrome's menu) are attributed to the app in `mFocusedApp`; any other window without a package name (lock screen, shade) is refused.
-- **No `uiautomator`**: the client never runs `uiautomator dump`, which briefly unbinds every accessibility service on the phone.
+- **`uiautomator`**: only `/ui` runs `uiautomator dump`, which briefly unbinds every accessibility service on the phone. Nothing else calls it, including `--selftest`.
+- **Keyboard taps**: the on-screen keyboard never takes focus, so its keys pass the focus guard. While a password field is focused and the keyboard is open, taps and swipes are refused, so a password cannot be typed key by key. Chrome's in-page autofill dropdown is not covered.
 - **Notifications**: a heads-up notification from another app can appear in a screenshot taken while Chrome or Gmail is in front. Turn on Do Not Disturb during agent sessions.
-- **Password fields**: adb *can* type into password fields. This differs from the plan's "cannot enter secure fields (by design)". The client reads the focused field's `inputType` from `dumpsys input_method` and refuses `/type` for password types (text, visible, web and number passwords). That covers standard Android and HTML password inputs, but not custom fields that do not declare a password type. It also refuses when no text field of the app in front is focused (`no_text_field`).
+- **Password fields**: adb *can* type into password fields. This differs from the plan's "cannot enter secure fields (by design)". The client reads the focused field's `inputType` from `dumpsys input_method` and refuses `/type` for password types (text, visible, web and number passwords). That covers standard Android and HTML password inputs, but not custom fields that do not declare a password type.
 - **Gmail and Chrome**: use a test Google account. Keep Chrome signed out, with saved passwords and payment autofill off. The allowlist limits apps, not what Chrome can browse to.
-- **Rate limits** (60 requests/min, 20 screenshots/min) are stored in Durable Object storage, so they survive hibernation. `/state` counts towards the 60.
+- **Rate limits** (300 requests/min, 120 screenshots/min by default; set `RATE_ACTIONS_PER_MIN` / `RATE_SCREENSHOTS_PER_MIN` as wrangler vars to change them) are stored in Durable Object storage, so they survive hibernation. `/state` and `/ui` count as requests.
 - **Coordinates** are checked against the larger screen dimension so both orientations work. Taps outside the visible screen are possible within that square; Android ignores them.
 - **Phone-side policy** (allowlist, keys) is constant in `phone_client.py`. Changing it means editing the code on the phone, which is intentional.
 

@@ -14,6 +14,9 @@ export interface Env {
   AGENT_TOKEN: string;
   DEVICE_TOKEN: string;
   ADMIN_TOKEN: string;
+  // Optional per-minute rate limits (wrangler vars); defaults in device.ts.
+  RATE_ACTIONS_PER_MIN?: string;
+  RATE_SCREENSHOTS_PER_MIN?: string;
 }
 
 const ADMIN_ROUTES: Record<string, "GET" | "POST"> = {
