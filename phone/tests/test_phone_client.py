@@ -9,7 +9,8 @@ import json
 import logging
 import os
 import shlex
-import stat
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -23,25 +24,38 @@ import phone_client as pc  # noqa: E402
 
 logging.getLogger("asyncio").setLevel(logging.WARNING)  # quiet asyncio debug mode in async tests
 
+FAKE_ADB = os.path.join(HERE, "fake_adb.py")
+
+# The curEditorInfo block as Android 17 on a Galaxy S24 prints it (from `dumpsys input_method`).
+EDITOR_INFO_S24 = """      curEditorInfo:
+        inputType=0x0 imeOptions=0x0 privateImeOptions=null
+        actionLabel=null actionId=0
+        initialSelStart=-1 initialSelEnd=-1 initialCapsMode=0x0
+        hintText=null label=null
+        packageName=com.sec.android.app.launcher autofillId=0 fieldId=0 fieldName=null
+      mCurClient=ClientState{1}
+"""
+
 
 class InProcessAdb:
-    """Calls fake_adb's handlers directly and records every command."""
+    """Calls fake_adb.run directly, records every command and the actions that actually ran."""
 
     def __init__(self, state=None):
-        self.state = {"foreground": "com.android.chrome", "awake": True, "password_focused": False}
+        self.state = fake_adb.default_state()
         self.state.update(state or {})
         self.calls = []
+        self.executed = []
 
     async def run(self, *args, timeout=None):
         self.calls.append(list(args))
-        kind, cmd = args[0], " ".join(args[1:])
-        if cmd == "screencap -p":
-            return fake_adb.png(fake_adb.WIDTH, fake_adb.HEIGHT)
-        if cmd.startswith("uiautomator dump"):
-            return fake_adb.ui_xml(self.state).encode()
-        # fake_adb.shell persists state through save_state(); keep it in memory instead
-        out = fake_adb.shell(cmd, self.state)
-        return out
+        cmd = " ".join(args[1:])
+        m = fake_adb.GUARD_RE.match(cmd)
+        if m is None:
+            self.executed.append(cmd)
+        elif fake_adb.guard_passes(m.group("guard"), self.state):
+            self.executed.append(m.group("action"))
+        # fake_adb.save_state is a no-op without FAKE_ADB_STATE, so state stays in memory
+        return fake_adb.run(cmd, self.state)
 
     async def shell(self, command, timeout=None):
         return (await self.run("shell", command)).decode()
@@ -50,7 +64,7 @@ class InProcessAdb:
         return await self.run("exec-out", command)
 
     def inputs(self):
-        return [c[1] for c in self.calls if c[0] == "shell" and c[1].startswith("input ")]
+        return [c for c in self.executed if c.startswith("input ")]
 
 
 def controller(state=None, stop_file=None):
@@ -89,6 +103,8 @@ class ParsingTests(unittest.TestCase):
 
     def test_wakefulness(self):
         self.assertEqual(pc.parse_wakefulness("  mWakefulness=Asleep\n"), "Asleep")
+        # Android 17 prints a second, numeric line; the first one wins
+        self.assertEqual(pc.parse_wakefulness("  mWakefulness=Awake\nmWakefulness=1\n"), "Awake")
 
     def test_size_override_wins(self):
         self.assertEqual(pc.parse_size("Physical size: 1080x2340\nOverride size: 720x1560\n"), (720, 1560))
@@ -98,37 +114,106 @@ class ParsingTests(unittest.TestCase):
     def test_battery(self):
         self.assertEqual(pc.parse_battery("  AC powered: false\n  level: 42\n  scale: 100\n"), 42)
 
-    def test_ui_drops_other_packages_and_empty_nodes(self):
-        els = pc.parse_ui(fake_adb.ui_xml({"foreground": "com.android.chrome"}).encode())
-        self.assertTrue(all(e["pkg"] == "com.android.chrome" for e in els))
-        self.assertEqual(len(els), 3)  # url bar, text, scroll view; empty View dropped
-        url_bar = els[0]
-        self.assertEqual(url_bar["center"], [500, 170])
-        self.assertTrue(url_bar["editable"] and url_bar["focused"])
-        self.assertEqual(els[1]["text"], "Hello & welcome")
+    def test_editor_info_s24(self):
+        self.assertEqual(pc.parse_editor_info(EDITOR_INFO_S24), ("com.sec.android.app.launcher", 0))
 
-    def test_ui_strips_trailing_status_line(self):
-        xml = fake_adb.ui_xml({"foreground": "com.android.chrome"}).encode() + b"\nUI hierchary dumped to: /dev/tty"
-        self.assertEqual(len(pc.parse_ui(xml)), 3)
+    def test_editor_info_stops_at_block_end(self):
+        # inputType after the block (another client's) must not be picked up
+        dump = "      curEditorInfo:\n        packageName=com.android.chrome\n      inputType=0x81\n"
+        self.assertIsNone(pc.parse_editor_info(dump))
+        self.assertIsNone(pc.parse_editor_info("nothing"))
 
-    def test_ui_hides_password_text(self):
-        xml = fake_adb.ui_xml({"foreground": "com.android.chrome", "password_focused": True})
-        xml = xml.replace('text="" resource-id="com.android.chrome:id/url_bar"',
-                          'text="secret" resource-id="com.android.chrome:id/url_bar"')
-        els = pc.parse_ui(xml.encode())
-        self.assertEqual(els[0]["text"], "")
-        self.assertTrue(els[0]["password"])
+    def test_editor_info_fake_matches_parser(self):
+        state = {"foreground": "com.android.chrome", "password_focused": True}
+        self.assertEqual(pc.parse_editor_info(fake_adb.editor_info(state)), ("com.android.chrome", 0x81))
 
-    def test_ui_bad_output(self):
-        with self.assertRaises(pc.CommandError) as cm:
-            pc.parse_ui(b"ERROR: could not get idle state.")
-        self.assertEqual(cm.exception.code, "ui_unavailable")
+    def test_password_types(self):
+        for t in [0x81, 0x91, 0xE1, 0x12, 0x4081]:  # text password, visible, web, number password, + flags
+            self.assertTrue(pc.is_password_type(t), hex(t))
+        for t in [0x0, 0x1, 0x21, 0x2, 0x3, 0x22C001, 0x11, 0xA1]:  # null, text, email, number, phone, ...
+            self.assertFalse(pc.is_password_type(t), hex(t))
 
-    def test_focused_password_field(self):
-        self.assertTrue(pc.focused_password_field(fake_adb.ui_xml(
-            {"foreground": "com.android.chrome", "password_focused": True}).encode()))
-        self.assertFalse(pc.focused_password_field(fake_adb.ui_xml(
-            {"foreground": "com.android.chrome"}).encode()))
+
+class GuardTests(unittest.TestCase):
+    """The focus guard's own grep patterns, applied to realistic dumpsys output."""
+
+    def passes(self, packages=pc.ALLOWED_PACKAGES, **state):
+        full = fake_adb.default_state()
+        full.update(state)
+        return fake_adb.guard_passes(pc.focus_guard(packages), full)
+
+    def test_allowed_app(self):
+        self.assertTrue(self.passes(foreground="com.android.chrome"))
+        self.assertTrue(self.passes(foreground="com.google.android.gm"))
+
+    def test_other_windows(self):
+        for fg in ["com.android.settings", "NotificationShade", "com.sec.android.app.launcher",
+                   "com.microsoft.teams", "com.android.chromex", None]:
+            self.assertFalse(self.passes(foreground=fg), fg)
+
+    def test_popup_counts_for_its_app(self):
+        self.assertTrue(self.passes(foreground="com.android.chrome", popup=True))
+        self.assertFalse(self.passes(foreground="com.android.settings", popup=True))
+
+    def test_screen_off(self):
+        self.assertFalse(self.passes(foreground="com.android.chrome", awake=False))
+
+    def test_package_dots_are_literal(self):
+        # "com.android.chrome" must not match "comXandroidXchrome"
+        self.assertFalse(self.passes(foreground="comXandroidXchrome"))
+
+    def test_guarded_shape(self):
+        cmd = pc.guarded("input tap 1 2", pc.ALLOWED_PACKAGES)
+        m = fake_adb.GUARD_RE.match(cmd)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group("action"), "input tap 1 2")
+        self.assertNotIn("uiautomator", cmd)
+
+
+def find_sh():
+    """A POSIX sh: on PATH, or the one Git for Windows ships next to git.exe."""
+    sh = shutil.which("sh")
+    if sh:
+        return sh
+    git = shutil.which("git")
+    if git:
+        candidate = os.path.join(os.path.dirname(os.path.dirname(git)), "usr", "bin", "sh.exe")
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+SH = find_sh()
+
+
+@unittest.skipUnless(SH, "needs a POSIX sh (Git for Windows provides one)")
+class GuardShellTests(unittest.TestCase):
+    """Runs the guard in a real POSIX shell with dumpsys stubbed, to check its shell syntax."""
+
+    STUBS = ("dumpsys() { case \"$1\" in window) printf '%s\\n' \"$WIN\";; "
+             "power) printf '  mWakefulness=%s\\n' \"$WAKE\";; esac; }\n")
+
+    def run_guard(self, win, wake="Awake"):
+        # sh's own folder first, so it finds its grep (Git for Windows' PATH does not include usr\bin)
+        path = os.path.dirname(SH) + os.pathsep + os.environ.get("PATH", "")
+        env = {**os.environ, "PATH": path, "WIN": win, "WAKE": wake}
+        script = self.STUBS + pc.guarded("echo RAN", pc.ALLOWED_PACKAGES)
+        out = subprocess.run([SH, "-c", script], env=env, capture_output=True, text=True, timeout=30)
+        return out.stdout.strip()
+
+    def test_allowed(self):
+        self.assertEqual(self.run_guard("  mCurrentFocus=Window{1a2b u0 com.android.chrome/x.Main}"), "RAN")
+
+    def test_refused(self):
+        self.assertEqual(self.run_guard("  mCurrentFocus=Window{1a2b u0 com.android.settings/x.Main}"),
+                         pc.REFUSED_MARKER)
+        self.assertEqual(self.run_guard("  mCurrentFocus=Window{1a2b u0 com.android.chrome/x.Main}", "Asleep"),
+                         pc.REFUSED_MARKER)
+
+    def test_popup(self):
+        win = ("  mCurrentFocus=Window{4d3c u0 PopupWindow:9a8b}\n"
+               "  mFocusedApp=ActivityRecord{1f2e u0 com.google.android.gm/.Main t4}")
+        self.assertEqual(self.run_guard(win), "RAN")
 
 
 class TextEscapingTests(unittest.TestCase):
@@ -176,22 +261,57 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res, {"x": 540, "y": 1170})
         self.assertEqual(adb.inputs(), ["input tap 540 1170"])
 
+    async def test_tap_in_popup(self):
+        ctl, adb = controller({"popup": True})
+        await ctl.handle("tap", {"x": 100, "y": 200})
+        self.assertEqual(adb.inputs(), ["input tap 100 200"])
+
+    async def test_every_input_is_guarded(self):
+        ctl, adb = controller()
+        await ctl.handle("tap", {"x": 1, "y": 1})
+        await ctl.handle("swipe", {"x1": 1, "y1": 1, "x2": 5, "y2": 5})
+        await ctl.handle("type", {"text": "hi"})
+        await ctl.handle("key", {"key": "back"})
+        await ctl.handle("screenshot", {})
+        for call in adb.calls:
+            cmd = call[1]
+            if cmd.startswith(("input ", "screencap", "am start", "monkey")):
+                self.fail(f"unguarded action: {cmd}")
+
     async def test_actions_refused_outside_allowlist(self):
-        for fg in ["com.android.settings", "NotificationShade", "com.sec.android.app.launcher", None]:
+        for fg in ["com.android.settings", "NotificationShade", "com.sec.android.app.launcher",
+                   "com.microsoft.teams", None]:
             ctl, adb = controller({"foreground": fg})
             for cmd, args in [
                 ("tap", {"x": 1, "y": 1}),
                 ("swipe", {"x1": 1, "y1": 1, "x2": 5, "y2": 5}),
                 ("type", {"text": "hi"}),
                 ("key", {"key": "back"}),
+                ("key", {"key": "home"}),
                 ("screenshot", {}),
-                ("ui", {}),
             ]:
                 with self.assertRaises(pc.CommandError, msg=f"{fg} {cmd}") as cm:
                     await ctl.handle(cmd, args)
                 self.assertEqual(cm.exception.code, "foreground_not_allowed")
             self.assertEqual(adb.inputs(), [])
-            self.assertFalse(any("screencap" in " ".join(c) for c in adb.calls))
+            self.assertFalse(any("screencap" in c for c in adb.executed))
+
+    async def test_focus_change_after_check_is_refused_by_guard(self):
+        """The race the plan accepted: the app changes between the check and the tap."""
+        ctl, adb = controller()
+        original = adb.run
+
+        async def run(*args, timeout=None):
+            out = await original(*args, timeout=timeout)
+            if args[1].startswith("dumpsys window"):  # the Python-side pre-check just passed
+                adb.state["foreground"] = "com.android.settings"
+            return out
+
+        adb.run = run
+        with self.assertRaises(pc.CommandError) as cm:
+            await ctl.handle("tap", {"x": 1, "y": 1})
+        self.assertEqual(cm.exception.code, "foreground_not_allowed")
+        self.assertEqual(adb.inputs(), [])
 
     async def test_screen_off_refused(self):
         ctl, adb = controller({"awake": False})
@@ -200,10 +320,11 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cm.exception.code, "screen_off")
         self.assertEqual(adb.inputs(), [])
 
-    async def test_home_always_allowed(self):
-        ctl, adb = controller({"foreground": "com.android.settings"})
+    async def test_home_from_allowed_app(self):
+        ctl, adb = controller()
         await ctl.handle("key", {"key": "home"})
         self.assertEqual(adb.inputs(), ["input keyevent KEYCODE_HOME"])
+        self.assertEqual(adb.state["foreground"], fake_adb.LAUNCHER)
 
     async def test_keys(self):
         ctl, adb = controller()
@@ -228,6 +349,13 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cm.exception.code, "password_field")
         self.assertEqual(adb.inputs(), [])
 
+    async def test_type_refused_without_text_field(self):
+        ctl, adb = controller({"text_field": False})
+        with self.assertRaises(pc.CommandError) as cm:
+            await ctl.handle("type", {"text": "hi"})
+        self.assertEqual(cm.exception.code, "no_text_field")
+        self.assertEqual(adb.inputs(), [])
+
     async def test_swipe(self):
         ctl, adb = controller()
         await ctl.handle("swipe", {"x1": 500, "y1": 1800, "x2": 500, "y2": 600, "ms": 400})
@@ -245,11 +373,24 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
                 await ctl.handle("swipe", {"x1": 1, "y1": 1, "x2": 2, "y2": 2, "ms": ms})
         self.assertEqual(adb.inputs(), [])
 
-    async def test_launch(self):
-        ctl, adb = controller({"foreground": "com.sec.android.app.launcher"})
+    async def test_launch_from_home_screen(self):
+        ctl, adb = controller({"foreground": fake_adb.LAUNCHER})
         await ctl.handle("launch", {"package": "com.google.android.gm"})
         self.assertEqual(adb.state["foreground"], "com.google.android.gm")
-        self.assertTrue(any(c[1].startswith("am start -W -n com.google.android.gm/") for c in adb.calls))
+        self.assertTrue(any(c.startswith("am start -W -n com.google.android.gm/") for c in adb.executed))
+
+    async def test_launch_from_allowed_app(self):
+        ctl, adb = controller({"foreground": "com.android.chrome"})
+        await ctl.handle("launch", {"package": "com.google.android.gm"})
+        self.assertEqual(adb.state["foreground"], "com.google.android.gm")
+
+    async def test_launch_refused_over_other_apps(self):
+        for fg in ["com.android.settings", "com.microsoft.teams", "NotificationShade", None]:
+            ctl, adb = controller({"foreground": fg})
+            with self.assertRaises(pc.CommandError, msg=str(fg)) as cm:
+                await ctl.handle("launch", {"package": "com.android.chrome"})
+            self.assertEqual(cm.exception.code, "foreground_not_allowed")
+            self.assertFalse(any(c.startswith(("am start", "monkey")) for c in adb.executed))
 
     async def test_launch_refuses_other_packages(self):
         ctl, adb = controller()
@@ -273,7 +414,7 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
 
         async def run(*args, timeout=None):
             out = await original(*args, timeout=timeout)
-            if args[1] == "screencap -p":
+            if "screencap -p" in args[1]:
                 adb.state["foreground"] = "com.android.settings"
             return out
 
@@ -282,14 +423,27 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
             await ctl.handle("screenshot", {})
         self.assertEqual(cm.exception.code, "foreground_not_allowed")
 
-    async def test_ui(self):
+    async def test_ui_endpoint_removed(self):
         ctl, _ = controller()
-        ui = await ctl.handle("ui", {})
-        self.assertEqual(ui["count"], 3)
+        with self.assertRaises(pc.CommandError) as cm:
+            await ctl.handle("ui", {})
+        self.assertEqual(cm.exception.code, "invalid_args")
+
+    async def test_never_calls_uiautomator(self):
+        ctl, adb = controller()
+        await ctl.handle("state", {})
+        await ctl.handle("screenshot", {})
+        await ctl.handle("tap", {"x": 1, "y": 1})
+        await ctl.handle("type", {"text": "hi"})
+        await ctl.handle("key", {"key": "home"})
+        await ctl.handle("launch", {"package": "com.android.chrome"})
+        self.assertFalse(any("uiautomator" in c[1] for c in adb.calls))
 
     async def test_stop_file_refuses_everything(self):
-        with tempfile.NamedTemporaryFile() as f:
-            ctl, adb = controller(stop_file=f.name)
+        with tempfile.TemporaryDirectory() as tmp:
+            stop = os.path.join(tmp, "STOP_PHONE_AGENT")
+            open(stop, "w").close()
+            ctl, adb = controller(stop_file=stop)
             for cmd in ["state", "tap", "key"]:
                 with self.assertRaises(pc.CommandError) as cm:
                     await ctl.handle(cmd, {"x": 1, "y": 1, "key": "home"})
@@ -321,7 +475,7 @@ class DispatchTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SubprocessAdbTests(unittest.IsolatedAsyncioTestCase):
-    """Exercises the real Adb wrapper against fake_adb.py as an executable."""
+    """Exercises the real Adb wrapper against fake_adb.py run as a separate process."""
 
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -331,11 +485,7 @@ class SubprocessAdbTests(unittest.IsolatedAsyncioTestCase):
             json.dump({"foreground": "com.android.chrome"}, f)
         os.environ["FAKE_ADB_STATE"] = self.state
         os.environ["FAKE_ADB_LOG"] = self.log
-        wrapper = os.path.join(self.tmp.name, "adb")
-        with open(wrapper, "w") as f:
-            f.write(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(os.path.join(HERE, 'fake_adb.py'))} \"$@\"\n")
-        os.chmod(wrapper, os.stat(wrapper).st_mode | stat.S_IXUSR)
-        self.ctl = pc.PhoneController(pc.Adb(wrapper, "localhost:5555"),
+        self.ctl = pc.PhoneController(pc.Adb(FAKE_ADB, "localhost:5555"),
                                       stop_file=os.path.join(self.tmp.name, "STOP"), focus_retry_delay=0)
 
     async def asyncTearDown(self):
@@ -351,7 +501,8 @@ class SubprocessAdbTests(unittest.IsolatedAsyncioTestCase):
         await self.ctl.handle("type", {"text": "it's a test"})
         last = self.logged()[-1]
         self.assertEqual(last[:3], ["-s", "localhost:5555", "shell"])
-        self.assertEqual(last[3], "input text 'it'\"'\"'s%sa%stest'")
+        self.assertTrue(last[3].endswith("then input text 'it'\"'\"'s%sa%stest'; else echo PHONE_RELAY_REFUSED; fi"),
+                        last[3])
 
     async def test_screenshot_and_launch(self):
         shot = await self.ctl.handle("screenshot", {"scale": 0.25})

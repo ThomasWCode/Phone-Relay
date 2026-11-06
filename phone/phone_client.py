@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Phone client for the phone relay (phase 1: Termux + adb over loopback).
+"""Phone client for the phone relay (phase 1: adb, from Termux on the phone or from a computer).
 
 Dials out to the relay over WSS, receives commands, runs them through adb and
-replies. The app allowlist is enforced here, on the phone, regardless of what
-the relay sends.
+replies. The app allowlist is enforced here, next to the phone, regardless of
+what the relay sends. Every input is sent in the same shell command as a
+focus check, so it only runs while an allowed app has focus.
+
+It never runs `uiautomator dump`: that unbinds every accessibility service on
+the phone for a moment. The screen is read from screenshots only.
 
 Usage:
-    python phone_client.py --selftest      # check adb, foreground, screenshot, UI dump
+    python phone_client.py --selftest      # check adb, foreground, input guard, text field, screenshot
     python phone_client.py                 # connect to the relay and serve commands
 """
 
@@ -24,13 +28,14 @@ import re
 import shlex
 import stat
 import sys
-import xml.etree.ElementTree as ET
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 # ---- policy (edit deliberately; the relay has its own copy) ----
 
 ALLOWED_PACKAGES = ("com.google.android.gm", "com.android.chrome")
+# /launch may also start from the home screen (Samsung One UI Home).
+HOME_PACKAGES = ("com.sec.android.app.launcher",)
 KEYCODES = {
     "back": "KEYCODE_BACK",
     "home": "KEYCODE_HOME",
@@ -48,10 +53,9 @@ MIN_SWIPE_MS = 50
 MAX_SWIPE_MS = 5000
 MAX_TEXT_LENGTH = 500
 JPEG_QUALITY = 60
-MAX_UI_ELEMENTS = 300
-MAX_UI_TEXT = 200
 ADB_TIMEOUT_S = 20
-UI_DUMP_PATH = "/data/local/tmp/phone_relay_ui.xml"
+# Printed by a guarded command when the focus check fails, instead of running the action.
+REFUSED_MARKER = "PHONE_RELAY_REFUSED"
 
 log = logging.getLogger("phone_client")
 
@@ -74,7 +78,8 @@ class Adb:
         self.serial = serial
 
     async def run(self, *args: str, timeout: float = ADB_TIMEOUT_S) -> bytes:
-        cmd = [self.adb_bin]
+        # A .py "adb" (the tests' fake) runs with this Python: no shell wrapper, so it works on Windows too.
+        cmd = [sys.executable, self.adb_bin] if self.adb_bin.endswith(".py") else [self.adb_bin]
         if self.serial:
             cmd += ["-s", self.serial]
         cmd += list(args)
@@ -108,7 +113,8 @@ _FOCUSED_APP_RE = re.compile(r"mFocusedApp=.*?ActivityRecord\{[0-9a-fA-F]+ (?:u\
 _WAKE_RE = re.compile(r"mWakefulness=(\w+)")
 _SIZE_RE = re.compile(r"(Physical|Override) size: (\d+)x(\d+)")
 _BATTERY_RE = re.compile(r"^\s*level: (\d+)", re.MULTILINE)
-_BOUNDS_RE = re.compile(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]")
+_INPUT_TYPE_RE = re.compile(r"\binputType=(0x[0-9a-fA-F]+|\d+)")
+_EDITOR_PKG_RE = re.compile(r"\bpackageName=(\S+)")
 
 
 def parse_foreground(dumpsys: str) -> str | None:
@@ -145,86 +151,55 @@ def parse_battery(dumpsys: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def parse_bounds(bounds: str) -> list[int] | None:
-    m = _BOUNDS_RE.fullmatch(bounds.strip())
-    return [int(v) for v in m.groups()] if m else None
+def parse_editor_info(dumpsys: str) -> tuple[str, int] | None:
+    """(package, inputType) of the text field the keyboard is serving, from `dumpsys input_method`.
 
-
-def _short(name: str) -> str:
-    return name.rsplit("/", 1)[-1].rsplit(".", 1)[-1] if name else ""
-
-
-def parse_ui(xml_bytes: bytes, allowlist: tuple[str, ...] = ALLOWED_PACKAGES) -> list[dict]:
-    """Compact list of useful elements from a uiautomator dump.
-
-    Nodes from packages outside the allowlist (status bar, keyboard, other
-    apps' overlays) are dropped. Password field contents are never returned.
+    Reads the indented block under the curEditorInfo: line. None if it is missing.
     """
-    start = xml_bytes.find(b"<?xml")
-    if start < 0:
-        start = xml_bytes.find(b"<hierarchy")
-    end = xml_bytes.rfind(b"</hierarchy>")
-    if start < 0 or end < 0:
-        raise CommandError("ui_unavailable", "no hierarchy in uiautomator output")
-    try:
-        root = ET.fromstring(xml_bytes[start : end + len(b"</hierarchy>")])
-    except ET.ParseError as e:
-        raise CommandError("ui_unavailable", f"bad XML: {e}") from e
-
-    elements: list[dict] = []
-    for node in root.iter("node"):
-        a = node.attrib
-        if a.get("package") not in allowlist:
+    lines = dumpsys.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() != "curEditorInfo:":
             continue
-        bounds = parse_bounds(a.get("bounds", ""))
-        if not bounds or bounds[2] <= bounds[0] or bounds[3] <= bounds[1]:
-            continue
-        cls = a.get("class", "")
-        password = a.get("password") == "true"
-        text = "" if password else a.get("text", "")[:MAX_UI_TEXT]
-        desc = a.get("content-desc", "")[:MAX_UI_TEXT]
-        clickable = a.get("clickable") == "true"
-        scrollable = a.get("scrollable") == "true"
-        editable = "EditText" in cls
-        if not (text or desc or clickable or scrollable or editable):
-            continue
-        el = {
-            "i": len(elements),
-            "text": text,
-            "desc": desc,
-            "id": _short(a.get("resource-id", "")),
-            "cls": _short(cls),
-            "pkg": a.get("package"),
-            "bounds": bounds,
-            "center": [(bounds[0] + bounds[2]) // 2, (bounds[1] + bounds[3]) // 2],
-        }
-        for flag, value in (
-            ("clickable", clickable),
-            ("scrollable", scrollable),
-            ("editable", editable),
-            ("focused", a.get("focused") == "true"),
-            ("password", password),
-            ("checked", a.get("checked") == "true"),
-        ):
-            if value:
-                el[flag] = True
-        elements.append(el)
-        if len(elements) >= MAX_UI_ELEMENTS:
-            break
-    return elements
+        indent = len(line) - len(line.lstrip())
+        block = []
+        for nxt in lines[i + 1 :]:
+            if nxt.strip() and len(nxt) - len(nxt.lstrip()) <= indent:
+                break
+            block.append(nxt)
+        text = "\n".join(block)
+        t, p = _INPUT_TYPE_RE.search(text), _EDITOR_PKG_RE.search(text)
+        if not t or not p:
+            return None
+        return p.group(1), int(t.group(1), 0)
+    return None
 
 
-def focused_password_field(xml_bytes: bytes) -> bool:
-    """True if any focused node in the dump is a password field (any package)."""
-    start = xml_bytes.find(b"<hierarchy")
-    end = xml_bytes.rfind(b"</hierarchy>")
-    if start < 0 or end < 0:
-        raise CommandError("ui_unavailable", "no hierarchy in uiautomator output")
-    try:
-        root = ET.fromstring(xml_bytes[start : end + len(b"</hierarchy>")])
-    except ET.ParseError as e:
-        raise CommandError("ui_unavailable", f"bad XML: {e}") from e
-    return any(n.get("focused") == "true" and n.get("password") == "true" for n in root.iter("node"))
+def is_password_type(input_type: int) -> bool:
+    """True for Android's password inputTypes (EditorInfo class and variation bits)."""
+    cls, variation = input_type & 0xF, input_type & 0xFF0
+    # TYPE_CLASS_TEXT with PASSWORD, VISIBLE_PASSWORD or WEB_PASSWORD; TYPE_CLASS_NUMBER with PASSWORD
+    return (cls == 0x1 and variation in (0x80, 0x90, 0xE0)) or (cls == 0x2 and variation == 0x10)
+
+
+def focus_guard(packages: tuple[str, ...]) -> str:
+    """POSIX sh condition: true only while the screen is awake and one of `packages` has focus.
+
+    Mirrors parse_foreground: an in-app PopupWindow counts for the app in mFocusedApp.
+    """
+    alt = "|".join(re.escape(p) for p in packages)
+    win = r"mCurrentFocus=Window\{[0-9a-fA-F]+ (u[0-9]+ )?"
+    app = r"mFocusedApp=.*ActivityRecord\{[0-9a-fA-F]+ (u[0-9]+ )?"
+    return (
+        "d=$(dumpsys window | grep -E 'mCurrentFocus=|mFocusedApp=') && "
+        "dumpsys power 2>/dev/null | grep -m1 'mWakefulness=' | grep -q Awake && "
+        f"{{ echo \"$d\" | grep -qE '{win}({alt})/' || "
+        f"{{ echo \"$d\" | grep -qE '{win}PopupWindow:' && echo \"$d\" | grep -qE '{app}({alt})/'; }}; }}"
+    )
+
+
+def guarded(action: str, packages: tuple[str, ...]) -> str:
+    """`action` run only if focus_guard passes, in the same shell command; otherwise prints REFUSED_MARKER."""
+    return f"if {focus_guard(packages)}; then {action}; else echo {REFUSED_MARKER}; fi"
 
 
 def validate_text(text: object) -> str:
@@ -317,19 +292,12 @@ class PhoneController:
         if not (0 <= x < limit and 0 <= y < limit):
             raise CommandError("invalid_args", f"point ({x},{y}) outside screen {w}x{h}")
 
-    async def _dump_ui(self) -> bytes:
-        cmd = f"uiautomator dump {UI_DUMP_PATH} >/dev/null && cat {UI_DUMP_PATH}; rm -f {UI_DUMP_PATH}"
-        last: CommandError | None = None
-        for _ in range(2):  # uiautomator fails if the screen is animating; retry once
-            try:
-                out = await self.adb.exec_out(cmd, timeout=30)
-                if b"</hierarchy>" in out:
-                    return out
-                last = CommandError("ui_unavailable", out.decode(errors="replace").strip()[:200])
-            except CommandError as e:
-                last = CommandError("ui_unavailable", e.detail)
-            await asyncio.sleep(0.5)
-        raise last or CommandError("ui_unavailable")
+    async def _guarded(self, action: str, packages: tuple[str, ...] | None = None, timeout: float = ADB_TIMEOUT_S) -> str:
+        """Run `action` on the phone only while an allowed app has focus (checked in the same command)."""
+        out = await self.adb.shell(guarded(action, packages or self.allowlist), timeout=timeout)
+        if REFUSED_MARKER in out:
+            raise CommandError("foreground_not_allowed", "focus changed before the action ran")
+        return out
 
     # ---- commands ----
 
@@ -341,7 +309,6 @@ class PhoneController:
         handler = {
             "state": self.cmd_state,
             "screenshot": self.cmd_screenshot,
-            "ui": self.cmd_ui,
             "tap": self.cmd_tap,
             "swipe": self.cmd_swipe,
             "type": self.cmd_type,
@@ -369,7 +336,9 @@ class PhoneController:
     async def cmd_screenshot(self, args: dict) -> dict:
         scale = _scale(args, 0.5)
         fg = await self.require_allowed()
-        png = await self.adb.exec_out("screencap -p", timeout=30)
+        png = await self.adb.exec_out(guarded("screencap -p", self.allowlist), timeout=30)
+        if png.startswith(REFUSED_MARKER.encode()):
+            raise CommandError("foreground_not_allowed", "focus changed before the capture")
         if not png.startswith(b"\x89PNG"):
             raise CommandError("device_error", "screencap did not return a PNG")
         # Re-check: if the foreground changed while capturing, discard the image.
@@ -387,19 +356,12 @@ class PhoneController:
         img.convert("RGB").save(buf, "JPEG", quality=JPEG_QUALITY, optimize=True)
         return _image_result(buf.getvalue(), "image/jpeg", img.size[0], img.size[1], rw, rh, scale, fg)
 
-    async def cmd_ui(self, args: dict) -> dict:
-        fg = await self.require_allowed()
-        xml_bytes = await self._dump_ui()
-        await self.require_allowed()
-        elements = parse_ui(xml_bytes, self.allowlist)
-        return {"foreground": fg, "count": len(elements), "elements": elements}
-
     async def cmd_tap(self, args: dict) -> dict:
         scale = _scale(args)
         x, y = _coord(args, "x", scale), _coord(args, "y", scale)
         await self._check_point(x, y)
         await self.require_allowed()
-        await self.adb.shell(f"input tap {x} {y}")
+        await self._guarded(f"input tap {x} {y}")
         return {"x": x, "y": y}
 
     async def cmd_swipe(self, args: dict) -> dict:
@@ -412,39 +374,54 @@ class PhoneController:
         await self._check_point(x1, y1)
         await self._check_point(x2, y2)
         await self.require_allowed()
-        await self.adb.shell(f"input swipe {x1} {y1} {x2} {y2} {ms}", timeout=ADB_TIMEOUT_S + ms / 1000)
+        await self._guarded(f"input swipe {x1} {y1} {x2} {y2} {ms}", timeout=ADB_TIMEOUT_S + ms / 1000)
         return {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "ms": ms}
+
+    async def text_field(self) -> tuple[str, int] | None:
+        """(package, inputType) of the focused text field, read without uiautomator."""
+        return parse_editor_info(await self.adb.shell("dumpsys input_method | grep -A12 'curEditorInfo:'"))
 
     async def cmd_type(self, args: dict) -> dict:
         quoted = escape_text(args.get("text"))  # validates
-        await self.require_allowed()
-        if focused_password_field(await self._dump_ui()):
+        fg = await self.require_allowed()
+        field = await self.text_field()
+        if field is None or field[0] != fg or field[1] == 0:
+            raise CommandError("no_text_field", f"no focused text field in {fg}")
+        if is_password_type(field[1]):
             raise CommandError("password_field", "refusing to type into a password field")
-        await self.require_allowed()
-        await self.adb.shell(f"input text {quoted}", timeout=45)
+        await self._guarded(f"input text {quoted}", timeout=45)
         return {"length": len(args["text"])}
 
     async def cmd_key(self, args: dict) -> dict:
         key = args.get("key")
         if key not in KEYCODES:
             raise CommandError("invalid_args", f"key must be one of: {', '.join(KEYCODES)}")
-        if key != "home":  # Home is always allowed so the agent can leave a screen
-            await self.require_allowed()
-        await self.adb.shell(f"input keyevent {KEYCODES[key]}")
+        # Home is guarded too: never press it over another app (e.g. a widget's automation in front).
+        await self.require_allowed()
+        await self._guarded(f"input keyevent {KEYCODES[key]}")
         return {"key": key}
 
     async def cmd_launch(self, args: dict) -> dict:
         package = args.get("package")
         if package not in self.allowlist:
             raise CommandError("invalid_args", f"package must be one of: {', '.join(self.allowlist)}")
+        # Start only from an allowed app or the home screen, never over anything else.
+        from_packages = self.allowlist + HOME_PACKAGES
+        fg, wake = await self.foreground_and_wake()
+        if wake is not None and wake != "Awake":
+            raise CommandError("screen_off", f"wakefulness={wake}")
+        if fg not in from_packages:
+            raise CommandError("foreground_not_allowed", f"foreground={fg}")
         out = await self.adb.shell(
             f"cmd package resolve-activity --brief -c android.intent.category.LAUNCHER {shlex.quote(package)}"
         )
         component = next((ln.strip() for ln in reversed(out.splitlines()) if ln.strip().startswith(package + "/")), None)
         if component:
-            await self.adb.shell(f"am start -W -n {shlex.quote(component)}", timeout=30)
+            await self._guarded(f"am start -W -n {shlex.quote(component)}", from_packages, timeout=30)
         else:
-            out = await self.adb.shell(f"monkey -p {shlex.quote(package)} -c android.intent.category.LAUNCHER 1")
+            out = await self._guarded(
+                f"monkey -p {shlex.quote(package)} -c android.intent.category.LAUNCHER 1", from_packages
+            )
             if "Events injected: 1" not in out:
                 raise CommandError("launch_failed", out.strip()[-200:])
         return {"package": package}
@@ -595,6 +572,15 @@ async def selftest(controller: PhoneController) -> int:
     if not state["foreground_allowed"]:
         print("FAIL: open Chrome or Gmail on the phone, then re-run the self-test")
         return 1
+    # The guard with a harmless action: proves the on-phone focus check works in this shell.
+    probe = await controller.adb.shell(guarded("echo GUARD_OK", controller.allowlist))
+    if "GUARD_OK" in probe:
+        print("input guard: passes while", state["foreground"], "has focus")
+    else:
+        ok = False
+        print("FAIL input guard: refused although an allowed app has focus:", probe.strip()[:200])
+    field = await controller.text_field()
+    print("text field:", "none" if field is None else f"package={field[0]} inputType={field[1]:#x} password={is_password_type(field[1])}")
     try:
         shot = await controller.cmd_screenshot({"scale": 0.5})
         ext = "jpg" if shot["mime"] == "image/jpeg" else "png"
@@ -608,14 +594,6 @@ async def selftest(controller: PhoneController) -> int:
     except CommandError as e:
         ok = False
         print("FAIL screenshot:", e)
-    try:
-        ui = await controller.cmd_ui({})
-        print(f"ui: {ui['count']} elements; first few:")
-        for el in ui["elements"][:8]:
-            print("   ", json.dumps(el))
-    except CommandError as e:
-        ok = False
-        print("FAIL ui:", e)
     print("self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
