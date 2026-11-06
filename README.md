@@ -11,7 +11,7 @@ Phone: the Phone Relay app (or phone_client.py + adb) --outbound WSS, device tok
 ```
 
 Two clients speak the same protocol to the relay; one is connected at a time:
-- **The Android app** (`android/`, recommended): always on, with nothing to start. It runs on mobile data, comes back by itself after a reboot or an update, and the owner turns it on and off from the phone (a Quick Settings tile, its notification, the app). It drives the phone through its own accessibility service, and does what only the shell user can (Chrome DevTools, any key, typing with no field focused) through its own adb connection to the phone's wireless debugging, once paired, on Wi-Fi.
+- **The Android app** (`android/`, recommended): always on, with nothing to start. It runs on mobile data, comes back by itself after an update, and after a reboot once the phone has first been unlocked (untested), and the owner turns it on and off from the phone (a Quick Settings tile, its notification, the app). It drives the phone through its own accessibility service, and does what only the shell user can (Chrome DevTools, any key, typing with no field focused) through its own adb connection to the phone's wireless debugging, once paired, on Wi-Fi.
 - **The adb client** (`phone/phone_client.py`, in Termux or on a computer over wireless debugging): every command, the shell-only ones too (Chrome DevTools, any key, typing with no field focused), but only while wireless debugging is on, so on Wi-Fi, and set up again after each reboot.
 
 The design and its reasoning are in [docs/PLAN.md](docs/PLAN.md). This README covers setup and use. Phases 0-5 of the plan are built (phase 5, the native app, after the owner asked for an always-on client), without the plan's app allowlist, key deny list, rate limits and input limits: those were removed later (see [docs/CAPABILITIES.md](docs/CAPABILITIES.md)). Phase 6 (MCP, custom domain) was dropped.
@@ -25,8 +25,9 @@ The design and its reasoning are in [docs/PLAN.md](docs/PLAN.md). This README co
 | `android/` | The Android app (Kotlin, Compose): its commands (`commands/`, tested on the JVM with a fake phone), the accessibility service, the relay connection |
 | `phone/phone_client.py` | Phone client for Termux (Python, single file) |
 | `phone/helper/` | The helper the client runs on the phone with `app_process`: Java source, `build.py`, and the built `phone-relay-helper.jar` |
-| `phone/tests/` | Phone client unit tests, plus `fake_adb.py` |
+| `phone/tests/` | Phone client unit tests, plus `fake_adb.py`, and the tests of `scripts/phone.py` |
 | `scripts/e2e_test.py` | Local end-to-end test: `wrangler dev` + phone client + fake adb |
+| `scripts/phone.py` | Calls the agent API from a session on your own computer, sending the agent token from `PHONE_RELAY_AGENT_TOKEN` |
 | `docs/AGENT_INSTRUCTIONS.md` | Instructions to give Claude |
 | `docs/PHONE_RULES.md` | The owner's rules for the phone, from their own instructions; the relay serves them to the agent |
 | `docs/CAPABILITIES.md` | What the agent can do, what is restricted and what is not built |
@@ -99,7 +100,7 @@ For **Chrome DevTools, any key and typing with no field focused**, the app needs
 2. In the app, under **Shell access**, tap **Pair**. A "Pair Phone Relay's shell" notification appears and Developer options opens. Tap **Wireless debugging > Pair device with pairing code** (leave the code showing), pull down the shade, tap **Pairing code** on the notification, and type the six digits. It then says "Paired". Once is enough: the app keeps its own key.
 3. Optional, so the app can switch wireless debugging back on by itself when Android has turned it off (Android 17's documentation says it turns it off on networks you have not allowed it on, and it can be off after a reboot) (once, from your computer): `adb shell pm grant com.thomaswcode.phonerelay android.permission.WRITE_SECURE_SETTINGS`. Without it, you switch wireless debugging on yourself after a reboot.
 
-Turn **Relay** on at the top. It stays as you leave it: on again after a reboot, an update of the app, or Android rebinding its accessibility service, with nothing to start. To turn it off or on from anywhere: the **Phone Relay** Quick Settings tile (edit the tiles and drag it in), or **Turn off** on its notification. Off means no connection at all.
+Turn **Relay** on at the top. It stays as you leave it: on again after an update of the app or Android rebinding its accessibility service, and after a reboot as soon as you first unlock the phone (Android starts apps only then; not yet tested), with nothing to start. To turn it off or on from anywhere: the **Phone Relay** Quick Settings tile (edit the tiles and drag it in), or **Turn off** on its notification. Off means no connection at all.
 
 What the app does differently from the adb client: see [docs/CAPABILITIES.md](docs/CAPABILITIES.md#two-clients).
 
@@ -183,6 +184,19 @@ The stop file is `~/STOP_PHONE_AGENT` on the computer (`$HOME\STOP_PHONE_AGENT` 
    - `GET /docs/PHONE_RULES.md`: [docs/PHONE_RULES.md](docs/PHONE_RULES.md), followed by your private notes if you have set them (section 4)
 
    Tell the session, for example: *Before using the phone, run `curl -sS https://WORKER_HOST/` and follow it.* The files are bundled at deploy time, so run `npx wrangler deploy` again after changing them.
+
+### Sessions on your own computer
+
+A session outside the cloud environment has no network secret, so it sends the agent token itself. Keep the token in the environment variable `PHONE_RELAY_AGENT_TOKEN` (on Windows a user variable: PowerShell sees it, Git Bash does not) and call the API with [`scripts/phone.py`](scripts/phone.py). It prints the reply, never the token, sends the token only to the relay, and needs nothing installed (Python 3.10 or later, standard library only):
+
+```bash
+python scripts/phone.py GET /state
+python scripts/phone.py GET "/screenshot?scale=0.4" -o screen.jpg
+python scripts/phone.py POST /tap '{"x":540,"y":1170,"if_foreground":"com.android.chrome"}'
+python scripts/phone.py POST "/files/push?path=/sdcard/Download/notes.txt" --data-file notes.txt
+```
+
+The relay's address is `RELAY_URL` in `phone/.env`, or `PHONE_RELAY_URL`. This is the way to drive the phone from a local session: the commands are guarded (`if_foreground`), logged and covered by the off switch. Use `adb` from the computer for building, installing and diagnosing (it needs wireless debugging, and has no guard or log). Don't run `phone/phone_client.py` while the app is on: the relay keeps one phone connection, and each client would replace the other. The admin token stays out of Claude sessions.
 
 ## 4. Owner controls (admin token: run these from your own machine, never in a Claude session)
 
@@ -301,7 +315,7 @@ Not yet tested, because it needs the real phone and account (phase 4 of the plan
 
 ## 7. Security notes and known gaps
 
-- **The app's off switch**: the tile, the notification and the app's own switch all turn the relay off on the phone itself: the socket closes and nothing reconnects until it is turned on again there. `/admin/disable` still works from your computer.
+- **The app's off switch**: the tile, the notification and the app's own switch all turn the relay off on the phone itself: the socket closes and nothing reconnects until it is turned on again there. `/admin/disable` still works from your computer. All of these end the relay's path to the phone only: `adb` from your computer is a separate door and keeps working.
 - **The app and `if_foreground`**: the app checks the foreground just before acting, a few milliseconds ahead. A focus change in those milliseconds can still let an action land in another app. The adb client's guard runs both in one shell command, but `input` (a Java program) takes a moment to start after the check, so its gap is longer.
 - **No allowlist**: the agent can do anything a person holding the unlocked phone can do, in any app (banking, messaging, Settings included), and press any key, power included. What stands between a session and the phone is the agent token (held by the network secret, never inside the session), the kill switches and the owner's rules in [docs/PHONE_RULES.md](docs/PHONE_RULES.md), which are guidance only.
 - **`if_foreground`**: the old allowlist's same-command guard, now opt-in. `if <named app focused and screen awake>; then <action>; else echo PHONE_RELAY_REFUSED; fi` runs on the phone, so a focus change between the agent's check and its action is refused. A change in the moment between the check and `input` acting (it takes a moment to start) is still possible. Focused in-app popups (`PopupWindow:…`) count for the app in `mFocusedApp`.
