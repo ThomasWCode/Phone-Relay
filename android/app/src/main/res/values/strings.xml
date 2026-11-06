@@ -1,12 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Phone Relay</string>
-    <string name="accessibility_description">Lets the owner\'s agent, through their Phone Relay, see the screen, touch, type and use apps on this phone, while the relay is on. Turn the relay off from the Quick Settings tile, the notification or the app.</string>
+    <string name="accessibility_description">Lets the owner\'s agent, through their Phone Relay, see the screen, touch, type and use apps on this phone, while the relay is on. Turn the relay off from the Quick Settings tile, the home screen widget, the notification or the app.</string>
     <string name="channel_name">Relay</string>
     <string name="channel_description">Shown while the relay is on</string>
     <string name="notification_title">Phone Relay is on</string>
     <string name="turn_off">Turn off</string>
     <string name="off">Off</string>
+    <string name="widget_description">The relay on or off with one tap</string>
+    <string name="widget_state">Phone Relay: %1$s</string>
     <string name="pairing_channel">Pairing</string>
     <string name="pairing_title">Pair Phone Relay\'s shell</string>
     <string name="pairing_how">In Wireless debugging, tap Pair device with pairing code, then come back here and type the code.</string>

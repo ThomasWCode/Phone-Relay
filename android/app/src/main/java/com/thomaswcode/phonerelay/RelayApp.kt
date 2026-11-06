@@ -24,7 +24,7 @@ class RelayApp : Application() {
     lateinit var shell: AdbShell
         private set
     private lateinit var _enabled: MutableStateFlow<Boolean>
-    /** Whether the owner has the relay on, wherever it was switched (the app, the tile, the notification). */
+    /** Whether the owner has the relay on, wherever it was switched (the app, the tile, the widget, the notification). */
     val enabled: StateFlow<Boolean> get() = _enabled
 
     override fun onCreate() {
@@ -40,12 +40,13 @@ class RelayApp : Application() {
         connection = RelayConnection(prefs, commands, BuildConfig.VERSION_NAME, scope)
     }
 
-    /** The owner's switch (the app's screen, the Quick Settings tile, the notification): kept across reboots. */
+    /** The owner's switch (the app's screen, the Quick Settings tile, the home screen widget, the notification): kept across reboots. */
     fun setEnabled(on: Boolean) {
         prefs.enabled = on
         _enabled.value = on
         if (on) RelayService.start(this) else RelayService.stop(this)
         TileService.requestListeningState(this, ComponentName(this, ToggleTile::class.java))
+        ToggleWidget.refresh(this)
     }
 
     companion object {

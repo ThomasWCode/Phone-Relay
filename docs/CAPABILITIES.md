@@ -14,7 +14,7 @@ The phone side is either the **Android app** (always on; it drives the phone thr
 | | Android app | adb client |
 |---|---|---|
 | Runs | Always, on any network; back by itself after an update, and after a reboot once the phone has first been unlocked (Android starts apps only then; not yet tested) | Only while wireless debugging is on (Wi-Fi); started again after each reboot |
-| Off switch on the phone | Quick Settings tile, notification, the app | The stop file |
+| Off switch on the phone | Quick Settings tile, home screen widget, notification, the app | The stop file |
 | `if_foreground` | Checked just before the action, milliseconds ahead of it | Checked in the same shell command as the action, which still leaves a gap: `input` (a Java program) takes a moment to start |
 | Typing | Into the focused field through the app's own input connection, as a keyboard types; with none focused, ASCII only, through the shell bridge (409 `no_text_field` otherwise) | Anywhere, as key events (`input text`), pasting what is not ASCII |
 | Keys | Back, Home, Recents, the shade, power (locks; held: the power menu), wake, d-pad, volume, media, page up/down; while a field is focused, any key; any other key through the shell bridge (below) | Any key |
@@ -91,7 +91,7 @@ Gestures, the clipboard, pasted text, audio and the UI tree go through a small J
 | # | Restriction | Where | Why |
 |---|---|---|---|
 | 1 | Tokens: the agent token cannot use the admin or device endpoints | Worker | The agent cannot switch the relay back on, read the log, change the owner's notes or pose as the phone |
-| 2 | Owner kill switches: `/admin/disable`, the app's switch (tile, notification, app) and the adb client's stop file | Worker + client | The owner's off switch. They end the relay's path to the phone, not `adb` from the owner's own computer |
+| 2 | Owner kill switches: `/admin/disable`, the app's switch (tile, widget, notification, app) and the adb client's stop file | Worker + client | The owner's off switch. They end the relay's path to the phone, not `adb` from the owner's own computer |
 | 3 | One phone, one command at a time | Worker + client | Actions must not interleave; a second phone connection replaces the first |
 
 Requests are still checked for shape, in the Worker and again on the phone: numbers must be numbers, package and key names must match their patterns, and text typed as keys (`method: keys`) must be ASCII; anything else is pasted. That keeps values out of the shell's syntax; it refuses no action.
