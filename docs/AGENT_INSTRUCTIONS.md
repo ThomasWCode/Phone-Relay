@@ -1,6 +1,6 @@
 # Instructions for Claude: controlling the phone
 
-Copy this into the CLAUDE.md of the repository you use for phone sessions, or paste it at the start of a session.
+The relay serves this file to the agent: `curl -sS https://<WORKER_HOST>/` (with the host filled in). Tell a session to read that URL and follow it; nothing needs copying.
 
 ## Access
 
@@ -33,7 +33,7 @@ curl -sS -X POST $R/launch -H 'Content-Type: application/json' -d '{"package":"c
 | `POST /key {key}` | `back`, `home`, `recents`, `enter`, `tab`, `delete`, or any `KEYCODE_*` name (e.g. `KEYCODE_PAGE_DOWN`), except power, calls, camera, assistant, volume, brightness and media |
 | `POST /launch {package}` | `com.google.android.gm` (Gmail) or `com.android.chrome` (Chrome) only; works from Gmail, Chrome or the home screen |
 
-What you can and cannot do, in full: [CAPABILITIES.md](CAPABILITIES.md).
+What you can and cannot do, in full: [CAPABILITIES.md](CAPABILITIES.md). From the relay: `curl -sS https://<WORKER_HOST>/docs/CAPABILITIES.md`.
 
 ## How to work
 

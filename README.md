@@ -122,7 +122,11 @@ The stop file is `~/STOP_PHONE_AGENT` on the computer (`$HOME\STOP_PHONE_AGENT` 
    env | grep -ci bearer     # expect 0: the token is not in the session
    ```
    A `403` with `error code: 1010` (not the relay's JSON `401`) is Cloudflare's bot check rejecting the client's `User-Agent`. Python's `urllib` default is rejected; `curl` and the phone client are not. Set a `User-Agent` header.
-5. Give Claude [docs/AGENT_INSTRUCTIONS.md](docs/AGENT_INSTRUCTIONS.md). For example, copy it into the CLAUDE.md of the repository you start phone sessions from, with `WORKER_HOST` filled in.
+5. Point Claude at the instructions. The relay serves them behind the agent token, so in the phone environment a session can read them with no copying and no extra hosts:
+   - `GET /` and `GET /docs/AGENT_INSTRUCTIONS.md`: [docs/AGENT_INSTRUCTIONS.md](docs/AGENT_INSTRUCTIONS.md), with `<WORKER_HOST>` replaced by the relay's host
+   - `GET /docs/CAPABILITIES.md`: [docs/CAPABILITIES.md](docs/CAPABILITIES.md)
+
+   Tell the session, for example: *Before using the phone, run `curl -sS https://WORKER_HOST/` and follow it.* The files are bundled at deploy time, so run `npx wrangler deploy` again after changing them.
 
 ## 4. Owner controls (admin token: run these from your own machine, never in a Claude session)
 

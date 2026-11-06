@@ -119,6 +119,18 @@ def main():
         check("wrong method -> 405", request("POST", "/state", body={})[0] == 405)
         check("device endpoint needs websocket", request("GET", "/device", token=DEVICE)[0] == 426)
 
+        # ---- agent docs served by the Worker ----
+        check("docs need the agent token", request("GET", "/", token=None)[0] == 401)
+        s, h, b = request("GET", "/")
+        text = b.decode(errors="replace")
+        check("GET / serves the agent instructions",
+              s == 200 and h.get("Content-Type", "").startswith("text/markdown") and "Instructions for Claude" in text,
+              f"{s} {h.get('Content-Type')}")
+        check("instructions name the real host", f"127.0.0.1:{PORT}" in text and "<WORKER_HOST>" not in text)
+        s, _, b = request("GET", "/docs/CAPABILITIES.md")
+        check("GET /docs/CAPABILITIES.md", s == 200 and b"Actively restricted" in b, f"{s}")
+        check("docs are GET only", request("POST", "/", body={})[0] == 405)
+
         # ---- offline ----
         s, _, b = request("GET", "/state")
         check("device offline -> 503", s == 503 and j(b).get("error") == "device_offline", f"{s} {b[:200]}")
