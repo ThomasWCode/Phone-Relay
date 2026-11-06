@@ -7,10 +7,14 @@ Claude (cloud session) --HTTPS, agent token added by the network secret-->  Clou
                                                                               |
                                                                     Durable Object "primary"
                                                                               ^
-Phone (Termux: phone_client.py + adb over loopback) --outbound WSS, device token--+
+Phone: the Phone Relay app (or phone_client.py + adb) --outbound WSS, device token--+
 ```
 
-The design and its reasoning are in [docs/PLAN.md](docs/PLAN.md). This README covers setup and use. Phases 0-4 of the plan are built, without the plan's app allowlist, key deny list, rate limits and input limits: those were removed later (see [docs/CAPABILITIES.md](docs/CAPABILITIES.md)). Phases 5-6 (native app, MCP, custom domain) were dropped.
+Two clients speak the same protocol to the relay; one is connected at a time:
+- **The Android app** (`android/`, recommended): always on, with nothing to start. It runs on mobile data, comes back by itself after a reboot or an update, and the owner turns it on and off from the phone (a Quick Settings tile, its notification, the app). It drives the phone through its own accessibility service.
+- **The adb client** (`phone/phone_client.py`, in Termux or on a computer over wireless debugging): every command, the shell-only ones too (Chrome DevTools, any key, screen recording, audio, reading the clipboard), but only while wireless debugging is on, so on Wi-Fi, and set up again after each reboot.
+
+The design and its reasoning are in [docs/PLAN.md](docs/PLAN.md). This README covers setup and use. Phases 0-5 of the plan are built (phase 5, the native app, after the owner asked for an always-on client), without the plan's app allowlist, key deny list, rate limits and input limits: those were removed later (see [docs/CAPABILITIES.md](docs/CAPABILITIES.md)). Phase 6 (MCP, custom domain) was dropped.
 
 ## Layout
 
@@ -18,6 +22,7 @@ The design and its reasoning are in [docs/PLAN.md](docs/PLAN.md). This README co
 |---|---|
 | `relay/` | Cloudflare Worker + SQLite-backed Durable Object (TypeScript) |
 | `relay/test/` | Worker unit tests (vitest) |
+| `android/` | The Android app (Kotlin, Compose): its commands (`commands/`, tested on the JVM with a fake phone), the accessibility service, the relay connection |
 | `phone/phone_client.py` | Phone client for Termux (Python, single file) |
 | `phone/helper/` | The helper the client runs on the phone with `app_process`: Java source, `build.py`, and the built `phone-relay-helper.jar` |
 | `phone/tests/` | Phone client unit tests, plus `fake_adb.py` |
@@ -56,7 +61,47 @@ Quick check (expect `401`):
 curl -sS -o /dev/null -w '%{http_code}\n' https://WORKER_HOST/state
 ```
 
-## 2. Set up the phone (Samsung S24, Termux)
+## 2. Set up the phone: the Android app (recommended)
+
+Build it on your computer (JDK 17, the Android SDK; the Gradle wrapper fetches the rest):
+
+```bash
+cd android
+./gradlew assembleDebug             # app/build/outputs/apk/debug/app-debug.apk
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+The app signs with its own key, `android/app/debug.keystore`, which is git-ignored and never published: it signs an app with an accessibility service and your device token, and anyone holding a published key could build an update that installs over it and keeps those permissions. Back the key up. Without it you can't install an update over the app, only uninstall and start again. Without the file, the build uses Android's default debug key (as CI does).
+
+Give it the relay's URL and the device token without typing either: push them into the app's private storage, where the app seals the token with an Android Keystore key and deletes the file. From PowerShell, with the token in a user environment variable:
+
+```powershell
+@{ relay_url = "wss://WORKER_HOST/device"; device_token = $env:PHONE_RELAY_DEVICE_TOKEN } | ConvertTo-Json -Compress | Set-Content import.json -NoNewline
+adb push import.json /data/local/tmp/pr_import.json
+adb shell 'run-as com.thomaswcode.phonerelay cp /data/local/tmp/pr_import.json files/import.json; rm /data/local/tmp/pr_import.json'
+Remove-Item import.json
+```
+
+Then, on the phone, open **Phone Relay** and tap **Allow** on each item in "What the app needs":
+
+| Grant | For |
+|---|---|
+| Accessibility service (Settings > Accessibility > Installed apps > Phone Relay; for a sideloaded app Android may first need App info > ⋮ > Allow restricted settings) | touch, type, read the screen, screenshots |
+| Notifications | its ongoing notification |
+| Not battery-optimised | staying connected with the screen off |
+| Notification access | `/notifications` |
+| All files access | `/files`, pull and push |
+| Modify system settings | `/rotation` |
+
+Turn **Relay** on at the top. It stays as you leave it: on again after a reboot, an update of the app, or Android rebinding its accessibility service, with nothing to start. To turn it off or on from anywhere: the **Phone Relay** Quick Settings tile (edit the tiles and drag it in), or **Turn off** on its notification. Off means no connection at all.
+
+What the app does differently from the adb client: see [docs/CAPABILITIES.md](docs/CAPABILITIES.md#two-clients).
+
+## 2b. Or: the adb client (Termux, or a computer)
+
+The original client. It runs every command, the shell-only ones too, but only over wireless debugging (Wi-Fi), and it has to be started again after each reboot. Stop it before turning the app on: the relay keeps one phone connection, and a new one replaces the old.
+
+### In Termux (Samsung S24)
 
 1. **Developer options**: Settings > About phone > Software information > tap Build number seven times. Then Developer options > Wireless debugging: on (needs Wi-Fi).
 2. **Termux from F-Droid** (the Play Store build is outdated).
@@ -216,13 +261,18 @@ cd relay && npm test && npm run typecheck && cd ..
 # Phone client unit tests (fake adb; no phone needed)
 python3 -m unittest discover -s phone/tests -v
 
+# The Android app's unit tests, build and lint (JDK 17 and the Android SDK)
+cd android && ./gradlew testDebugUnitTest assembleDebug lintDebug && cd ..
+
 # End-to-end: real Worker + Durable Object in `wrangler dev`, real phone client, fake adb
 python3 scripts/e2e_test.py
 ```
 
 What the end-to-end test covers: token separation (agent, device and admin tokens cannot stand in for each other), validation, every endpoint, the docs and the owner's private notes, actions in any app (Settings, Teams, lock screen, launcher) and with the screen off, typing into password fields, typing `%`, newlines and long text, any key, launch of any app, `if_foreground` (refusals, popups, screen off), timeouts (a hung command stopped, a long one allowed), no rate limit, unknown fields named, Chrome DevTools against a fake DevTools endpoint (tabs, JavaScript, a raw call, a tab opened and closed, no forward left), opening URLs and `mailto:` links, intents, notifications, the status bar, rotation, waits, batches (and their `if_foreground`), listing files, a 3 MB push and pull compared byte for byte, empty and missing files, screen recordings (one file, and a zip past 180 s), the admin kill switch and reconnect, the stop file, a bad device token, and that typed text never reaches the log.
 
-CI (`.github/workflows/tests.yml`) runs all three on every pull request.
+CI (`.github/workflows/tests.yml`) runs all of them, the app's included, on every pull request.
+
+The app was checked on the phone through the whole stack (a local relay reached with `adb reverse`, then the live one). 43 checks covered: `/state`, screenshots and the UI tree through its accessibility service; `/open`, an intent, waits for the foreground, a settled screen and text; tapping Chrome's address bar and typing ASCII, `%` and Unicode with trailing spaces kept, then Delete; a pinch both ways and a swipe; rotation to landscape and back; the shade; notifications through its listener; a 3 MB push and pull; setting and emptying the clipboard; a batch; `if_foreground` refusing; and 501 for the adb-only commands. The relay came back by itself about 2 s after each update of the app, with every accessibility service still bound, and logcat showed no crash.
 
 Checked on a Galaxy S24 (Android 17) through the whole stack (`wrangler dev`, the phone client on a PC over wireless adb, HTTP as an agent sends it), after the allowlist was removed, every input with `if_foreground`: opening a URL and an intent, `/wait` for the foreground, a settled screen and text, screenshots, the helper's UI tree in Chrome with every accessibility service still bound during and after it, tapping and typing in Chrome's address bar (keys, then pasted Unicode, with the clipboard's old text back afterwards), setting, reading and emptying the clipboard, a two-finger pinch both ways, `/record/start`-`/record/stop` and `/record?seconds=`, 2 s of audio from the output and from the microphone, rotation to landscape and back, the shade, notifications, a 3 MB push and pull, a batch, `if_foreground` refusing, an unresolvable URL (422) and a timeout (504). Afterwards: no crash in logcat, the accessibility services enabled and bound, nothing left in `/data/local/tmp`. On that phone, `am` exits 1 for an unresolvable intent, `sha256sum` exits 1 for a missing file, and the helper needed the ActivityThread's ConfigurationController filled in for the clipboard and audio; the code allows for all three.
 
@@ -241,6 +291,8 @@ Not yet tested, because it needs the real phone and account (phase 4 of the plan
 
 ## 7. Security notes and known gaps
 
+- **The app's off switch**: the tile, the notification and the app's own switch all turn the relay off on the phone itself: the socket closes and nothing reconnects until it is turned on again there. `/admin/disable` still works from your computer.
+- **The app and `if_foreground`**: an app cannot run a check and an action in one shell command, so it checks the foreground just before acting. A focus change in those few milliseconds can still let an action land in another app. The adb client's guard runs both in one command and leaves no such gap.
 - **No allowlist**: the agent can do anything a person holding the unlocked phone can do, in any app (banking, messaging, Settings included), and press any key, power included. What stands between a session and the phone is the agent token (held by the network secret, never inside the session), the kill switches and the owner's rules in [docs/PHONE_RULES.md](docs/PHONE_RULES.md), which are guidance only.
 - **`if_foreground`**: the old allowlist's same-command guard, now opt-in. `if <named app focused and screen awake>; then <action>; else echo PHONE_RELAY_REFUSED; fi` runs on the phone, so a focus change between the agent's check and its action is refused. A change in the milliseconds inside that one command is still possible. Focused in-app popups (`PopupWindow:…`) count for the app in `mFocusedApp`.
 - **`uiautomator`**: only `/ui?engine=uiautomator` runs `uiautomator dump`, which briefly unbinds every accessibility service on the phone. The default `/ui`, and `/wait` for text, use the helper, which leaves them bound. Nothing else calls uiautomator, including `--selftest`.
@@ -256,4 +308,5 @@ Not yet tested, because it needs the real phone and account (phase 4 of the plan
 
 ## 8. Not built
 
-- Nothing from the earlier "Not built" list is left. Dropped, by the owner's choice: phase 5 (native app), phase 6 (MCP wrapper, custom domain) and a status page for the owner (open question 4 in the plan; `/admin/status` and `/admin/log` cover it).
+- Nothing from the earlier "Not built" list is left. The native app (phase 5) is built. Dropped, by the owner's choice: phase 6 (MCP wrapper, custom domain) and a status page for the owner (open question 4 in the plan; `/admin/status` and `/admin/log` cover it).
+- In the app: screen recording and audio (they need MediaProjection, with Android's consent prompt each time), reading the clipboard, and Chrome DevTools. They answer 501 `unsupported`; the adb client has them.

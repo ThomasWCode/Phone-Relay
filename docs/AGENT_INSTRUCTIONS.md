@@ -76,6 +76,7 @@ What you can and cannot do, in full: [CAPABILITIES.md](CAPABILITIES.md). From th
 
 ## How to work
 
+- **Which client is connected**: `/state`'s `client` is `android-app` (the owner's always-on app) or `termux-adb` (the adb client). The app lists what it runs in `capabilities`; it types only into a focused text field (tap one first), checks `if_foreground` just before acting rather than in the same command, and answers 501 `unsupported` for the adb client's shell-only commands (reading the clipboard, recording, audio, Chrome DevTools). [CAPABILITIES.md](CAPABILITIES.md) has the full comparison.
 - You decide how to read the screen and check your actions.
 - **Screenshots** have no side effects. If you read a coordinate off a scaled screenshot, pass the same `scale` with the tap (or multiply by `X-Screen-Width / X-Image-Width` yourself).
 - **`/ui`** gives exact element centres and text. It leaves the phone's accessibility services alone; only `engine=uiautomator` unbinds them for a moment, so use that only if the default fails (502 `helper_failed`), and say so.
@@ -89,11 +90,14 @@ What you can and cannot do, in full: [CAPABILITIES.md](CAPABILITIES.md). From th
 | 400 | `invalid_args` | Fix the request |
 | 401 | `unauthorized` | Stop and tell the user (network secret missing or wrong host) |
 | 404 | `not_found` | The file or folder does not exist (or the shell cannot read it), or `/record/stop` found no recording |
+| 409 | `no_text_field`, `gesture_cancelled` | The app: tap a text field before typing; a gesture Android cancelled (a real touch, the screen changed) can be retried once |
 | 409 | `foreground_mismatch` | The app you named with `if_foreground` was not in front (or the screen was off). Take a screenshot and work out why before you retry |
 | 422 | `launch_failed` | Nothing on the phone handles that URL or intent |
 | 502 | `helper_failed`, `helper_missing` | The helper could not do it (its reason is in `detail`). Tell the user; for `/ui`, `engine=uiautomator` is the fallback |
 | 502 | `devtools_unavailable`, `devtools_failed` | Chrome is not running or not in front (`/launch` it), or DevTools refused the call (`detail` has its error) |
-| 503 | `device_offline`, `disabled`, `stopped` | Stop and tell the user |
+| 501 | `unsupported` | The connected client cannot do this (`detail` says why). Find another way, or tell the user |
+| 503 | `device_offline`, `disabled`, `stopped` | Stop and tell the user. The owner may have turned the relay off on the phone |
+| 503 | `permission_missing` | The app lacks a grant (`detail` names it): tell the user; only they can give it |
 | 504 | `timeout`, `device_timeout` | The command ran past its deadline. Retry once, with a larger `timeout` if the work is slow, then tell the user |
 | 502 | other device error | Retry once, then tell the user |
 
