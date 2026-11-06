@@ -1,0 +1,15 @@
+// Copy to wrangler.jsonc and change "name" to something non-guessable,
+// for example phone-relay-<random>. wrangler.jsonc is git-ignored so the
+// real name stays out of the repository.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "phone-relay-example",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": true,
+  "preview_urls": false,
+  "durable_objects": {
+    "bindings": [{ "name": "DEVICE_HUB", "class_name": "DeviceHub" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["DeviceHub"] }]
+}

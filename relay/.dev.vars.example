@@ -1,0 +1,5 @@
+# Local development secrets for `wrangler dev` only. Copy to .dev.vars.
+# Each token must be at least 32 characters: openssl rand -hex 32
+AGENT_TOKEN=
+DEVICE_TOKEN=
+ADMIN_TOKEN=
