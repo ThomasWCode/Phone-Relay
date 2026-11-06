@@ -107,6 +107,38 @@ class FakeDevice : Device {
         clip = text
     }
 
+    override suspend fun readClipboard(): String? = clip
+
+    val recordings = mutableListOf<Triple<Double, Size?, Int>>()
+    var recordingNow = false
+    var captureEnded = 0
+    override suspend fun startRecording(seconds: Double, size: Size?, bitRate: Int) {
+        recordings += Triple(seconds, size, bitRate)
+        files[RECORDING] = "mp4 bytes".toByteArray()
+        recordingNow = true
+    }
+
+    override suspend fun stopRecording(): String? {
+        if (!recordingNow) return null
+        recordingNow = false
+        return RECORDING
+    }
+
+    val audioTaken = mutableListOf<Pair<Double, String>>()
+    override suspend fun recordAudio(seconds: Double, source: String): String {
+        audioTaken += seconds to source
+        files[AUDIO] = Wav.header(4) + ByteArray(4)
+        return AUDIO
+    }
+
+    override fun ownFileSize(path: String): Long = files[path]?.size?.toLong() ?: 0
+
+    override fun endCapture() {
+        captureEnded++
+        recordingNow = false
+        files.remove(RECORDING)
+    }
+
     val volume = mutableListOf<Int>()
     override fun adjustVolume(direction: Int) {
         volume += direction
@@ -164,6 +196,7 @@ class FakeDevice : Device {
 
     override fun deleteFile(path: String) {
         written.remove(path)
+        if (path == RECORDING || path == AUDIO) files.remove(path)
     }
 
     override fun scanFile(path: String) {
@@ -171,10 +204,13 @@ class FakeDevice : Device {
     }
 
     companion object {
+        const val RECORDING = "/data/user/0/com.thomaswcode.phonerelay/cache/record.mp4"
+        const val AUDIO = "/data/user/0/com.thomaswcode.phonerelay/cache/audio.wav"
+
         fun node(
             pkg: String, text: String, desc: String = "", id: String = "", cls: String = "android.widget.TextView",
             editable: Boolean = false, focused: Boolean = false, visible: Boolean = true,
-            bounds: IntArray = intArrayOf(0, 80, 1080, 2340), children: List<UiNode> = emptyList(),
+            bounds: IntArray = intArrayOf(0, 80, 1080, 2340), children: List<UiNode> = emptyList(), clickable: Boolean = editable,
         ): UiNode = object : UiNode {
             override val text = text
             override val desc = desc
@@ -182,7 +218,7 @@ class FakeDevice : Device {
             override val className = cls
             override val pkg = pkg
             override val bounds = bounds
-            override val clickable = editable
+            override val clickable = clickable
             override val scrollable = false
             override val editable = editable
             override val focused = focused

@@ -109,6 +109,18 @@ interface Device {
     fun paste(text: String)
     /** Puts `text` on the clipboard, or empties it for null. */
     fun setClipboard(text: String?)
+    /** The clipboard's text, or null. Android lets only the app in front read it, so the app comes forward for a moment. */
+    suspend fun readClipboard(): String?
+    /** Starts recording the screen to a file, for at most `seconds`. */
+    suspend fun startRecording(seconds: Double, size: Size?, bitRate: Int)
+    /** Stops the recording and gives its MP4 file's path, or null if there is none. */
+    suspend fun stopRecording(): String?
+    /** Records `seconds` of the phone's sound output ("output") or its microphone ("mic") to a WAV file; its path. */
+    suspend fun recordAudio(seconds: Double, source: String): String
+    /** The size of a file the app wrote for itself (a recording); openRead and deleteFile take it too. */
+    fun ownFileSize(path: String): Long
+    /** Stops any recording and deletes it: the owner's kill switches and a closed connection end capture. */
+    fun endCapture()
     /** AudioManager.ADJUST_RAISE (1), ADJUST_LOWER (-1), ADJUST_TOGGLE_MUTE (101). */
     fun adjustVolume(direction: Int)
     fun mediaKey(keyName: String)

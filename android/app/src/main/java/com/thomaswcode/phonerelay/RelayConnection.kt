@@ -186,6 +186,7 @@ class RelayConnection(
             worker.cancel()
             queue.close()
             socket.cancel()
+            runCatching { commands.closed() }.onFailure { Log.w(TAG, "could not end a capture", it) }
         }
     }
 

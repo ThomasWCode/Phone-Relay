@@ -12,6 +12,7 @@ import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.yield
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.int
@@ -48,7 +49,7 @@ class CommandsTest {
         val texts = ui["elements"]!!.jsonArray.map { it.jsonObject.str("text") }
         assertEquals(listOf("Hello & welcome", ""), texts) // the invisible node and its child are dropped
         assertEquals("url_bar", ui["elements"]!!.jsonArray[1].jsonObject.str("id"))
-        assertEquals("unsupported", error("ui", """{"engine": "uiautomator"}""").code)
+        assertEquals(texts.size, run("ui", """{"engine": "uiautomator"}""")["count"]!!.jsonPrimitive.int)
     }
 
     @Test
@@ -194,8 +195,64 @@ class CommandsTest {
 
     @Test
     fun adbOnlyCommandsAreUnsupported() = runTest {
-        for (cmd in listOf("clipboard_get", "record_start", "audio", "chrome_eval")) assertEquals("unsupported", error(cmd).code, cmd)
+        for (cmd in listOf("chrome_eval", "chrome_tabs")) assertEquals("unsupported", error(cmd).code, cmd)
         assertEquals("invalid_args", error("shell").code)
+    }
+
+    @Test
+    fun theClipboardIsReadAndBothUiEnginesAreTheTree() = runTest {
+        assertEquals("old", run("clipboard_get").str("text"))
+        device.clip = null
+        assertEquals(JsonNull, run("clipboard_get")["text"])
+        assertEquals(run("ui")["count"], run("ui", """{"engine": "uiautomator"}""")["count"])
+        assertEquals("invalid_args", error("ui", """{"engine": "xml"}""").code)
+    }
+
+    private fun sink(sent: MutableList<JsonObject>) = Stream("r") { sent += it }
+
+    @Test
+    fun recordingStartsStopsAndStreamsItsVideo() = runTest {
+        val started = run("record_start", """{"seconds": 5, "size": "720x1560", "bit_rate": 4000000}""")
+        assertEquals(JsonPrimitive(true), started["recording"])
+        assertEquals(Triple(5.0, Size(720, 1560), 4_000_000), device.recordings.last())
+        val sent = mutableListOf<JsonObject>()
+        val stopped = commands.handle("record_stop", args("{}"), sink(sent))
+        assertEquals(1, stopped["segments"]!!.jsonPrimitive.int)
+        assertEquals("video/mp4", sent.first().str("mime"))
+        assertEquals("1", sent.first()["headers"]!!.jsonObject.str("X-Segments"))
+        assertEquals("mp4 bytes", String(Base64.getDecoder().decode(sent.first { it.str("type") == "chunk" }.str("data"))))
+        assertTrue(FakeDevice.RECORDING !in device.files) // sent, then deleted
+        assertEquals("not_found", assertFailsWith<CommandError> { commands.handle("record_stop", args("{}"), sink(sent)) }.code)
+        // /record: start, the wait, stop; the default bit rate as the adb client's.
+        val whole = commands.handle("record", args("""{"seconds": 2}"""), sink(mutableListOf()))
+        assertEquals(1, whole["segments"]!!.jsonPrimitive.int)
+        assertEquals(Triple(2.0, null, Commands.RECORD_BIT_RATE), device.recordings.last())
+        for (bad in listOf("""{"seconds": 0}""", """{"size": "720"}""", """{"size": 720}""", """{"bit_rate": "x"}""", """{"bit_rate": 0}""")) {
+            assertEquals("invalid_args", error("record_start", bad).code, bad)
+        }
+    }
+
+    @Test
+    fun audioIsStreamedAsWav() = runTest {
+        val sent = mutableListOf<JsonObject>()
+        val r = commands.handle("audio", args("""{"seconds": 2, "source": "mic"}"""), sink(sent))
+        assertEquals("mic", r.str("source"))
+        assertEquals(48, r["bytes"]!!.jsonPrimitive.int)
+        assertEquals("audio/wav", sent.first().str("mime"))
+        assertEquals("mic", sent.first()["headers"]!!.jsonObject.str("X-Audio-Source"))
+        assertEquals(2.0 to "mic", device.audioTaken.last())
+        commands.handle("audio", args("{}"), sink(mutableListOf()))
+        assertEquals(10.0 to "output", device.audioTaken.last())
+        assertTrue(FakeDevice.AUDIO !in device.files)
+        assertEquals("invalid_args", assertFailsWith<CommandError> { commands.handle("audio", args("""{"source": "speaker"}"""), sink(sent)) }.code)
+    }
+
+    @Test
+    fun aClosedConnectionEndsTheCapture() = runTest {
+        run("record_start")
+        commands.closed()
+        assertEquals(1, device.captureEnded)
+        assertEquals("not_found", assertFailsWith<CommandError> { commands.handle("record_stop", args("{}"), sink(mutableListOf())) }.code)
     }
 
     @Test
@@ -206,6 +263,9 @@ class CommandsTest {
         run("tap", """{"x": 1, "y": 1, "timeout": 86400}""")
         assertEquals("invalid_args", error("tap", """{"x": 1, "y": 1, "timeout": 0}""").code)
         assertEquals(130.0, defaultTimeout("type", args("""{"text": "${"x".repeat(1000)}"}""")))
+        assertEquals(60.0 + 40, defaultTimeout("record", args("""{"seconds": 20}""")))
+        assertEquals(60.0 + 20, defaultTimeout("audio", args("{}")))
+        assertEquals(TRANSFER_TIMEOUT_S, defaultTimeout("record_stop", args("{}")))
         assertEquals(30.0 + 30 + 2 + 5, defaultTimeout("batch", args("""{"steps": [{"cmd": "tap", "args": {}}, {"cmd": "sleep", "args": {"ms": 2000}}, {"cmd": "key", "args": {"timeout": 5}}]}""")))
     }
 
@@ -376,5 +436,72 @@ class UiTreeTest {
         val els = UiTree.elements(roots)
         assertEquals(listOf("ok"), els.map { (it["text"] as JsonPrimitive).content })
         assertEquals(JsonArray(listOf(JsonPrimitive(5), JsonPrimitive(5))), els[0]["center"])
+    }
+}
+
+class PathsTest {
+    private val corner = listOf(Point(0f, 0f), Point(100f, 0f), Point(100f, 100f))
+
+    @Test
+    fun aLongGestureSplitsIntoSlicesThatMeet() {
+        assertEquals(1, Paths.slices(1, 60_000))
+        assertEquals(1, Paths.slices(60_000, 60_000))
+        assertEquals(2, Paths.slices(60_001, 60_000))
+        assertEquals(3, Paths.slices(150_000, 60_000))
+        assertEquals(listOf(Point(0f, 0f), Point(100f, 0f)), Paths.slice(corner, 0.0, 0.5))
+        assertEquals(listOf(Point(100f, 0f), Point(100f, 100f)), Paths.slice(corner, 0.5, 1.0))
+        assertEquals(corner, Paths.slice(corner, 0.0, 1.0))
+        val n = 3
+        val parts = (0 until n).map { Paths.slice(corner, it.toDouble() / n, (it + 1).toDouble() / n) }
+        for (i in 0 until n - 1) assertEquals(parts[i].last(), parts[i + 1].first())
+        assertEquals(listOf(Point(5f, 5f)), Paths.slice(listOf(Point(5f, 5f)), 0.25, 0.5)) // a held finger
+    }
+}
+
+class MediaTest {
+    @Test
+    fun wavHeader() {
+        val h = Wav.header(192_000)
+        assertEquals(44, h.size)
+        assertEquals("RIFF", String(h, 0, 4))
+        assertEquals("WAVEfmt ", String(h, 8, 8))
+        assertEquals("data", String(h, 36, 4))
+        fun le(at: Int, n: Int) = (0 until n).sumOf { (h[at + it].toLong() and 0xFF) shl (8 * it) }
+        assertEquals(36L + 192_000, le(4, 4))
+        assertEquals(48_000L, le(24, 4))
+        assertEquals(192_000L, le(40, 4))
+        assertEquals(192_000L, Wav.dataBytes(1.0))
+    }
+
+    @Test
+    fun videoSizeFitsTheEncoder() {
+        assertEquals(Size(1072, 2336), Video.fit(Size(1080, 2340), 16, 16) { _, _ -> true })
+        assertEquals(Size(810, 1754), Video.fit(Size(1080, 2340), 2, 2) { _, h -> h <= 1920 })
+        assertEquals(null, Video.fit(Size(1080, 2340), 2, 2) { _, _ -> false })
+    }
+}
+
+class ConsentTest {
+    private fun prompt(pkg: String = Consent.SYSTEM_UI, title: String = "Start recording or casting with Phone Relay?", start: UiNode) =
+        FakeDevice.node(pkg, "", children = listOf(
+            FakeDevice.node(pkg, title),
+            FakeDevice.node(pkg, "Cancel", id = "$pkg:id/button_cancel", clickable = true),
+            start,
+        ))
+
+    @Test
+    fun onlyTheAppsPromptsStartButtonIsPressed() {
+        val start = FakeDevice.node(Consent.SYSTEM_UI, "Start", clickable = true)
+        assertEquals(start, Consent.startButton(prompt(start = start), "Phone Relay"))
+        assertEquals(null, Consent.startButton(prompt(title = "Start recording or casting with Another App?", start = start), "Phone Relay"))
+        val elsewhere = FakeDevice.node("com.example.app", "Start", clickable = true)
+        assertEquals(null, Consent.startButton(prompt(pkg = "com.example.app", start = elsewhere), "Phone Relay"))
+        // A button whose words are on a child; one known only by its id.
+        val wrapped = FakeDevice.node(Consent.SYSTEM_UI, "", clickable = true, children = listOf(FakeDevice.node(Consent.SYSTEM_UI, "Start now")))
+        assertEquals(wrapped, Consent.startButton(prompt(start = wrapped), "Phone Relay"))
+        val byId = FakeDevice.node(Consent.SYSTEM_UI, "OK", id = "com.android.systemui:id/button_start", clickable = true)
+        assertEquals(byId, Consent.startButton(prompt(start = byId), "Phone Relay"))
+        val notClickable = FakeDevice.node(Consent.SYSTEM_UI, "Start")
+        assertEquals(null, Consent.startButton(prompt(start = notClickable), "Phone Relay"))
     }
 }
