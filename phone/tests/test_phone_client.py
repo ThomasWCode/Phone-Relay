@@ -114,6 +114,37 @@ class ParsingTests(unittest.TestCase):
     def test_battery(self):
         self.assertEqual(pc.parse_battery("  AC powered: false\n  level: 42\n  scale: 100\n"), 42)
 
+    def test_ui_drops_other_packages_and_empty_nodes(self):
+        els = pc.parse_ui(fake_adb.ui_xml({"foreground": "com.android.chrome"}).encode())
+        self.assertTrue(all(e["pkg"] == "com.android.chrome" for e in els))
+        self.assertEqual(len(els), 3)  # url bar, text, scroll view; empty View dropped
+        url_bar = els[0]
+        self.assertEqual(url_bar["center"], [500, 170])
+        self.assertTrue(url_bar["editable"] and url_bar["focused"])
+        self.assertEqual(els[1]["text"], "Hello & welcome")
+
+    def test_ui_strips_trailing_status_line(self):
+        xml = fake_adb.ui_xml({"foreground": "com.android.chrome"}).encode() + b"\nUI hierchary dumped to: /dev/tty"
+        self.assertEqual(len(pc.parse_ui(xml)), 3)
+
+    def test_ui_hides_password_text(self):
+        xml = fake_adb.ui_xml({"foreground": "com.android.chrome", "password_focused": True})
+        xml = xml.replace('text="" resource-id="com.android.chrome:id/url_bar"',
+                          'text="secret" resource-id="com.android.chrome:id/url_bar"')
+        els = pc.parse_ui(xml.encode())
+        self.assertEqual(els[0]["text"], "")
+        self.assertTrue(els[0]["password"])
+
+    def test_ui_bad_output(self):
+        with self.assertRaises(pc.CommandError) as cm:
+            pc.parse_ui(b"ERROR: could not get idle state.")
+        self.assertEqual(cm.exception.code, "ui_unavailable")
+
+    def test_input_shown(self):
+        self.assertTrue(pc.parse_input_shown("      mInputShown=true\n"))
+        self.assertFalse(pc.parse_input_shown("      mInputShown=false\n"))
+        self.assertIsNone(pc.parse_input_shown("nothing"))
+
     def test_editor_info_s24(self):
         self.assertEqual(pc.parse_editor_info(EDITOR_INFO_S24), ("com.sec.android.app.launcher", 0))
 
@@ -227,13 +258,51 @@ class TextEscapingTests(unittest.TestCase):
             self.assertEqual(shlex.split(quoted), [text.replace(" ", "%s")])
 
     def test_rejects_bad_text(self):
-        for bad in ["", "50%", "café", "line\nbreak", "tab\t", "x" * 501, None, 5]:
+        for bad in ["", "café", "line\nbreak", "tab\t", "x" * 501, None, 5]:
             with self.assertRaises(pc.CommandError, msg=repr(bad)) as cm:
-                pc.escape_text(bad)
+                pc.input_text_command(bad)
             self.assertEqual(cm.exception.code, "invalid_args")
 
     def test_accepts_max_length(self):
         self.assertEqual(pc.escape_text("x" * 500), "x" * 500)
+
+    @staticmethod
+    def typed(command):
+        """What `input text` would type for a command from input_text_command."""
+        out = ""
+        for call in command.split(" && "):
+            arg = shlex.split(call)[2]
+            out += arg.replace("%s", " ")
+        return out
+
+    def test_percent_is_typed_exactly(self):
+        for text in ["50% off", "100%", "%", "a%sb", "%s", "%%s", "x%s y%sz", "% %s %", "it's 5% $(x)"]:
+            self.assertEqual(self.typed(pc.input_text_command(text)), text, text)
+
+    def test_literal_percent_s_splits_into_two_calls(self):
+        self.assertEqual(pc.input_text_command("a%sb"), "input text a% && input text sb")
+        self.assertEqual(pc.input_text_command("plain text"), "input text plain%stext")
+
+
+class KeyTests(unittest.TestCase):
+    def test_short_names(self):
+        self.assertEqual(pc.resolve_key("back"), "KEYCODE_BACK")
+        self.assertEqual(pc.resolve_key("recents"), "KEYCODE_APP_SWITCH")
+
+    def test_raw_keycodes(self):
+        for key in ["KEYCODE_PAGE_DOWN", "KEYCODE_ESCAPE", "KEYCODE_DPAD_LEFT", "KEYCODE_MOVE_END", "KEYCODE_A"]:
+            self.assertEqual(pc.resolve_key(key), key)
+
+    def test_denied_keycodes(self):
+        for key in ["KEYCODE_POWER", "KEYCODE_SLEEP", "KEYCODE_CALL", "KEYCODE_VOLUME_UP", "KEYCODE_MEDIA_PLAY",
+                    "KEYCODE_CAMERA", "KEYCODE_ASSIST", "KEYCODE_BRIGHTNESS_DOWN", "KEYCODE_WAKEUP"]:
+            with self.assertRaises(pc.CommandError, msg=key):
+                pc.resolve_key(key)
+
+    def test_malformed(self):
+        for key in ["power", "keycode_back", "KEYCODE_BACK; reboot", "26", "", None, "KEYCODE_"]:
+            with self.assertRaises(pc.CommandError, msg=repr(key)):
+                pc.resolve_key(key)
 
 
 class ControllerTests(unittest.IsolatedAsyncioTestCase):
@@ -273,9 +342,10 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         await ctl.handle("type", {"text": "hi"})
         await ctl.handle("key", {"key": "back"})
         await ctl.handle("screenshot", {})
+        await ctl.handle("ui", {})
         for call in adb.calls:
             cmd = call[1]
-            if cmd.startswith(("input ", "screencap", "am start", "monkey")):
+            if cmd.startswith(("input ", "screencap", "am start", "monkey", "uiautomator")):
                 self.fail(f"unguarded action: {cmd}")
 
     async def test_actions_refused_outside_allowlist(self):
@@ -289,12 +359,13 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
                 ("key", {"key": "back"}),
                 ("key", {"key": "home"}),
                 ("screenshot", {}),
+                ("ui", {}),
             ]:
                 with self.assertRaises(pc.CommandError, msg=f"{fg} {cmd}") as cm:
                     await ctl.handle(cmd, args)
                 self.assertEqual(cm.exception.code, "foreground_not_allowed")
             self.assertEqual(adb.inputs(), [])
-            self.assertFalse(any("screencap" in c for c in adb.executed))
+            self.assertFalse(any("screencap" in c or "uiautomator" in c for c in adb.executed))
 
     async def test_focus_change_after_check_is_refused_by_guard(self):
         """The race the plan accepted: the app changes between the check and the tap."""
@@ -333,14 +404,22 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
                 continue
             await ctl.handle("key", {"key": key})
             self.assertEqual(adb.inputs()[-1], f"input keyevent {code}")
-        with self.assertRaises(pc.CommandError):
-            await ctl.handle("key", {"key": "power"})
+        await ctl.handle("key", {"key": "KEYCODE_PAGE_DOWN"})
+        self.assertEqual(adb.inputs()[-1], "input keyevent KEYCODE_PAGE_DOWN")
+        for key in ["power", "KEYCODE_POWER", "KEYCODE_VOLUME_DOWN"]:
+            with self.assertRaises(pc.CommandError, msg=key):
+                await ctl.handle("key", {"key": key})
 
     async def test_type(self):
         ctl, adb = controller()
         res = await ctl.handle("type", {"text": "hello world"})
-        self.assertEqual(res, {"length": 11})
+        self.assertEqual(res, {"length": 11, "field_input_type": 0x1})
         self.assertEqual(adb.inputs(), ["input text hello%sworld"])
+
+    async def test_type_percent(self):
+        ctl, adb = controller()
+        await ctl.handle("type", {"text": "a%sb"})
+        self.assertEqual(adb.inputs(), ["input text a% && input text sb"])
 
     async def test_type_refused_in_password_field(self):
         ctl, adb = controller({"password_focused": True})
@@ -349,12 +428,25 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cm.exception.code, "password_field")
         self.assertEqual(adb.inputs(), [])
 
-    async def test_type_refused_without_text_field(self):
+    async def test_type_without_text_field_is_allowed(self):
+        """No field focused: the agent's call; it gets field_input_type 0 back and checks the screen."""
         ctl, adb = controller({"text_field": False})
-        with self.assertRaises(pc.CommandError) as cm:
-            await ctl.handle("type", {"text": "hi"})
-        self.assertEqual(cm.exception.code, "no_text_field")
+        res = await ctl.handle("type", {"text": "hi"})
+        self.assertEqual(res["field_input_type"], 0)
+        self.assertEqual(adb.inputs(), ["input text hi"])
+
+    async def test_keyboard_taps_refused_on_password_field(self):
+        """The keyboard never takes focus, so its keys would pass the focus guard."""
+        ctl, adb = controller({"password_focused": True, "keyboard": True})
+        for cmd, args in [("tap", {"x": 100, "y": 2000}), ("swipe", {"x1": 1, "y1": 1, "x2": 5, "y2": 5})]:
+            with self.assertRaises(pc.CommandError, msg=cmd) as cm:
+                await ctl.handle(cmd, args)
+            self.assertEqual(cm.exception.code, "password_field")
         self.assertEqual(adb.inputs(), [])
+        await ctl.handle("key", {"key": "back"})  # back is how the agent closes the keyboard
+        adb.state["keyboard"] = False
+        await ctl.handle("tap", {"x": 100, "y": 2000})
+        self.assertEqual(adb.inputs()[-1], "input tap 100 2000")
 
     async def test_swipe(self):
         ctl, adb = controller()
@@ -423,13 +515,13 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
             await ctl.handle("screenshot", {})
         self.assertEqual(cm.exception.code, "foreground_not_allowed")
 
-    async def test_ui_endpoint_removed(self):
+    async def test_ui(self):
         ctl, _ = controller()
-        with self.assertRaises(pc.CommandError) as cm:
-            await ctl.handle("ui", {})
-        self.assertEqual(cm.exception.code, "invalid_args")
+        ui = await ctl.handle("ui", {})
+        self.assertEqual(ui["count"], 3)
 
-    async def test_never_calls_uiautomator(self):
+    async def test_only_ui_calls_uiautomator(self):
+        """uiautomator unbinds accessibility services, so nothing but an explicit /ui may run it."""
         ctl, adb = controller()
         await ctl.handle("state", {})
         await ctl.handle("screenshot", {})

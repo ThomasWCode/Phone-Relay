@@ -3,13 +3,12 @@
 
 State is a JSON file named by FAKE_ADB_STATE:
     {"foreground": "com.android.chrome", "awake": true, "popup": false,
-     "password_focused": false, "text_field": true}
+     "password_focused": false, "text_field": true, "keyboard": true}
 Every invocation is appended to the file named by FAKE_ADB_LOG (one JSON list per line).
 
 Guarded commands (`if <focus guard>; then <action>; else echo PHONE_RELAY_REFUSED; fi`)
 are evaluated by applying the guard's own grep patterns to the fake dumpsys output,
-so the tests exercise the real regexes. `uiautomator` is refused: the client must
-never call it.
+so the tests exercise the real regexes.
 """
 
 import json
@@ -32,7 +31,7 @@ GREP_PATTERN_RE = re.compile(r"grep -qE '([^']*)'")
 
 def default_state():
     return {"foreground": "com.android.chrome", "awake": True, "popup": False,
-            "password_focused": False, "text_field": True}
+            "password_focused": False, "text_field": True, "keyboard": True}
 
 
 def load_state():
@@ -61,6 +60,22 @@ def png(width, height):
     return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", raw) + chunk(b"IEND", b"")
 
 
+def ui_xml(state):
+    pkg = state["foreground"]
+    pw = "true" if state.get("password_focused") else "false"
+    return f"""<?xml version='1.0' encoding='UTF-8' standalone='yes' ?><hierarchy rotation="0">
+<node index="0" text="" resource-id="" class="android.widget.FrameLayout" package="com.android.systemui" content-desc="" clickable="false" focused="false" password="false" scrollable="false" bounds="[0,0][1080,80]">
+  <node index="0" text="12:00" resource-id="com.android.systemui:id/clock" class="android.widget.TextView" package="com.android.systemui" content-desc="" clickable="false" focused="false" password="false" scrollable="false" bounds="[40,10][160,70]" />
+</node>
+<node index="1" text="" resource-id="" class="android.widget.FrameLayout" package="{pkg}" content-desc="" clickable="false" focused="false" password="false" scrollable="false" bounds="[0,80][1080,2340]">
+  <node index="0" text="" resource-id="{pkg}:id/url_bar" class="android.widget.EditText" package="{pkg}" content-desc="Search or type URL" clickable="true" focused="true" password="{pw}" scrollable="false" bounds="[100,120][900,220]" />
+  <node index="1" text="Hello &amp; welcome" resource-id="" class="android.widget.TextView" package="{pkg}" content-desc="" clickable="false" focused="false" password="false" scrollable="false" bounds="[50,400][1030,500]" />
+  <node index="2" text="" resource-id="" class="android.view.View" package="{pkg}" content-desc="" clickable="false" focused="false" password="false" scrollable="false" bounds="[0,600][1080,700]" />
+  <node index="3" text="" resource-id="" class="android.widget.ScrollView" package="{pkg}" content-desc="" clickable="false" focused="false" password="false" scrollable="true" bounds="[0,800][1080,2300]" />
+</node>
+</hierarchy>"""
+
+
 def window_lines(state):
     fg = state["foreground"]
     if not fg:
@@ -80,7 +95,9 @@ def editor_info(state):
         input_type = "0x0"
     else:
         input_type = "0x81" if state.get("password_focused") else "0x1"
-    return ("      curEditorInfo:\n"
+    shown = "true" if state.get("keyboard", True) else "false"
+    return (f"      mInputShown={shown}\n"
+            "      curEditorInfo:\n"
             f"        inputType={input_type} imeOptions=0x6 privateImeOptions=null\n"
             "        actionLabel=null actionId=0\n"
             "        initialSelStart=0 initialSelEnd=0 initialCapsMode=0x0\n"
@@ -100,14 +117,16 @@ def guard_passes(guard, state):
 
 
 def run(cmd, state):
-    """Output of one `adb shell`/`exec-out` command (bytes). Raises on commands the client must not use."""
+    """Output of one `adb shell`/`exec-out` command (bytes)."""
     m = GUARD_RE.match(cmd)
     if m:
         if not guard_passes(m.group("guard"), state):
             return (REFUSED_MARKER + "\n").encode()
         return run(m.group("action"), state)
-    if "uiautomator" in cmd:
-        raise RuntimeError("uiautomator must never be called (it unbinds accessibility services)")
+    if cmd.startswith("uiautomator dump"):
+        return ui_xml(state).encode()
+    if " && input text " in cmd:  # several `input text` calls chained by input_text_command
+        return b"".join(run(part, state) for part in cmd.split(" && "))
     if cmd == "screencap -p":
         return png(WIDTH, HEIGHT)
     if cmd.startswith("echo "):
@@ -164,11 +183,7 @@ def main(argv):
     if args[0] not in ("shell", "exec-out") or len(args) < 2:
         sys.stderr.write("fake adb: unsupported\n")
         return 1
-    try:
-        sys.stdout.buffer.write(run(" ".join(args[1:]), state))
-    except RuntimeError as e:
-        sys.stderr.write(f"fake adb: {e}\n")
-        return 1
+    sys.stdout.buffer.write(run(" ".join(args[1:]), state))
     return 0
 
 
