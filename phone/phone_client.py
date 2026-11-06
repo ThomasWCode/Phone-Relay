@@ -84,6 +84,10 @@ WAIT_KINDS = ("change", "stable", "foreground")
 # A batch may run any command that replies with JSON, plus sleep; not the streaming ones or batch itself.
 BATCH_COMMANDS = ("state", "screenshot", "ui", "tap", "swipe", "type", "key", "launch", "open", "intent",
                   "notifications", "statusbar", "rotation", "wait", "files", "record_start", "sleep")
+# Commands that run their action inside the if_foreground guard themselves (in the same shell command).
+# Any other command given if_foreground is checked against the foreground before it starts.
+SELF_GUARDED = ("screenshot", "ui", "tap", "swipe", "type", "key", "launch", "open", "intent", "statusbar",
+                "rotation", "record_start", "record", "batch")
 # Side messages of a running command, routed to its Channel rather than queued as commands.
 SIDE_TYPES = ("chunk", "end", "ack", "cancel")
 
@@ -318,12 +322,27 @@ NOTIFICATION_EXTRAS = {
 }
 
 
+_DUMP_FIELD_RE = re.compile(r"^[\w.$:-]+[=(]")
+
+
+def _structural(line: str, indent: int) -> bool:
+    """Whether a dump line is the dump's own, not text carried on from a value: the next extra (a
+    `key=` line at the extras' own indent), or the end of the extras (a `}` or another `key=` field
+    further out). A value's own lines are printed as they are, so anything else belongs to it."""
+    stripped = line.lstrip()
+    depth = len(line) - len(stripped)
+    if depth == indent:
+        return bool(_DUMP_FIELD_RE.match(stripped))
+    return 0 < depth < indent and (stripped == "}" or bool(_DUMP_FIELD_RE.match(stripped)))
+
+
 def parse_notifications(dumpsys: str) -> list[dict]:
     """Notifications from `dumpsys notification --noredact`: key, package, id, tag, title, text, ...
 
     Each NotificationRecord block is read up to the next one. A value that runs over
-    several lines (a long text) is joined back up. A key already seen is skipped, as
-    the dump can list a record in more than one section.
+    several lines (a long text) is joined back up: it ends where the dump's own indented
+    lines resume, and its last ")" is the dump's. A key already seen is skipped, as the
+    dump can list a record in more than one section.
     """
     out: list[dict] = []
     seen: set[str] = set()
@@ -345,11 +364,12 @@ def parse_notifications(dumpsys: str) -> list[dict]:
         elif cur is not None:
             e = _EXTRA_RE.match(lines[i])
             if e and e.group(1) in NOTIFICATION_EXTRAS:
+                indent = len(lines[i]) - len(lines[i].lstrip())
                 value = e.group(3)
-                while (not value.endswith(")") and i + 1 < len(lines)
-                       and not _EXTRA_RE.match(lines[i + 1]) and not _NOTIFICATION_RE.match(lines[i + 1])):
+                while i + 1 < len(lines) and not _structural(lines[i + 1], indent):
                     i += 1
-                    value += "\n" + lines[i].strip()
+                    value += "\n" + lines[i]
+                value = value.rstrip()
                 cur[NOTIFICATION_EXTRAS[e.group(1)]] = value[:-1] if value.endswith(")") else value
         i += 1
     return out
@@ -776,8 +796,12 @@ class PhoneController:
             raise CommandError("invalid_args", f"unknown command: {cmd}")
         if streaming is not None and channel is None:
             raise CommandError("invalid_args", f"{cmd} streams over the relay; it cannot run here")
-        _if_foreground(args)  # validates
+        packages = _if_foreground(args)  # validates
         timeout = _timeout(args, default_timeout(cmd, args))
+        if packages is not None and cmd not in SELF_GUARDED:
+            fg, wake = await self.foreground_and_wake()
+            if fg not in packages or wake not in (None, "Awake"):
+                raise CommandError("foreground_mismatch", f"wanted {', '.join(packages)}; foreground={fg}, wakefulness={wake}")
         try:
             # The deadline cancels the command; Adb.run kills the adb call it was waiting on.
             return await asyncio.wait_for(handler(args) if handler else streaming(args, channel), timeout)
@@ -970,9 +994,9 @@ class PhoneController:
             raise CommandError("invalid_args", 'rotation must be 0, 1, 2 or 3 (quarter turns) or "auto"')
         previous = await self._rotation()
         if rotation == "auto":
-            await self.adb.shell("settings put system accelerometer_rotation 1")
+            await self._guarded("settings put system accelerometer_rotation 1", args)
         else:
-            await self.adb.shell(f"settings put system accelerometer_rotation 0 && settings put system user_rotation {rotation}")
+            await self._guarded(f"settings put system accelerometer_rotation 0 && settings put system user_rotation {rotation}", args)
         return {"rotation": rotation, "previous": previous}
 
     async def _frame(self):
@@ -1105,6 +1129,13 @@ class PhoneController:
         )
         files = [ln.strip() for ln in out.splitlines() if ln.strip().startswith(RECORD_PREFIX) and ln.strip().endswith(".mp4")]
         return sorted(files, key=lambda f: int(re.sub(r"\D", "", f[len(RECORD_PREFIX):]) or 0))
+
+    async def end_recording(self) -> None:
+        """Stop any recording and delete it: the owner's kill switches and a closed connection end capture."""
+        remotes = await self._end_recording()
+        if remotes:
+            await self.adb.shell("rm -f " + " ".join(shlex.quote(r) for r in remotes))
+            log.warning("stopped a screen recording (%d segment(s)) as the connection closed", len(remotes))
 
     async def cmd_record_start(self, args: dict) -> dict:
         """Start recording the screen in the background, for at most `seconds`; /record/stop returns the video."""
@@ -1334,6 +1365,12 @@ async def serve(controller: PhoneController, ws) -> None:
             pass
         except Exception:  # a reply that could not be sent: the connection is gone anyway
             log.warning("command worker stopped", exc_info=True)
+        # A recording runs detached on the phone: the owner's disable or stop file (both close the
+        # connection) must end it too, as must a drop, since nobody is left to fetch it.
+        try:
+            await asyncio.wait_for(controller.end_recording(), 45)
+        except (CommandError, asyncio.TimeoutError):
+            log.warning("could not check for a screen recording to stop")
 
 
 async def _watch_stop(controller: PhoneController, ws) -> None:

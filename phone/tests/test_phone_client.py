@@ -769,6 +769,16 @@ class NewParsingTests(unittest.TestCase):
         self.assertNotIn("showWhen", gm)
         self.assertEqual((chrome["tag"], chrome["title"]), (None, "report.pdf"))
 
+    def test_notification_text_with_parentheses_over_several_lines(self):
+        dump = fake_adb.NOTIFICATION_DUMP.replace(
+            "Meeting moved to Thursday.\nBring the slides (final version).)",
+            "Meeting moved (Thursday)\nBring the slides (final version).\n\n  indented (a quote))")
+        gm = pc.parse_notifications(dump)[0]
+        self.assertEqual(gm["big_text"], "Meeting moved (Thursday)\nBring the slides (final version).\n\n  indented (a quote)")
+        self.assertEqual(gm["sub_text"], "someone@example.com")  # the next extra is still read
+        last = pc.parse_notifications(dump)[1]
+        self.assertEqual(last["text"], "Download complete")  # the last extra ends at the closing brace
+
     def test_stat(self):
         self.assertEqual(pc.parse_stat("regular file|12|1700000000|a b|c.txt"),
                          {"name": "a b|c.txt", "type": "file", "size": 12, "modified": 1700000000})
@@ -913,6 +923,37 @@ class AppCommandTests(unittest.IsolatedAsyncioTestCase):
         for bad in [4, -1, True, "left", None]:
             with self.assertRaises(pc.CommandError, msg=repr(bad)):
                 await ctl.handle("rotation", {"rotation": bad})
+
+    async def test_every_command_honours_if_foreground(self):
+        """Commands without a guarded action of their own are checked before they start."""
+        ctl, adb = controller({"foreground": "com.android.settings", "rotation": [1, 0]})
+        guard = {"if_foreground": "com.android.chrome"}
+        for cmd, args in [("rotation", {"rotation": 1}), ("state", {}), ("notifications", {}),
+                          ("files", {"path": "/sdcard"}), ("wait", {"for": "change", "seconds": 0})]:
+            with self.assertRaises(pc.CommandError, msg=cmd) as cm:
+                await ctl.handle(cmd, {**args, **guard})
+            self.assertEqual(cm.exception.code, "foreground_mismatch", cmd)
+        with self.assertRaises(pc.CommandError) as cm:
+            await ctl.handle("push", {"path": "/sdcard/Download/x", **guard}, FakeRelay(upload(b"data")))
+        self.assertEqual(cm.exception.code, "foreground_mismatch")
+        self.assertEqual(adb.state["rotation"], [1, 0])
+        self.assertNotIn("/sdcard/Download/x", adb.state["files"])
+        await ctl.handle("rotation", {"rotation": 1, "if_foreground": "com.android.settings"})
+        self.assertEqual(adb.state["rotation"], [0, 1])
+
+    async def test_rotation_guard_is_in_the_same_command(self):
+        ctl, adb = controller({"rotation": [1, 0]})
+        original = adb.run
+
+        async def run(*args, timeout=None):
+            if "settings put" in args[1]:
+                adb.state["foreground"] = "com.android.settings"
+            return await original(*args, timeout=timeout)
+
+        adb.run = run
+        with self.assertRaises(pc.CommandError):
+            await ctl.handle("rotation", {"rotation": 2, "if_foreground": "com.android.chrome"})
+        self.assertEqual(adb.state["rotation"], [1, 0])
 
 
 class WaitBatchTests(unittest.IsolatedAsyncioTestCase):
@@ -1149,12 +1190,45 @@ class ServeTests(unittest.IsolatedAsyncioTestCase):
         ws.incoming.put_nowait(json.dumps({"id": "a", "cmd": "tap", "args": {"x": 1, "y": 1, "timeout": 600}}))
         task = asyncio.create_task(pc.serve(ctl, ws))
         await asyncio.sleep(0.2)  # the tap is now waiting on adb
+        adb.state["hang"] = 0  # (only that call hangs; the cleanup after it does not)
         started = time.monotonic()
         ws.incoming.put_nowait(None)  # the relay closes the connection
         await asyncio.wait_for(task, 5)
         self.assertLess(time.monotonic() - started, 2)
         self.assertEqual(adb.inputs(), [])
         self.assertEqual(ws.sent, [])
+
+    async def test_closing_the_connection_ends_a_background_recording(self):
+        """The owner's disable or stop file closes the socket; a detached recording must stop with it."""
+        ctl, adb = controller()
+        ws = FakeSocket()
+        ws.incoming.put_nowait(json.dumps({"id": "r", "cmd": "record_start", "args": {"seconds": 600}}))
+        task = asyncio.create_task(pc.serve(ctl, ws))
+        while not ws.sent:
+            await asyncio.sleep(0.01)
+        self.assertTrue(any(p.startswith(fake_adb.RECORD_PREFIX) for p in adb.state["files"]))
+        ws.incoming.put_nowait(None)
+        await task
+        self.assertTrue(any(c[1].startswith("touch /data/local/tmp/phone_relay_rec.stop") for c in adb.calls))
+        self.assertFalse(any(p.startswith(fake_adb.RECORD_PREFIX) for p in adb.state["files"]))
+
+    async def test_a_cancel_sent_while_a_transfer_waits_in_the_queue_ends_it_at_once(self):
+        """The relay gave up on a queued upload: it must not hold the queue waiting for chunks."""
+        ctl, adb = controller()
+        ws = FakeSocket()
+        ws.incoming.put_nowait(json.dumps({"id": "slow", "cmd": "wait", "args": {"for": "change", "seconds": 0.5}}))
+        ws.incoming.put_nowait(json.dumps({"id": "up", "cmd": "push", "args": {"path": "/sdcard/Download/u", "timeout": 300}}))
+        ws.incoming.put_nowait(json.dumps({"id": "up", "type": "chunk", "seq": 0, "data": base64.b64encode(b"part").decode()}))
+        ws.incoming.put_nowait(json.dumps({"id": "up", "type": "cancel"}))
+        task = asyncio.create_task(pc.serve(ctl, ws))
+        started = time.monotonic()
+        while not any(m.get("id") == "up" and "ok" in m for m in ws.sent):
+            await asyncio.sleep(0.01)
+        self.assertLess(time.monotonic() - started, 5)
+        reply = next(m for m in ws.sent if m.get("id") == "up" and "ok" in m)
+        self.assertEqual(reply["error"], "cancelled")
+        ws.incoming.put_nowait(None)
+        await task
 
     async def test_upload_chunks_sent_right_behind_the_command_reach_it(self):
         ctl, adb = controller()

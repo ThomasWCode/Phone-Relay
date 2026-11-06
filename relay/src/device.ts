@@ -356,6 +356,8 @@ export class DeviceHub extends DurableObject<Env> {
       }
     });
     void reply.then((r) => {
+      // The relay gave up (the command sat queued behind a slow one, say): stop the phone sending.
+      if (!r.ok && r.error === "device_timeout") this.sendSide(ws, id, { type: "cancel" });
       if (!writer) {
         // Nothing was streamed: an error before the start (or a reply with no file at all).
         respond(r.ok ? done(502, "device_error", { detail: "the phone sent no file" }) : done(...this.failure(r)));
@@ -374,6 +376,7 @@ export class DeviceHub extends DurableObject<Env> {
   private upload(ws: WebSocket, command: Command, body: ReadableStream<Uint8Array> | null): { id: string; reply: Promise<DeviceReply> } {
     let acked = -1;
     let finished = false;
+    let ended = false;
     let wake: (() => void) | null = null;
     const sent = this.dispatch(ws, command, (msg) => {
       if (msg.type === "ack" && typeof msg.seq === "number") {
@@ -384,6 +387,9 @@ export class DeviceHub extends DurableObject<Env> {
     void sent.reply.then(() => {
       finished = true;
       wake?.();
+      // A reply before the end message (an error, or the relay's own deadline): the phone may still be
+      // waiting on chunks, or have the upload queued, so tell it to stop.
+      if (!ended) this.sendSide(ws, sent.id, { type: "cancel" });
     });
     const pump = async () => {
       let seq = 0;
@@ -396,7 +402,10 @@ export class DeviceHub extends DurableObject<Env> {
           seq++;
           total += piece.length;
         }
-        if (!finished) ws.send(JSON.stringify({ id: sent.id, type: "end", bytes: total }));
+        if (!finished) {
+          ws.send(JSON.stringify({ id: sent.id, type: "end", bytes: total }));
+          ended = true;
+        }
       } catch {
         this.sendSide(ws, sent.id, { type: "cancel" });
       }
