@@ -43,7 +43,6 @@ import stat
 import sys
 import tempfile
 import urllib.error
-import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
@@ -1440,11 +1439,12 @@ class PhoneController:
         or "browser" for the browser itself. By default the first page (Chrome lists the one in front first)."""
         tab = args.get("tab", 0)
         if tab == "browser":
+            # Desktop Chrome gives /devtools/browser/<id>; Chrome on Android plain /devtools/browser.
             version = await self._devtools_http(port, "/json/version")
             url = version.get("webSocketDebuggerUrl", "") if isinstance(version, dict) else ""
-            if "/devtools/browser/" not in url:
+            if "/devtools/browser" not in url:
                 raise CommandError("devtools_failed", "no browser target")
-            return "/devtools/browser/" + url.split("/devtools/browser/", 1)[1]
+            return url[url.index("/devtools/browser"):]
         pages = [t for t in self._tab_list(await self._devtools_http(port, "/json/list")) if t["type"] == "page"]
         if isinstance(tab, int) and not isinstance(tab, bool):
             if not 0 <= tab < len(pages):
@@ -1527,17 +1527,19 @@ class PhoneController:
         return {"result": await self._devtools(args, work)}
 
     async def cmd_chrome_new(self, args: dict) -> dict:
+        """Open a tab with Target.createTarget on the browser target: Chrome on Android refuses
+        DevTools' /json/new ("Could not create new page")."""
         url = _string_arg(args, "url")
-        # Newer Chrome wants PUT for /json/new; older Chrome took GET.
-        async def work(port):
-            path = "/json/new?" + urllib.parse.quote(url, safe=":/?&=%#@+,;!$'()*[]~")
-            try:
-                return await self._devtools_http(port, path, "PUT")
-            except CommandError:
-                return await self._devtools_http(port, path, "GET")
 
-        tab = await self._devtools(args, work)
-        return {"tab": self._tab_list([tab])[0] if isinstance(tab, dict) else None}
+        async def work(port):
+            created = await self._cdp(port, await self._pick_tab(port, {"tab": "browser"}), "Target.createTarget", {"url": url})
+            tab_id = created.get("targetId")
+            if not tab_id:
+                raise CommandError("devtools_failed", f"no tab created: {json.dumps(created)[:200]}")
+            listed = next((t for t in self._tab_list(await self._devtools_http(port, "/json/list")) if t["id"] == tab_id), None)
+            return listed or {"id": tab_id, "type": "page", "title": "", "url": url}
+
+        return {"tab": await self._devtools(args, work)}
 
     async def _tab_action(self, args: dict, action: str) -> dict:
         async def work(port):

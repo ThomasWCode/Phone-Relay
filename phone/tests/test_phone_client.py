@@ -1361,7 +1361,7 @@ class DevToolsTests(unittest.IsolatedAsyncioTestCase):
         res = await self.ctl.handle("chrome_cdp", {"method": "Page.navigate", "params": {"url": "https://example.net/"}})
         self.assertEqual(res["result"], {"echo": {"url": "https://example.net/"}, "target": "/devtools/page/T1"})
         res = await self.ctl.handle("chrome_cdp", {"method": "Target.getTargets", "tab": "browser"})
-        self.assertEqual(res["result"]["target"], "/devtools/browser/B1")
+        self.assertEqual(res["result"]["target"], "/devtools/browser")
         with self.assertRaises(pc.CommandError) as cm:
             await self.ctl.handle("chrome_cdp", {"method": "Nope.missing"})
         self.assertEqual(cm.exception.code, "devtools_failed")
@@ -1372,6 +1372,8 @@ class DevToolsTests(unittest.IsolatedAsyncioTestCase):
         res = await self.ctl.handle("chrome_new", {"url": "https://example.net/a b?x=1&y=2"})
         self.assertEqual(res["tab"]["url"], "https://example.net/a b?x=1&y=2")
         new_id = res["tab"]["id"]
+        self.assertIn(("/devtools/browser", "Target.createTarget", {"url": "https://example.net/a b?x=1&y=2"}),
+                      self.devtools.calls)
         self.assertIn("activated", (await self.ctl.handle("chrome_activate", {"tab": new_id}))["reply"])
         res = await self.ctl.handle("chrome_close", {"tab": new_id})
         self.assertEqual(res["tab"], new_id)

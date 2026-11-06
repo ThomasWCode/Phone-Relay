@@ -12,7 +12,6 @@ Run on its own (python fake_devtools.py PORT) it serves until killed, for the en
 import asyncio
 import json
 import sys
-import urllib.parse
 
 from websockets.asyncio.server import serve
 
@@ -43,13 +42,12 @@ class FakeDevTools:
         if path == "/json/list":
             return connection.respond(200, json.dumps(self.tabs))
         if path == "/json/version":
+            # As Chrome on Android gives it: no id after /devtools/browser (desktop Chrome adds one).
             return connection.respond(200, json.dumps({
-                "Browser": "Chrome/150.0", "webSocketDebuggerUrl": f"ws://127.0.0.1:{self.port}/devtools/browser/B1"}))
+                "Browser": "Chrome/150.0", "webSocketDebuggerUrl": f"ws://127.0.0.1:{self.port}/devtools/browser"}))
         if path.startswith("/json/new?"):
-            tab = {"id": f"T{len(self.tabs) + 1}", "type": "page", "title": "",
-                   "url": urllib.parse.unquote(path.split("?", 1)[1])}
-            self.tabs.insert(0, tab)
-            return connection.respond(200, json.dumps(tab))
+            # Chrome on Android refuses this; tabs are created with Target.createTarget.
+            return connection.respond(500, "Could not create new page")
         if path.startswith("/json/close/"):
             tab_id = path.rsplit("/", 1)[1]
             self.tabs = [t for t in self.tabs if t["id"] != tab_id]
@@ -75,6 +73,10 @@ class FakeDevTools:
                     reply = {"result": {"result": {"type": "string", "value": title}}}
                 else:
                     reply = {"result": {"result": {"type": "number", "value": 2, "description": "2"}}}
+            elif method == "Target.createTarget" and path == "/devtools/browser":
+                tab = {"id": f"T{len(self.tabs) + 1}", "type": "page", "title": "", "url": params.get("url", "")}
+                self.tabs.insert(0, tab)
+                reply = {"result": {"targetId": tab["id"]}}
             elif method == "Nope.missing":
                 reply = {"error": {"code": -32601, "message": "'Nope.missing' wasn't found"}}
             else:
