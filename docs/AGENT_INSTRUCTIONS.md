@@ -76,7 +76,7 @@ What you can and cannot do, in full: [CAPABILITIES.md](CAPABILITIES.md). From th
 
 ## How to work
 
-- **Which client is connected**: `/state`'s `client` is `android-app` (the owner's always-on app) or `termux-adb` (the adb client). The app lists what it runs in `capabilities`; it types only into a focused text field (tap one first), brings an invisible window forward for a moment to read the clipboard, answers Android's consent prompt itself before each recording or audio capture (it shows for a moment), and answers 501 `unsupported` for Chrome DevTools, which needs the adb client. [CAPABILITIES.md](CAPABILITIES.md) has the full comparison.
+- **Which client is connected**: `/state`'s `client` is `android-app` (the owner's always-on app) or `termux-adb` (the adb client). The app lists what it runs in `capabilities`; it types only into a focused text field (tap one first), brings an invisible window forward for a moment to read the clipboard, and answers Android's consent prompt itself before each recording or audio capture (it shows for a moment). Chrome DevTools, other keys and typing with no field focused go through its shell bridge, which works on Wi-Fi only: a 503 `shell_unavailable` says why it cannot now (not paired, or wireless debugging is off), and only the owner can fix that. [CAPABILITIES.md](CAPABILITIES.md) has the full comparison.
 - You decide how to read the screen and check your actions.
 - **Screenshots** have no side effects. If you read a coordinate off a scaled screenshot, pass the same `scale` with the tap (or multiply by `X-Screen-Width / X-Image-Width` yourself).
 - **`/ui`** gives exact element centres and text. It leaves the phone's accessibility services alone; only `engine=uiautomator` unbinds them for a moment, so use that only if the default fails (502 `helper_failed`), and say so.
@@ -98,6 +98,7 @@ What you can and cannot do, in full: [CAPABILITIES.md](CAPABILITIES.md). From th
 | 501 | `unsupported` | The connected client cannot do this (`detail` says why). Find another way, or tell the user |
 | 503 | `device_offline`, `disabled`, `stopped` | Stop and tell the user. The owner may have turned the relay off on the phone |
 | 503 | `permission_missing` | The app lacks a grant (`detail` names it): tell the user; only they can give it |
+| 503 | `shell_unavailable` | The app's shell bridge cannot be used now (`detail` says why: not paired, or wireless debugging off or not reachable, as on mobile data). Tell the user; do not retry in a loop |
 | 504 | `timeout`, `device_timeout` | The command ran past its deadline. Retry once, with a larger `timeout` if the work is slow, then tell the user |
 | 502 | other device error | Retry once, then tell the user |
 

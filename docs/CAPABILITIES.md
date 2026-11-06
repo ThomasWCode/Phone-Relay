@@ -17,14 +17,14 @@ The phone side is either the **Android app** (always on; it drives the phone thr
 | Off switch on the phone | Quick Settings tile, notification, the app | The stop file |
 | `if_foreground` | Checked just before the action, milliseconds ahead of it | Checked in the same shell command as the action, which still leaves a gap: `input` (a Java program) takes a moment to start |
 | Typing | Into the focused field only (409 `no_text_field` otherwise), through the app's own input connection, as a keyboard types | Anywhere, as key events (`input text`), pasting what is not ASCII |
-| Keys | Back, Home, Recents, the shade, power (locks; held: the power menu), wake, d-pad, volume, media, page up/down; while a field is focused, any key | Any key |
+| Keys | Back, Home, Recents, the shade, power (locks; held: the power menu), wake, d-pad, volume, media, page up/down; while a field is focused, any key; any other key through the shell bridge (below) | Any key |
 | UI tree | Every window of the main user, as the accessibility framework gives it; `engine=uiautomator` gives the same tree and unbinds nothing | The same through the helper, or `uiautomator` |
 | Screenshots | Through the accessibility service (about 3 a second at most) | `screencap` |
 | Gestures | Up to 10 fingers, any length (past Android's 60 s, as strokes that continue each other, the fingers staying down) | Up to 10 fingers, any length |
 | Reading the clipboard | An invisible window of the app comes forward for a moment (Android lets only the app in front read it) | Through the helper |
 | Screen recording, audio | MediaProjection: Android's consent prompt shows for a moment before each, and the app answers it; the status bar shows the capture. One MP4 at any length. The sound output is captured as it plays, without apps that refuse capture (and calls) | `screenrecord` (MP4 segments past 180 s) and the helper (the output goes quiet on the phone meanwhile) |
-| Shell-only (501 `unsupported` in the app) | — | Chrome DevTools |
-| Grants the owner gives once | Accessibility service, notification access, all-files access, modify system settings, no battery optimisation, the microphone | Wireless debugging pairing |
+| Chrome DevTools, any key, typing with no field focused | Through the **shell bridge**: the app's own adb connection to this phone's wireless debugging, so only on Wi-Fi, and only once the owner has paired it (503 `shell_unavailable` otherwise, with the reason). The app switches wireless debugging back on by itself when Android has turned it off, if it holds the secure-settings grant | Direct |
+| Grants the owner gives once | Accessibility service, notification access, all-files access, modify system settings, no battery optimisation, the microphone; for the shell bridge, pairing (the code typed into a notification) and, optionally, the secure-settings grant over adb | Wireless debugging pairing |
 
 ## Can do
 
@@ -101,4 +101,4 @@ Typed text is never logged, only its length. That limits what is recorded, not w
 
 Nothing from the earlier list is left; the native app (phase 5) is built. The owner dropped these rather than have them built: the phase 6 MCP wrapper and custom domain, and a status page for the owner (`/admin/status` and `/admin/log` give the same information).
 
-The app does all the adb client does but reach Chrome DevTools, whose socket admits the shell user only.
+The app does all the adb client does. What only the shell user can do (Chrome DevTools, other keys, typing with no field focused) it does through the shell bridge, so on Wi-Fi only, and once the owner has paired it.
