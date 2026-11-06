@@ -546,8 +546,12 @@ class PhoneController:
         return _image_result(buf.getvalue(), "image/jpeg", img.size[0], img.size[1], rw, rh, scale, fg)
 
     async def cmd_ui(self, args: dict) -> dict:
-        xml_bytes = await self._dump_ui(_if_foreground(args))
+        packages = _if_foreground(args)
+        xml_bytes = await self._dump_ui(packages)
         fg, _ = await self.foreground_and_wake()
+        # With if_foreground: if the app in front changed during the dump, discard it.
+        if packages is not None and fg not in packages:
+            raise CommandError("foreground_mismatch", f"foreground changed to {fg} during the UI dump")
         elements = parse_ui(xml_bytes)
         return {"foreground": fg, "count": len(elements), "elements": elements}
 
@@ -581,6 +585,8 @@ class PhoneController:
         # Typing with no field focused is the agent's call: the reply says what was focused.
         field = await self.text_field()
         for command in commands:
+            if self.stopped():  # a long text: the owner's stop file halts it between chunks
+                raise CommandError("stopped", "stop file present")
             await self._guarded(command, args)
         return {
             "length": len(args["text"]),
@@ -705,12 +711,7 @@ async def relay_loop(controller: PhoneController, url: str, token: str) -> int:
                 )
                 watcher = asyncio.create_task(_watch_stop(controller, ws))
                 try:
-                    async for raw in ws:  # one command at a time: adb actions are serialised
-                        reply = await dispatch(controller, raw)
-                        if reply is not None:
-                            await ws.send(json.dumps(reply))
-                        if controller.stopped():
-                            await ws.close(1000, "stop file")
+                    await serve(controller, ws)
                 finally:
                     watcher.cancel()
             log.info("connection closed")
@@ -731,6 +732,38 @@ async def relay_loop(controller: PhoneController, url: str, token: str) -> int:
         log.info("reconnecting in %.1fs", delay)
         await asyncio.sleep(delay)
         backoff = min(backoff * 2, 60.0)
+
+
+async def serve(controller: PhoneController, ws) -> None:
+    """Run the relay's commands one at a time, in order, while reading the socket.
+
+    Reading goes on while a command runs, so when the connection closes (the owner's
+    disable, the stop file, a network drop) the running command is cancelled, and with
+    it the adb call it was waiting on, instead of carrying on unseen.
+    """
+    commands: asyncio.Queue = asyncio.Queue()
+
+    async def worker() -> None:
+        while True:
+            raw = await commands.get()  # one command at a time: adb actions are serialised
+            reply = await dispatch(controller, raw)
+            if reply is not None:
+                await ws.send(json.dumps(reply))
+            if controller.stopped():
+                await ws.close(1000, "stop file")
+
+    task = asyncio.create_task(worker())
+    try:
+        async for raw in ws:
+            commands.put_nowait(raw)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # a reply that could not be sent: the connection is gone anyway
+            log.warning("command worker stopped", exc_info=True)
 
 
 async def _watch_stop(controller: PhoneController, ws) -> None:

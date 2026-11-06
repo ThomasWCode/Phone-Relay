@@ -616,6 +616,39 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         ui = await ctl.handle("ui", {})
         self.assertEqual(ui["count"], 4)
 
+    async def test_ui_discarded_if_foreground_changes_with_if_foreground(self):
+        ctl, adb = controller()
+        original = adb.run
+
+        async def run(*args, timeout=None):
+            out = await original(*args, timeout=timeout)
+            if "uiautomator dump" in args[1]:
+                adb.state["foreground"] = "com.android.settings"
+            return out
+
+        adb.run = run
+        with self.assertRaises(pc.CommandError) as cm:
+            await ctl.handle("ui", {"if_foreground": "com.android.chrome"})
+        self.assertEqual(cm.exception.code, "foreground_mismatch")
+
+    async def test_stop_file_halts_long_typing_between_chunks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stop = os.path.join(tmp, "STOP_PHONE_AGENT")
+            ctl, adb = controller(stop_file=stop)
+            original = adb.run
+
+            async def run(*args, timeout=None):
+                out = await original(*args, timeout=timeout)
+                if "input text" in args[1]:
+                    open(stop, "w").close()  # the owner stops the agent after the first chunk
+                return out
+
+            adb.run = run
+            with self.assertRaises(pc.CommandError) as cm:
+                await ctl.handle("type", {"text": "x" * (5 * pc.TEXT_CHUNK)})
+            self.assertEqual(cm.exception.code, "stopped")
+            self.assertEqual(len(adb.inputs()), 1)
+
     async def test_only_ui_calls_uiautomator(self):
         """uiautomator unbinds accessibility services, so nothing but an explicit /ui may run it."""
         ctl, adb = controller()
@@ -682,6 +715,60 @@ class DispatchTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs("phone_client", level="INFO") as logs:
             await pc.dispatch(ctl, json.dumps({"id": "c", "cmd": "type", "args": {"text": "topsecretvalue"}}))
         self.assertFalse(any("topsecretvalue" in line for line in logs.output))
+
+
+class FakeSocket:
+    """The relay side of the connection: messages queued for the client, replies recorded."""
+
+    def __init__(self):
+        self.incoming = asyncio.Queue()
+        self.sent = []
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raw = await self.incoming.get()
+        if raw is None:
+            raise StopAsyncIteration
+        return raw
+
+    async def send(self, raw):
+        self.sent.append(json.loads(raw))
+
+    async def close(self, code=1000, reason=""):
+        self.closed = True
+        self.incoming.put_nowait(None)
+
+
+class ServeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_commands_run_in_order(self):
+        ctl, adb = controller()
+        ws = FakeSocket()
+        for i in range(3):
+            ws.incoming.put_nowait(json.dumps({"id": str(i), "cmd": "tap", "args": {"x": i, "y": i}}))
+        task = asyncio.create_task(pc.serve(ctl, ws))
+        while len(ws.sent) < 3:
+            await asyncio.sleep(0.01)
+        ws.incoming.put_nowait(None)
+        await task
+        self.assertEqual([r["id"] for r in ws.sent], ["0", "1", "2"])
+        self.assertEqual(adb.inputs(), ["input tap 0 0", "input tap 1 1", "input tap 2 2"])
+
+    async def test_closing_the_connection_cancels_the_running_command(self):
+        """The owner's disable closes the socket: a hung or long command must not carry on."""
+        ctl, adb = controller({"hang": 30})
+        ws = FakeSocket()
+        ws.incoming.put_nowait(json.dumps({"id": "a", "cmd": "tap", "args": {"x": 1, "y": 1, "timeout": 600}}))
+        task = asyncio.create_task(pc.serve(ctl, ws))
+        await asyncio.sleep(0.2)  # the tap is now waiting on adb
+        started = time.monotonic()
+        ws.incoming.put_nowait(None)  # the relay closes the connection
+        await asyncio.wait_for(task, 5)
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(adb.inputs(), [])
+        self.assertEqual(ws.sent, [])
 
 
 class SubprocessAdbTests(unittest.IsolatedAsyncioTestCase):
