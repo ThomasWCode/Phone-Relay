@@ -55,7 +55,7 @@ curl -sS -X POST $R/chrome/eval -H 'Content-Type: application/json' -d '{"expres
 | `GET /files?path=` | A folder's entries (`name`, `type`, `size`, `modified`), or one file's |
 | `GET /files/pull?path=` | The file's bytes. Headers: `X-File-Size`, `X-File-Path` |
 | `POST /files/push?path=` | The request body (any bytes, any size) is written to `path` |
-| `GET /record?seconds=` | Record the screen for that long and return the MP4 (a zip of MP4 segments past 180 s). Also `size=720x1560`, `bit_rate=` (default 2000000). It holds the queue: nothing else runs meanwhile |
+| `GET /record?seconds=` | Record the screen for that long and return the MP4 (with the adb client, a zip of MP4 segments past 180 s). Also `size=720x1560`, `bit_rate=` (default 2000000). It holds the queue: nothing else runs meanwhile |
 | `POST /record/start {seconds?,size?,bit_rate?}`, `POST /record/stop` | Record around other commands: start, act, then stop returns the video. `seconds` (default 10) is the most it records |
 | `POST /gesture {pointers,ms?,scale?}` | Several fingers at once: `pointers` is a list of paths, each a list of `[x, y]` points; every finger goes down at its first point, follows its path over `ms` (default 300) and lifts |
 | `GET /clipboard`, `POST /clipboard {text}` | Read the clipboard's text (`null` if none), or set it; `"text": null` empties it |
@@ -64,10 +64,10 @@ curl -sS -X POST $R/chrome/eval -H 'Content-Type: application/json' -d '{"expres
 | `POST /chrome/cdp {method,params?,tab?}` | Any [DevTools protocol](https://chromedevtools.github.io/devtools-protocol/) method on a tab, or on the browser with `"tab":"browser"`; the reply's `result` is DevTools' own |
 | `POST /chrome/new {url}`, `POST /chrome/activate {tab}`, `POST /chrome/close {tab}` | Open a tab, bring one to the front, close one |
 | `GET /chrome/sockets` | DevTools sockets on the phone (Chrome's, and any debuggable WebView's); every `/chrome/*` call takes `socket=` for another one |
-| `GET /audio?seconds=&source=` | Record `seconds` (default 10) of the phone's sound output (`source=output`, the default; it is silent on the phone meanwhile) or its microphone (`source=mic`), as WAV |
+| `GET /audio?seconds=&source=` | Record `seconds` (default 10) of the phone's sound output (`source=output`, the default; with the adb client it is silent on the phone meanwhile) or its microphone (`source=mic`), as WAV |
 
 Every endpoint also takes:
-- **`if_foreground`**: a package name or a list (on a GET, `?if_foreground=a.b,c.d`). The command runs only while one of them has focus and the screen is on, checked on the phone in the same command as the action, so a focus change between your screenshot and your tap refuses the tap (409 `foreground_mismatch`) instead of landing in another app. Use it for every input.
+- **`if_foreground`**: a package name or a list (on a GET, `?if_foreground=a.b,c.d`). The command runs only while one of them has focus and the screen is on, checked on the phone just before the action, so a focus change between your screenshot and your tap refuses the tap (409 `foreground_mismatch`) instead of landing in another app. Use it for every input.
 - **`timeout`**: the command's deadline in seconds (on a GET, `?timeout=60`). Any value above 0; without one it is 30 s, plus 0.1 s per typed character and a swipe's own duration. A very long wait may be cut off by your HTTP client or proxy first.
 
 A field an endpoint does not take is dropped and named in the reply as `ignored_fields` (on a screenshot, the `X-Ignored-Fields` header). Check for it after a request that did not do what you expected.
@@ -76,7 +76,7 @@ What you can and cannot do, in full: [CAPABILITIES.md](CAPABILITIES.md). From th
 
 ## How to work
 
-- **Which client is connected**: `/state`'s `client` is `android-app` (the owner's always-on app) or `termux-adb` (the adb client). The app lists what it runs in `capabilities`; it types only into a focused text field (tap one first), checks `if_foreground` just before acting rather than in the same command, and answers 501 `unsupported` for the adb client's shell-only commands (reading the clipboard, recording, audio, Chrome DevTools). [CAPABILITIES.md](CAPABILITIES.md) has the full comparison.
+- **Which client is connected**: `/state`'s `client` is `android-app` (the owner's always-on app) or `termux-adb` (the adb client). The app lists what it runs in `capabilities`; it types only into a focused text field (tap one first), brings an invisible window forward for a moment to read the clipboard, answers Android's consent prompt itself before each recording or audio capture (it shows for a moment), and answers 501 `unsupported` for Chrome DevTools, which needs the adb client. [CAPABILITIES.md](CAPABILITIES.md) has the full comparison.
 - You decide how to read the screen and check your actions.
 - **Screenshots** have no side effects. If you read a coordinate off a scaled screenshot, pass the same `scale` with the tap (or multiply by `X-Screen-Width / X-Image-Width` yourself).
 - **`/ui`** gives exact element centres and text. It leaves the phone's accessibility services alone; only `engine=uiautomator` unbinds them for a moment, so use that only if the default fails (502 `helper_failed`), and say so.
