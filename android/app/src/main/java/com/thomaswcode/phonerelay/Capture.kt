@@ -57,7 +57,7 @@ class Capture(private val context: Context, private val scope: CoroutineScope) {
         @Volatile var stopped = false
     }
 
-    private class Recording(val session: Session, val recorder: MediaRecorder, val display: VirtualDisplay, val file: File) {
+    private class Recording(val session: Session, val encoder: ScreenEncoder, val display: VirtualDisplay, val file: File) {
         var timer: Job? = null
         var done = false
         var ok = true
@@ -205,31 +205,21 @@ class Capture(private val context: Context, private val scope: CoroutineScope) {
         drop() // a recording left running or unfetched is dropped, as in the adb client
         val generation = synchronized(this) { ends }
         val s = acquire(projection = true, label = "recording the screen")
-        var recorder: MediaRecorder? = null
+        var encoder: ScreenEncoder? = null
         var display: VirtualDisplay? = null
         val rec = try {
             val frame = videoSize(size)
             val file = File(context.cacheDir, "record.mp4").apply { delete() }
-            recorder = MediaRecorder(context).apply {
-                setVideoSource(MediaRecorder.VideoSource.SURFACE)
-                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-                setVideoEncoder(MediaRecorder.VideoEncoder.H264)
-                setVideoSize(frame.width, frame.height)
-                setVideoFrameRate(30)
-                setVideoEncodingBitRate(bitRate)
-                setOutputFile(file)
-                prepare()
-            }
+            encoder = ScreenEncoder(file, frame.width, frame.height, bitRate).apply { start() }
             val mirror = s.projection!!.createVirtualDisplay(
                 "Phone Relay recording", frame.width, frame.height, context.resources.displayMetrics.densityDpi,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, recorder.surface, null, null,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, encoder.surface, null, null,
             ) ?: throw CommandError("device_error", "Android would not mirror the screen for the recording")
             display = mirror
-            recorder.start()
-            Recording(s, recorder, mirror, file)
+            Recording(s, encoder, mirror, file)
         } catch (e: Exception) {
-            runCatching { recorder?.release() }
             runCatching { display?.release() }
+            runCatching { encoder?.stop() }
             release(s)
             throw if (e is CommandError || e is CancellationException) e else CommandError("device_error", "the recording could not start: ${e.message}")
         }
@@ -247,16 +237,15 @@ class Capture(private val context: Context, private val scope: CoroutineScope) {
 
     /**
      * Ends a recording, keeping its file for /record/stop (or the next start's drop). A second caller
-     * (the timer and /record/stop together) waits for the first: stop() takes a moment to write the
+     * (the timer and /record/stop together) waits for the first: the encoder takes a moment to write the
      * file, and until it returns neither the file nor the projection may be touched.
      */
     private fun finish(rec: Recording) {
         synchronized(rec) {
             if (rec.done) return
             rec.timer?.cancel()
-            rec.ok = runCatching { rec.recorder.stop() }.isSuccess // it throws when no frame arrived
-            runCatching { rec.recorder.release() }
-            runCatching { rec.display.release() }
+            runCatching { rec.display.release() } // no frame after this; the encoder ends the video
+            rec.ok = rec.encoder.stop()
             release(rec.session)
             rec.done = true
         }
@@ -284,7 +273,7 @@ class Capture(private val context: Context, private val scope: CoroutineScope) {
         val screen = wanted ?: context.getSystemService(WindowManager::class.java).maximumWindowMetrics.bounds.let { Size(it.width(), it.height()) }
         val caps = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
             .filter { it.isEncoder && it.supportedTypes.any { t -> t.equals(MediaFormat.MIMETYPE_VIDEO_AVC, ignoreCase = true) } }
-            .sortedByDescending { it.isHardwareAccelerated } // MediaRecorder's choice
+            .sortedByDescending { it.isHardwareAccelerated } // the one createEncoderByType picks, as a rule
             .firstOrNull()?.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)?.videoCapabilities
             ?: throw CommandError("unsupported", "the phone has no H.264 encoder")
         return Video.fit(screen, caps.widthAlignment, caps.heightAlignment, caps::isSizeSupported)
