@@ -82,13 +82,28 @@ curl -sS -o /dev/null -w '%{http_code}\n' https://WORKER_HOST/state
    ```bash
    python phone_client.py --selftest
    ```
-   It prints the raw `mCurrentFocus`/`mWakefulness` lines, the parsed state, saves `selftest_screenshot.jpg` and lists a few UI elements. **Check that the foreground package it reports is right.** The parsing is unverified on Android 17 / One UI 9, and the allowlist depends on it. Then open Settings and re-run the self-test: it must report `foreground_allowed: false` and stop.
+   It prints the raw `mCurrentFocus`/`mWakefulness` lines and the parsed state, runs the input guard with a harmless `echo`, shows the focused text field's `inputType`, and saves `selftest_screenshot.jpg`. It sends no input. **Check that the foreground package it reports is right**: the allowlist depends on it. Then open Settings and re-run the self-test: it must report `foreground_allowed: false` and stop.
 9. **Run**:
    ```bash
    ./start.sh            # takes a wake lock and runs the client; reconnects with backoff
    ```
 
 Wireless debugging turns off when Wi-Fi changes, and its port changes. Expect to run `adb connect` again (and sometimes re-pair) after reboots or network changes. This is a phase 1 limitation.
+
+### Alternative for testing: run the client on a computer
+
+The same client runs on a computer that already has adb connected to the phone (USB or wireless). Nothing is installed on the phone and no phone settings change. The phone only takes part while the computer runs the client. On Windows (PowerShell), from the repository root:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r phone/requirements.txt pillow
+adb devices                                        # exactly one device, or set ADB_SERIAL in phone/.env
+Copy-Item phone/.env.example phone/.env            # set RELAY_URL and DEVICE_TOKEN
+.\.venv\Scripts\python.exe phone/phone_client.py --selftest
+.\.venv\Scripts\python.exe phone/phone_client.py   # Ctrl-C to stop
+```
+
+The stop file is `~/STOP_PHONE_AGENT` on the computer (`$HOME\STOP_PHONE_AGENT` on Windows).
 
 ## 3. Wire up Claude (cloud environment)
 
@@ -130,14 +145,16 @@ All endpoints need `Authorization: Bearer <AGENT_TOKEN>`, which the network secr
 |---|---|
 | `GET /state` | foreground, foreground_allowed, awake, battery, screen, allowlist |
 | `GET /screenshot?scale=0.5` | JPEG (PNG if Pillow is missing on the phone). Headers `X-Image-*`, `X-Screen-*`, `X-Scale`, `X-Foreground` |
-| `GET /ui` | Elements from allowed packages only; password text is blanked |
-| `POST /tap` `{x,y,scale?}` | |
-| `POST /swipe` `{x1,y1,x2,y2,ms?,scale?}` | ms 50-5000 |
-| `POST /type` `{text}` | 1-500 printable ASCII, no `%`; refused if the focused field is a password field |
-| `POST /key` `{key}` | back, home, recents, enter, tab, delete |
-| `POST /launch` `{package}` | Gmail or Chrome only |
+| `GET /ui` | Elements from allowed packages only; password text is blanked. Runs `uiautomator dump`, which unbinds every accessibility service on the phone for a moment |
+| `POST /tap` `{x,y,scale?}` | Refused while the keyboard is open on a password field |
+| `POST /swipe` `{x1,y1,x2,y2,ms?,scale?}` | ms 50-5000; same password-keyboard rule as tap |
+| `POST /type` `{text}` | 1-500 printable ASCII, `%` included; refused in password fields; the reply gives the focused field's `inputType` |
+| `POST /key` `{key}` | back, home, recents, enter, tab, delete, or any `KEYCODE_*` except power, calls, camera, assistant, volume, brightness and media; only while an allowed app is in front |
+| `POST /launch` `{package}` | Gmail or Chrome only, started from an allowed app or the home screen |
 
 Errors: 400 `invalid_args`, 401 `unauthorized`, 404, 405, 409 `foreground_not_allowed` / `screen_off` / `password_field`, 429 `rate_limited`, 503 `device_offline` / `disabled` / `stopped`, 504 `device_timeout`, 502 other device errors.
+
+The full list of what the agent can do, what is actively restricted and what is just not built is in [docs/CAPABILITIES.md](docs/CAPABILITIES.md).
 
 ## 6. Tests
 
@@ -147,6 +164,8 @@ Install:
 cd relay && npm ci && cd ..
 python3 -m pip install websockets pillow     # in a venv if your system Python is externally managed
 ```
+
+On Windows use `python` (or `.\.venv\Scripts\python.exe`) for `python3`. The real-shell guard tests use Git for Windows' `sh.exe`, found next to `git`, and are skipped without it. npm 11 reports that the `esbuild` and `workerd` install scripts are not approved; `wrangler dev` and the tests work without them.
 
 Run:
 
@@ -161,17 +180,28 @@ python3 -m unittest discover -s phone/tests -v
 python3 scripts/e2e_test.py
 ```
 
-What the end-to-end test covers: token separation (agent, device and admin tokens cannot stand in for each other), validation, every endpoint, the allowlist (Settings, lock screen, launcher), screen off, password-field refusal, Home always allowed, launch, the screenshot rate limit, the admin kill switch and reconnect, the stop file, a bad device token, and that typed text never reaches the log.
+What the end-to-end test covers: token separation (agent, device and admin tokens cannot stand in for each other), validation, every endpoint, the allowlist (Settings, Teams, lock screen, launcher), in-app popups, screen off, password-field refusals (typing, and keyboard taps), typing `%`, `KEYCODE_*` keys and denied keys, Home and launch refused over other apps, launch from the home screen, the screenshot rate limit, the admin kill switch and reconnect, the stop file, a bad device token, and that typed text never reaches the log.
 
-Not yet tested, because it needs the real phone and account (phase 4 of the plan): One UI 9 output formats, reboot and Wi-Fi-drop recovery, token rotation, and the prompt-injection test with a hostile email and web page.
+Checked on a Galaxy S24 (Android 17) with real input in Chrome and Gmail:
+- the self-test;
+- taps, swipes and typing (`%` and `%s` included);
+- `KEYCODE_*` keys, with `KEYCODE_POWER` refused;
+- refusals: typing into a password field, keyboard taps on a password field, taps on the home screen;
+- launch from Chrome and from the home screen.
+
+`/ui` was not run on that phone.
+
+Not yet tested, because it needs the real phone and account (phase 4 of the plan): reboot and Wi-Fi-drop recovery, token rotation, and the prompt-injection test with a hostile email and web page.
 
 ## 7. Security notes and known gaps
 
-- **Allowlist**: enforced on the phone (it checks the foreground app before every action, and again after screenshots and UI dumps) and in the Worker (`/launch`, keys). The check and the action are not atomic. Focused in-app popups (`PopupWindow:…`, e.g. Chrome's menu) are attributed to the app in `mFocusedApp`; any other window without a package name (lock screen, shade) is refused.
+- **Allowlist**: enforced by the client (it checks the foreground app before every action, and again after screenshots) and in the Worker (`/launch`, keys). Every input, screenshot and launch also runs inside a shell guard on the phone: `if <allowed app focused and screen awake>; then <action>; else echo PHONE_RELAY_REFUSED; fi`. The check and the action run in the same command, so a focus change between the client's check and the action is refused. A change in the milliseconds inside that one command is still possible. Focused in-app popups (`PopupWindow:…`, e.g. Chrome's menu) are attributed to the app in `mFocusedApp`; any other window without a package name (lock screen, shade) is refused.
+- **`uiautomator`**: only `/ui` runs `uiautomator dump`, which briefly unbinds every accessibility service on the phone. Nothing else calls it, including `--selftest`.
+- **Keyboard taps**: the on-screen keyboard never takes focus, so its keys pass the focus guard. While a password field is focused and the keyboard is open, taps and swipes are refused, so a password cannot be typed key by key. Chrome's in-page autofill dropdown is not covered.
 - **Notifications**: a heads-up notification from another app can appear in a screenshot taken while Chrome or Gmail is in front. Turn on Do Not Disturb during agent sessions.
-- **Password fields**: adb *can* type into password fields. This differs from the plan's "cannot enter secure fields (by design)". The client refuses `/type` when the focused node has `password="true"` in the accessibility tree. That covers standard Android and HTML password inputs, but not custom fields that do not flag themselves.
+- **Password fields**: adb *can* type into password fields. This differs from the plan's "cannot enter secure fields (by design)". The client reads the focused field's `inputType` from `dumpsys input_method` and refuses `/type` for password types (text, visible, web and number passwords). That covers standard Android and HTML password inputs, but not custom fields that do not declare a password type.
 - **Gmail and Chrome**: use a test Google account. Keep Chrome signed out, with saved passwords and payment autofill off. The allowlist limits apps, not what Chrome can browse to.
-- **Rate limits** (60 requests/min, 20 screenshots/min) are stored in Durable Object storage, so they survive hibernation. `/state` and `/ui` count towards the 60.
+- **Rate limits** (300 requests/min, 120 screenshots/min by default; set `RATE_ACTIONS_PER_MIN` / `RATE_SCREENSHOTS_PER_MIN` as wrangler vars to change them) are stored in Durable Object storage, so they survive hibernation. `/state` and `/ui` count as requests.
 - **Coordinates** are checked against the larger screen dimension so both orientations work. Taps outside the visible screen are possible within that square; Android ignores them.
 - **Phone-side policy** (allowlist, keys) is constant in `phone_client.py`. Changing it means editing the code on the phone, which is intentional.
 

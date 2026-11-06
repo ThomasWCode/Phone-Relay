@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseBody, summariseArgs, validateCommand, validateText, type CommandName } from "../src/validate";
+import { AGENT_ROUTES, parseBody, summariseArgs, validateCommand, validateText, type CommandName } from "../src/validate";
 
 const q = (s = "") => new URLSearchParams(s);
 const v = (cmd: CommandName, body: Record<string, unknown> | null = null, query = "") => validateCommand(cmd, q(query), body);
@@ -8,6 +8,7 @@ describe("validateCommand", () => {
   it("accepts reads without arguments", () => {
     expect(v("state")).toEqual({ ok: true, command: { cmd: "state", args: {} } });
     expect(v("ui")).toEqual({ ok: true, command: { cmd: "ui", args: {} } });
+    expect(AGENT_ROUTES["/ui"]).toEqual({ method: "GET", cmd: "ui" });
   });
 
   it("screenshot scale defaults to 0.5 and is bounded", () => {
@@ -33,17 +34,24 @@ describe("validateCommand", () => {
     for (const ms of [49, 5001, 100.5, "300"]) expect(v("swipe", { ...base, ms }).ok).toBe(false);
   });
 
-  it("type allows printable ASCII up to 500 characters without %", () => {
+  it("type allows printable ASCII up to 500 characters, % included", () => {
     expect(v("type", { text: "Hello, world! (test) $x `y`" }).ok).toBe(true);
     expect(v("type", { text: "x".repeat(500) }).ok).toBe(true);
-    for (const text of ["", "x".repeat(501), "100%", "café", "a\nb", "tab\t", 5, null]) {
+    expect(v("type", { text: "100% and %s" }).ok).toBe(true);
+    for (const text of ["", "x".repeat(501), "café", "a\nb", "tab\t", 5, null]) {
       expect(v("type", { text }).ok, JSON.stringify(text)).toBe(false);
     }
   });
 
-  it("key must come from the fixed list", () => {
+  it("key accepts short names and KEYCODE_* names, not keys that act outside the app", () => {
     for (const key of ["back", "home", "recents", "enter", "tab", "delete"]) expect(v("key", { key }).ok).toBe(true);
-    for (const key of ["power", "KEYCODE_POWER", "26", ""]) expect(v("key", { key }).ok).toBe(false);
+    for (const key of ["KEYCODE_PAGE_DOWN", "KEYCODE_ESCAPE", "KEYCODE_DPAD_UP", "KEYCODE_A"]) {
+      expect(v("key", { key }).ok, key).toBe(true);
+    }
+    for (const key of ["power", "KEYCODE_POWER", "KEYCODE_VOLUME_UP", "KEYCODE_MEDIA_PLAY", "KEYCODE_CALL",
+      "KEYCODE_back", "KEYCODE_", "KEYCODE_BACK;reboot", "26", ""]) {
+      expect(v("key", { key }).ok, key).toBe(false);
+    }
   });
 
   it("launch accepts only Gmail and Chrome", () => {
@@ -73,6 +81,7 @@ describe("logging", () => {
 
   it("validateText reports reasons", () => {
     expect(validateText("ok")).toBeNull();
-    expect(validateText("50%")).toMatch(/%/);
+    expect(validateText("50%")).toBeNull();
+    expect(validateText("café")).toMatch(/ASCII/);
   });
 });
