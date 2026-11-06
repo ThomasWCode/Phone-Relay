@@ -1374,6 +1374,9 @@ class DevToolsTests(unittest.IsolatedAsyncioTestCase):
         new_id = res["tab"]["id"]
         self.assertIn(("/devtools/browser", "Target.createTarget", {"url": "https://example.net/a b?x=1&y=2"}),
                       self.devtools.calls)
+        res = await self.ctl.handle("chrome_new", {"url": "https://example.net/#/settings?tab=2"})  # a hash route
+        self.assertEqual(res["tab"]["url"], "https://example.net/#/settings?tab=2")
+        await self.ctl.handle("chrome_close", {"tab": res["tab"]["id"]})
         self.assertIn("activated", (await self.ctl.handle("chrome_activate", {"tab": new_id}))["reply"])
         res = await self.ctl.handle("chrome_close", {"tab": new_id})
         self.assertEqual(res["tab"], new_id)
