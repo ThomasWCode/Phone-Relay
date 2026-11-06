@@ -33,12 +33,12 @@ ADMIN = secrets.token_hex(32)
 failures = []
 
 
-def request(method, path, token=AGENT, body=None):
-    data = json.dumps(body).encode() if body is not None else None
+def request(method, path, token=AGENT, body=None, raw=None):
+    data = json.dumps(body).encode() if body is not None else raw
     req = urllib.request.Request(BASE + path, data=data, method=method)
     if token:
         req.add_header("Authorization", f"Bearer {token}")
-    if data is not None:
+    if body is not None:
         req.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
@@ -84,8 +84,7 @@ def main():
     tmp = tempfile.mkdtemp(prefix="phone-relay-e2e-")
     env_file = os.path.join(tmp, "dev.vars")
     with open(env_file, "w") as f:
-        # a low screenshot limit so the rate-limit check below hits it (default is 120/min)
-        f.write(f"AGENT_TOKEN={AGENT}\nDEVICE_TOKEN={DEVICE}\nADMIN_TOKEN={ADMIN}\nRATE_SCREENSHOTS_PER_MIN=20\n")
+        f.write(f"AGENT_TOKEN={AGENT}\nDEVICE_TOKEN={DEVICE}\nADMIN_TOKEN={ADMIN}\n")
     state_path = os.path.join(tmp, "fake_state.json")
     with open(state_path, "w") as f:
         json.dump({"foreground": "com.android.chrome", "awake": True, "password_focused": False}, f)
@@ -129,12 +128,27 @@ def main():
         check("instructions name the real host", f"127.0.0.1:{PORT}" in text and "<WORKER_HOST>" not in text)
         s, _, b = request("GET", "/docs/CAPABILITIES.md")
         check("GET /docs/CAPABILITIES.md", s == 200 and b"Actively restricted" in b, f"{s}")
+        s, _, b = request("GET", "/docs/PHONE_RULES.md")
+        check("GET /docs/PHONE_RULES.md", s == 200 and b"main, daily phone" in b and b"## The owner's private notes" not in b, f"{s}")
         check("docs are GET only", request("POST", "/", body={})[0] == 405)
+
+        # ---- the owner's private notes, appended to the phone rules ----
+        notes = b"- A private note for the agent."
+        check("agent token cannot set notes", request("PUT", "/admin/notes", raw=notes)[0] == 401)
+        s, _, b = request("PUT", "/admin/notes", token=ADMIN, raw=notes)
+        check("admin sets notes", s == 200 and j(b).get("length") == len(notes), f"{s} {b[:200]}")
+        s, _, b = request("GET", "/docs/PHONE_RULES.md")
+        check("phone rules end with the notes", b.rstrip().endswith(notes) and b"main, daily phone" in b, b[-200:])
+        check("admin reads notes", j(request("GET", "/admin/notes", token=ADMIN)[2]).get("notes") == notes.decode())
+        check("notes need PUT or GET", request("POST", "/admin/notes", token=ADMIN, raw=notes)[0] == 405)
+        request("PUT", "/admin/notes", token=ADMIN, raw=b"")
+        check("empty PUT clears notes", notes not in request("GET", "/docs/PHONE_RULES.md")[2])
+        request("PUT", "/admin/notes", token=ADMIN, raw=notes)
 
         # ---- offline ----
         s, _, b = request("GET", "/state")
         check("device offline -> 503", s == 503 and j(b).get("error") == "device_offline", f"{s} {b[:200]}")
-        check("validation runs before device", request("POST", "/launch", body={"package": "com.android.settings"})[0] == 400)
+        check("validation runs before device", request("POST", "/launch", body={"package": "com.android.chrome;reboot"})[0] == 400)
 
         # ---- connect the phone client ----
         env = {**os.environ, "RELAY_URL": f"ws://127.0.0.1:{PORT}/device", "DEVICE_TOKEN": DEVICE,
@@ -152,58 +166,94 @@ def main():
         # ---- agent API ----
         s, _, b = request("GET", "/state")
         st = j(b)
-        check("GET /state", s == 200 and st.get("foreground") == "com.android.chrome" and st.get("battery") == 87, f"{s} {b[:200]}")
+        check("GET /state", s == 200 and st.get("foreground") == "com.android.chrome" and st.get("battery") == 87
+              and "allowlist" not in st, f"{s} {b[:200]}")
 
         s, h, b = request("GET", "/screenshot?scale=0.5")
         check("GET /screenshot is JPEG", s == 200 and h.get("Content-Type") == "image/jpeg" and b[:2] == b"\xff\xd8", f"{s} {h}")
         check("screenshot headers", h.get("X-Image-Width") == "540" and h.get("X-Screen-Width") == "1080" and h.get("X-Scale") == "0.5", str(h))
 
         s, _, b = request("GET", "/ui")
-        check("GET /ui", s == 200 and j(b).get("count") == 3, f"{s} {b[:200]}")
+        check("GET /ui (every package)", s == 200 and j(b).get("count") == 4, f"{s} {b[:200]}")
 
         s, _, b = request("POST", "/tap", body={"x": 270, "y": 585, "scale": 0.5})
         check("POST /tap scaled", s == 200 and j(b).get("x") == 540, f"{s} {b[:200]}")
+        check("POST /tap anywhere", request("POST", "/tap", body={"x": 50000, "y": -3.5})[0] == 200)
         check("POST /swipe", request("POST", "/swipe", body={"x1": 500, "y1": 1800, "x2": 500, "y2": 600})[0] == 200)
+        check("POST /swipe of 0 ms", request("POST", "/swipe", body={"x1": 5, "y1": 5, "x2": 6, "y2": 6, "ms": 0})[0] == 200)
         check("POST /type", request("POST", "/type", body={"text": "hello world"})[0] == 200)
         check("type with % and %s", request("POST", "/type", body={"text": "100% and %s"})[0] == 200)
+        check("type with newlines and tabs", request("POST", "/type", body={"text": "a\nb\tc"})[0] == 200)
+        check("type 2000 characters", request("POST", "/type", body={"text": "x" * 2000})[0] == 200)
         s, _, b = request("POST", "/type", body={"text": "café"})
-        check("type non-ASCII -> 400", s == 400 and j(b).get("error") == "invalid_args")
+        check("type non-ASCII -> 400 (not built yet)", s == 400 and j(b).get("error") == "invalid_args")
         check("KEYCODE_* key", request("POST", "/key", body={"key": "KEYCODE_PAGE_DOWN"})[0] == 200)
-        check("power key -> 400", request("POST", "/key", body={"key": "KEYCODE_POWER"})[0] == 400)
+        check("power key accepted", request("POST", "/key", body={"key": "KEYCODE_POWER"})[0] == 200)
+        check("key by number, long press", request("POST", "/key", body={"key": 82, "longpress": True})[0] == 200)
+        s, _, b = request("POST", "/tap", body={"x": 1, "y": 1, "scal": 0.5})
+        check("unknown fields named in the reply", s == 200 and j(b).get("ignored_fields") == ["scal"], f"{s} {b[:200]}")
+        s, h, _ = request("GET", "/screenshot?scale=0.2&nope=1")
+        check("unknown screenshot fields named in a header", s == 200 and h.get("X-Ignored-Fields") == "nope", str(h))
 
         set_fake(state_path, password_focused=True)
         s, _, b = request("POST", "/type", body={"text": "hunter2"})
-        check("type into password field -> 409", s == 409 and j(b).get("error") == "password_field", f"{s} {b[:200]}")
-        s, _, b = request("POST", "/tap", body={"x": 100, "y": 2000})
-        check("keyboard tap on password field -> 409", s == 409 and j(b).get("error") == "password_field", f"{s} {b[:200]}")
+        check("type into a password field works and says so", s == 200 and j(b).get("password_field") is True, f"{s} {b[:200]}")
+        check("keyboard tap on a password field", request("POST", "/tap", body={"x": 100, "y": 2000})[0] == 200)
         set_fake(state_path, password_focused=False, text_field=False)
-        check("type without a text field is allowed", request("POST", "/type", body={"text": "hi"})[0] == 200)
+        check("type without a text field", request("POST", "/type", body={"text": "hi"})[0] == 200)
         set_fake(state_path, text_field=True, popup=True)
-        check("tap in an app's popup menu", request("POST", "/tap", body={"x": 10, "y": 10})[0] == 200)
+        check("if_foreground passes in the app's popup menu",
+              request("POST", "/tap", body={"x": 10, "y": 10, "if_foreground": "com.android.chrome"})[0] == 200)
         set_fake(state_path, popup=False)
 
-        # ---- allowlist ----
+        # ---- any app ----
         set_fake(state_path, foreground="com.android.settings")
-        s, _, b = request("POST", "/tap", body={"x": 10, "y": 10})
-        check("tap in Settings -> 409", s == 409 and j(b).get("error") == "foreground_not_allowed", f"{s} {b[:200]}")
-        check("screenshot in Settings -> 409", request("GET", "/screenshot")[0] == 409)
-        check("ui in Settings -> 409", request("GET", "/ui")[0] == 409)
-        check("back in Settings -> 409", request("POST", "/key", body={"key": "back"})[0] == 409)
-        check("home in Settings -> 409", request("POST", "/key", body={"key": "home"})[0] == 409)
-        check("launch over Settings -> 409", request("POST", "/launch", body={"package": "com.android.chrome"})[0] == 409)
+        check("tap in Settings", request("POST", "/tap", body={"x": 10, "y": 10})[0] == 200)
+        s, h, _ = request("GET", "/screenshot")
+        check("screenshot in Settings", s == 200 and h.get("X-Foreground") == "com.android.settings", f"{s} {h}")
+        check("ui in Settings", request("GET", "/ui")[0] == 200)
+        check("back in Settings", request("POST", "/key", body={"key": "back"})[0] == 200)
         set_fake(state_path, foreground="com.microsoft.teams")
-        check("home over Teams -> 409", request("POST", "/key", body={"key": "home"})[0] == 409)
-        set_fake(state_path, foreground="com.android.chrome")
+        check("launch Chrome over Teams", request("POST", "/launch", body={"package": "com.android.chrome"})[0] == 200)
         check("home from Chrome", request("POST", "/key", body={"key": "home"})[0] == 200)
+        s, _, b = request("POST", "/launch", body={"package": "com.android.settings"})
+        check("launch Settings", s == 200 and j(request("GET", "/state")[2]).get("foreground") == "com.android.settings",
+              f"{s} {b[:200]}")
         s, _, b = request("POST", "/launch", body={"package": "com.google.android.gm"})
-        check("launch Gmail from the home screen", s == 200, f"{s} {b[:200]}")
-        check("Gmail now foreground", j(request("GET", "/state")[2]).get("foreground") == "com.google.android.gm")
+        check("launch Gmail", s == 200 and j(request("GET", "/state")[2]).get("foreground") == "com.google.android.gm")
+
+        # ---- if_foreground (opt-in guard) ----
+        set_fake(state_path, foreground="com.android.settings")
+        s, _, b = request("POST", "/tap", body={"x": 10, "y": 10, "if_foreground": ["com.android.chrome"]})
+        check("if_foreground refuses another app", s == 409 and j(b).get("error") == "foreground_mismatch", f"{s} {b[:200]}")
+        check("if_foreground on a screenshot", request("GET", "/screenshot?if_foreground=com.android.chrome")[0] == 409)
+        check("if_foreground on Settings itself",
+              request("POST", "/tap", body={"x": 10, "y": 10, "if_foreground": "com.android.settings"})[0] == 200)
         set_fake(state_path, foreground="NotificationShade")
-        check("lock screen refused", request("POST", "/tap", body={"x": 10, "y": 10})[0] == 409)
+        check("tap on the lock screen", request("POST", "/tap", body={"x": 10, "y": 10})[0] == 200)
         set_fake(state_path, foreground="com.android.chrome", awake=False)
-        s, _, b = request("POST", "/tap", body={"x": 10, "y": 10})
-        check("screen off refused", s == 409 and j(b).get("error") == "screen_off", f"{s} {b[:200]}")
+        check("tap with the screen off", request("POST", "/tap", body={"x": 10, "y": 10})[0] == 200)
+        s, _, b = request("POST", "/tap", body={"x": 10, "y": 10, "if_foreground": "com.android.chrome"})
+        check("if_foreground wants the screen on", s == 409, f"{s} {b[:200]}")
         set_fake(state_path, awake=True)
+
+        # ---- timeouts ----
+        set_fake(state_path, hang=5)
+        started = time.time()
+        s, _, b = request("POST", "/tap", body={"x": 1, "y": 1, "timeout": 1})
+        check("a command past its timeout -> 504 timeout", s == 504 and j(b).get("error") == "timeout", f"{s} {b[:200]}")
+        check("the timeout stops it promptly", time.time() - started < 5, f"{time.time() - started:.1f} s")
+        set_fake(state_path, hang=1)
+        s, _, b = request("POST", "/tap", body={"x": 1, "y": 1, "timeout": 120})
+        check("a long timeout lets a slow command finish", s == 200, f"{s} {b[:200]}")
+        set_fake(state_path, hang=0)
+        check("the next command runs", request("GET", "/state")[0] == 200)
+
+        # ---- no rate limit ----
+        statuses = [request("GET", "/screenshot?scale=0.1")[0] for _ in range(25)]
+        check("no rate limit on a burst", set(statuses) == {200}, str(statuses))
+        st = j(request("GET", "/admin/status", token=ADMIN)[2])
+        check("status has no rate fields", "rate_limits" not in st and st.get("notes_length") == len(notes), str(st))
 
         # ---- log ----
         s, _, b = request("GET", "/admin/log?n=100", token=ADMIN)
@@ -211,10 +261,6 @@ def main():
         check("admin log readable", s == 200 and len(entries) > 10, f"{s}")
         check("typed text not logged", b"hello world" not in b and b"hunter2" not in b)
         check("type logged as length", any(e.get("action") == "type" and e.get("detail") == {"length": 11} for e in entries))
-
-        # ---- rate limit (screenshots: 20/min; 1 used above, plus 1 refused) ----
-        statuses = [request("GET", "/screenshot?scale=0.1")[0] for _ in range(20)]
-        check("screenshot rate limit -> 429", statuses.count(429) >= 1 and statuses[0] == 200, str(statuses))
 
         # ---- kill switch (admin) ----
         check("admin disable", request("POST", "/admin/disable", token=ADMIN)[0] == 200)

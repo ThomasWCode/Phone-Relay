@@ -6,4 +6,5 @@ phone/.env
 __pycache__/
 *.pyc
 selftest_screenshot.*
+private/
 .venv/
