@@ -3,7 +3,8 @@
 
 State is a JSON file named by FAKE_ADB_STATE:
     {"foreground": "com.android.chrome", "awake": true, "popup": false,
-     "password_focused": false, "text_field": true, "keyboard": true}
+     "password_focused": false, "text_field": true, "keyboard": true, "hang": 0}
+"hang" makes every invocation sleep that many seconds first (for timeout tests).
 Every invocation is appended to the file named by FAKE_ADB_LOG (one JSON list per line).
 
 Guarded commands (`if <focus guard>; then <action>; else echo PHONE_RELAY_REFUSED; fi`)
@@ -16,6 +17,7 @@ import os
 import re
 import struct
 import sys
+import time
 import zlib
 
 WIDTH, HEIGHT = 1080, 2340
@@ -31,7 +33,7 @@ GREP_PATTERN_RE = re.compile(r"grep -qE '([^']*)'")
 
 def default_state():
     return {"foreground": "com.android.chrome", "awake": True, "popup": False,
-            "password_focused": False, "text_field": True, "keyboard": True}
+            "password_focused": False, "text_field": True, "keyboard": True, "hang": 0}
 
 
 def load_state():
@@ -125,7 +127,7 @@ def run(cmd, state):
         return run(m.group("action"), state)
     if cmd.startswith("uiautomator dump"):
         return ui_xml(state).encode()
-    if " && input text " in cmd:  # several `input text` calls chained by input_text_command
+    if " && " in cmd:  # several `input` calls chained by type_commands
         return b"".join(run(part, state) for part in cmd.split(" && "))
     if cmd == "screencap -p":
         return png(WIDTH, HEIGHT)
@@ -177,6 +179,8 @@ def main(argv):
     if not args:
         return 1
     state = load_state()
+    if state.get("hang"):
+        time.sleep(state["hang"])
     if args[0] == "devices":
         sys.stdout.write("List of devices attached\nlocalhost:5555\tdevice\n")
         return 0

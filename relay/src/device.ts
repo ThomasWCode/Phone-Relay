@@ -1,27 +1,23 @@
 // DeviceHub Durable Object: holds the phone's WebSocket (hibernation API),
-// relays commands to it, enforces rate limits and the kill switch, and keeps
-// an action log in SQLite storage.
+// relays commands to it, enforces the kill switch, keeps an action log and the
+// owner's private notes in SQLite storage.
 
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./index";
 import { json } from "./http";
-import { summariseArgs, type Command } from "./validate";
+import { DEFAULT_TIMEOUT_S, summariseArgs, type Command } from "./validate";
 
-// Per-minute limits; override with the RATE_ACTIONS_PER_MIN / RATE_SCREENSHOTS_PER_MIN vars.
-// They only catch runaway loops: an agent working normally stays far below them.
-export const DEFAULT_RATE_LIMITS = { action: 300, screenshot: 120 } as const;
-const RATE_WINDOW_MS = 60_000;
 const LOG_KEEP = 1000;
-// The phone gives each adb call up to 20 s (uiautomator and typing can be slow).
-const DEFAULT_TIMEOUT_MS = 30_000;
-const TYPE_TIMEOUT_MS = 60_000; // UI check plus up to 500 characters of input
+// The phone enforces each command's `timeout` itself and replies "timeout". The relay waits this much
+// longer before giving up on a reply that never comes (a lost message, a wedged client).
+const REPLY_GRACE_MS = 10_000;
+const MAX_TIMER_MS = 2 ** 31 - 1; // setTimeout's limit (about 24.8 days); longer waits are capped here
 
 // Device error code -> HTTP status. Unknown codes become 502.
 const DEVICE_ERROR_STATUS: Record<string, number> = {
   invalid_args: 400,
-  foreground_not_allowed: 409,
-  password_field: 409,
-  screen_off: 409,
+  foreground_mismatch: 409,
+  timeout: 504,
   stopped: 503,
 };
 
@@ -42,7 +38,6 @@ interface DeviceInfo {
   connected_at: number;
   client?: string;
   version?: string;
-  allowlist?: string[];
 }
 
 function base64ToBytes(b64: string): Uint8Array {
@@ -60,8 +55,7 @@ export class DeviceHub extends DurableObject<Env> {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     this.sql.exec(`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS rate (kind TEXT NOT NULL, ts INTEGER NOT NULL)`);
-    this.sql.exec(`CREATE INDEX IF NOT EXISTS rate_kind_ts ON rate (kind, ts)`);
+    this.sql.exec(`DROP TABLE IF EXISTS rate`); // rate limits were removed
     this.sql.exec(
       `CREATE TABLE IF NOT EXISTS log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,34 +90,9 @@ export class DeviceHub extends DurableObject<Env> {
     this.sql.exec(`DELETE FROM log WHERE id <= (SELECT MAX(id) FROM log) - ?`, LOG_KEEP);
   }
 
-  private rateLimits(): Record<keyof typeof DEFAULT_RATE_LIMITS, number> {
-    const pick = (v: string | undefined, fallback: number) => {
-      const n = Number(v);
-      return Number.isInteger(n) && n > 0 ? n : fallback;
-    };
-    return {
-      action: pick(this.env.RATE_ACTIONS_PER_MIN, DEFAULT_RATE_LIMITS.action),
-      screenshot: pick(this.env.RATE_SCREENSHOTS_PER_MIN, DEFAULT_RATE_LIMITS.screenshot),
-    };
-  }
-
-  // Sliding one-minute window, persisted so it survives hibernation.
-  private takeRateToken(kind: keyof typeof DEFAULT_RATE_LIMITS): boolean {
-    const now = Date.now();
-    this.sql.exec(`DELETE FROM rate WHERE ts <= ?`, now - RATE_WINDOW_MS);
-    const row = this.sql.exec(`SELECT COUNT(*) AS n FROM rate WHERE kind = ?`, kind).one();
-    if (Number(row.n) >= this.rateLimits()[kind]) return false;
-    this.sql.exec(`INSERT INTO rate (kind, ts) VALUES (?, ?)`, kind, now);
-    return true;
-  }
-
-  private rateCounts(): Record<string, number> {
-    const since = Date.now() - RATE_WINDOW_MS;
-    const out: Record<string, number> = { action: 0, screenshot: 0 };
-    for (const row of this.sql.exec(`SELECT kind, COUNT(*) AS n FROM rate WHERE ts > ? GROUP BY kind`, since)) {
-      out[String(row.kind)] = Number(row.n);
-    }
-    return out;
+  private notes(): string {
+    const row = this.sql.exec(`SELECT value FROM meta WHERE key = 'notes'`).toArray()[0];
+    return row ? String(row.value) : "";
   }
 
   // ---- socket helpers ----
@@ -160,6 +129,17 @@ export class DeviceHub extends DurableObject<Env> {
         return this.acceptDevice();
       case "/internal/command":
         return this.runCommand((await request.json()) as Command);
+      case "/internal/notes":
+        return new Response(this.notes(), { headers: { "Content-Type": "text/markdown; charset=utf-8" } });
+      case "/admin/notes": {
+        if (request.method === "GET") return json(200, { ok: true, notes: this.notes() });
+        // PUT: the owner's private notes for the agent, appended to /docs/PHONE_RULES.md. An empty body clears them.
+        const text = await request.text();
+        if (text.trim()) this.sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('notes', ?)`, text);
+        else this.sql.exec(`DELETE FROM meta WHERE key = 'notes'`);
+        this.log("admin", "notes", { length: text.length }, true);
+        return json(200, { ok: true, length: text.trim() ? text.length : 0 });
+      }
       case "/admin/disable":
         this.sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('disabled', '1')`);
         this.closeAll(4001, "disabled");
@@ -177,8 +157,7 @@ export class DeviceHub extends DurableObject<Env> {
           device_online: ws !== undefined,
           device: ws ? (ws.deserializeAttachment() as DeviceInfo | null) : null,
           pending: this.pending.size,
-          rate_last_minute: this.rateCounts(),
-          rate_limits: this.rateLimits(),
+          notes_length: this.notes().length,
         });
       }
       case "/admin/log": {
@@ -218,20 +197,20 @@ export class DeviceHub extends DurableObject<Env> {
   private async runCommand(command: Command): Promise<Response> {
     const started = Date.now();
     const detail = summariseArgs(command);
-    const done = (status: number, error?: string, extra: Record<string, unknown> = {}, headers = {}) => {
+    // Fields the command does not take are dropped; say which, so a typo does not pass unnoticed.
+    const ignored = command.ignored?.length ? { ignored_fields: command.ignored } : {};
+    const done = (status: number, error?: string, extra: Record<string, unknown> = {}) => {
       this.log("agent", command.cmd, detail, status < 400, error, Date.now() - started);
-      return json(status, error ? { ok: false, error, ...extra } : { ok: true, ...extra }, headers);
+      return json(status, error ? { ok: false, error, ...extra, ...ignored } : { ok: true, ...extra, ...ignored });
     };
 
     if (this.isDisabled()) return done(503, "disabled");
     const ws = this.openSockets()[0];
     if (!ws) return done(503, "device_offline");
 
-    const kind = command.cmd === "screenshot" ? "screenshot" : "action";
-    if (!this.takeRateToken(kind)) return done(429, "rate_limited", { limit_per_minute: this.rateLimits()[kind] }, { "Retry-After": "60" });
-
     const id = crypto.randomUUID();
-    const timeoutMs = command.cmd === "type" ? TYPE_TIMEOUT_MS : DEFAULT_TIMEOUT_MS;
+    const timeoutS = Number(command.args.timeout ?? DEFAULT_TIMEOUT_S);
+    const timeoutMs = Math.min(timeoutS * 1000 + REPLY_GRACE_MS, MAX_TIMER_MS);
     const reply = await new Promise<DeviceReply>((resolve) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
@@ -269,6 +248,7 @@ export class DeviceHub extends DurableObject<Env> {
           "X-Screen-Height": String(result.real_height),
           "X-Scale": String(result.scale),
           "X-Foreground": String(result.foreground ?? ""),
+          ...(command.ignored?.length ? { "X-Ignored-Fields": command.ignored.join(",") } : {}),
         },
       });
     }
@@ -290,7 +270,6 @@ export class DeviceHub extends DurableObject<Env> {
         connected_at: (ws.deserializeAttachment() as DeviceInfo | null)?.connected_at ?? Date.now(),
         client: String(msg.client ?? "").slice(0, 64),
         version: String(msg.version ?? "").slice(0, 32),
-        allowlist: Array.isArray(msg.allowlist) ? msg.allowlist.slice(0, 20).map((p) => String(p).slice(0, 128)) : [],
       };
       ws.serializeAttachment(info);
       this.log("device", "hello", { client: info.client, version: info.version }, true);

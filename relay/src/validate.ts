@@ -1,39 +1,33 @@
 // Request validation for the agent-facing API.
-// Everything the phone receives passes through here first; the phone client
-// validates again (defence in depth).
+// It checks only that each value has a shape the phone can run safely (numbers
+// are numbers, names cannot carry shell syntax). There is no app allowlist, no
+// key deny list and no range limit. The phone client checks the same shapes
+// again (defence in depth).
 
-export const ALLOWED_PACKAGES = ["com.google.android.gm", "com.android.chrome"] as const;
-export const ALLOWED_KEYS = ["back", "home", "recents", "enter", "tab", "delete"] as const;
-// Any other key by its Android name, except keys that act outside the app in front
-// (power and sleep, calls, camera, assistant, volume, brightness, media). Same list as the phone client.
+export const KEY_NAMES = ["back", "home", "recents", "enter", "tab", "delete"] as const;
+// Any other key by its Android name (KEYCODE_PAGE_DOWN, KEYCODE_POWER, ...) or number. Same patterns as the phone client.
 const RAW_KEY_RE = /^KEYCODE_[A-Z0-9_]{1,40}$/;
-const DENIED_KEY_PREFIXES = [
-  "KEYCODE_POWER", "KEYCODE_SLEEP", "KEYCODE_SOFT_SLEEP", "KEYCODE_WAKEUP", "KEYCODE_CALL",
-  "KEYCODE_ENDCALL", "KEYCODE_CAMERA", "KEYCODE_VOICE_ASSIST", "KEYCODE_ASSIST", "KEYCODE_VOLUME_",
-  "KEYCODE_MUTE", "KEYCODE_BRIGHTNESS_", "KEYCODE_MEDIA_", "KEYCODE_HEADSETHOOK", "KEYCODE_SYSRQ",
-];
+const KEY_NUMBER_RE = /^\d{1,4}$/;
+const PACKAGE_RE = /^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*$/;
 
-export function isAllowedKey(key: unknown): key is string {
+export function isKey(key: unknown): boolean {
+  if (typeof key === "number") return Number.isInteger(key) && key >= 0 && key <= 9999;
   if (typeof key !== "string") return false;
-  if ((ALLOWED_KEYS as readonly string[]).includes(key)) return true;
-  return RAW_KEY_RE.test(key) && !DENIED_KEY_PREFIXES.some((p) => key.startsWith(p));
+  return (KEY_NAMES as readonly string[]).includes(key) || RAW_KEY_RE.test(key) || KEY_NUMBER_RE.test(key);
 }
 
-export const MAX_COORD = 10000;
-export const MIN_SCALE = 0.1;
-export const MAX_SCALE = 1;
 export const DEFAULT_SCREENSHOT_SCALE = 0.5;
-export const MIN_SWIPE_MS = 50;
-export const MAX_SWIPE_MS = 5000;
 export const DEFAULT_SWIPE_MS = 300;
-export const MAX_TEXT_LENGTH = 500;
-export const MAX_BODY_BYTES = 4096;
+// A command's deadline when the agent sets no `timeout` (seconds); typing and long swipes get their own time on top.
+export const DEFAULT_TIMEOUT_S = 30;
 
 export type CommandName = "state" | "screenshot" | "ui" | "tap" | "swipe" | "type" | "key" | "launch";
 
 export interface Command {
   cmd: CommandName;
-  args: Record<string, string | number>;
+  args: Record<string, unknown>;
+  // Request fields this command does not take; they are dropped and named in the reply.
+  ignored?: string[];
 }
 
 export type ValidationResult = { ok: true; command: Command } | { ok: false; error: string };
@@ -55,30 +49,35 @@ export const AGENT_ROUTES: Record<string, Route> = {
   "/launch": { method: "POST", cmd: "launch" },
 };
 
-const TEXT_RE = /^[\x20-\x7e]+$/;
+// Each command's own fields; every command also takes COMMON_FIELDS.
+const FIELDS: Record<CommandName, string[]> = {
+  state: [],
+  screenshot: ["scale"],
+  ui: [],
+  tap: ["x", "y", "scale"],
+  swipe: ["x1", "y1", "x2", "y2", "ms", "scale"],
+  type: ["text"],
+  key: ["key", "longpress"],
+  launch: ["package"],
+};
+const COMMON_FIELDS = ["timeout", "if_foreground"];
+
+type Fields = Record<string, unknown>;
 
 function fail(error: string): ValidationResult {
   return { ok: false, error };
 }
 
-function isCoord(v: unknown): v is number {
-  return typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= MAX_COORD;
+function isNumber(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v);
 }
 
-function isScale(v: unknown): v is number {
-  return typeof v === "number" && Number.isFinite(v) && v >= MIN_SCALE && v <= MAX_SCALE;
-}
-
-function checkKeys(body: Record<string, unknown>, allowed: string[]): string | null {
-  for (const k of Object.keys(body)) {
-    if (!allowed.includes(k)) return `unknown field: ${k}`;
-  }
-  return null;
+function isPositive(v: unknown): v is number {
+  return isNumber(v) && v > 0;
 }
 
 // Parse a JSON object body. Returns null for anything that is not a plain object.
 export function parseBody(raw: string): Record<string, unknown> | null {
-  if (raw.length > MAX_BODY_BYTES) return null;
   try {
     const v: unknown = JSON.parse(raw);
     if (v === null || typeof v !== "object" || Array.isArray(v)) return null;
@@ -88,90 +87,121 @@ export function parseBody(raw: string): Record<string, unknown> | null {
   }
 }
 
+// A GET's query string as fields: numbers for scale and timeout, a list for if_foreground.
+function queryFields(query: URLSearchParams): Fields {
+  const out: Fields = {};
+  for (const [k, v] of query) {
+    if (k === "scale" || k === "timeout") out[k] = v.trim() === "" ? NaN : Number(v);
+    else if (k === "if_foreground") out[k] = v.split(",");
+    else out[k] = v;
+  }
+  return out;
+}
+
 export function validateText(text: unknown): string | null {
   if (typeof text !== "string" || text.length === 0) return "text must be a non-empty string";
-  if (text.length > MAX_TEXT_LENGTH) return `text longer than ${MAX_TEXT_LENGTH} characters`;
-  if (!TEXT_RE.test(text)) return "text must be printable ASCII";
+  for (const c of text) {
+    const code = c.codePointAt(0) ?? 0;
+    if (code > 0x7e) return "non-ASCII text is not supported yet";
+    if (code < 0x20 && !"\n\r\t".includes(c)) return "control characters other than newline and tab cannot be typed";
+  }
   return null;
 }
 
+// Deadline (seconds) when the agent gives none. Mirrors the phone client's default_timeout.
+export function defaultTimeout(cmd: CommandName, args: Fields): number {
+  if (cmd === "type" && typeof args.text === "string") return DEFAULT_TIMEOUT_S + args.text.length / 10;
+  if (cmd === "swipe" && isNumber(args.ms)) return DEFAULT_TIMEOUT_S + Math.max(args.ms, 0) / 1000;
+  return DEFAULT_TIMEOUT_S;
+}
+
+// timeout (seconds above 0) and if_foreground (a package name or a list), taken by every command.
+function commonArgs(src: Fields): Fields | string {
+  const out: Fields = {};
+  if (src.timeout !== undefined) {
+    if (!isPositive(src.timeout)) return "timeout must be a number of seconds above 0";
+    out.timeout = src.timeout;
+  }
+  if (src.if_foreground !== undefined) {
+    const v = src.if_foreground;
+    const list = typeof v === "string" ? [v] : v;
+    if (!Array.isArray(list) || list.length === 0 || !list.every((p) => typeof p === "string" && PACKAGE_RE.test(p))) {
+      return "if_foreground must be a package name or a list of them";
+    }
+    out.if_foreground = list;
+  }
+  return out;
+}
+
+function commandArgs(cmd: CommandName, src: Fields): Fields | string {
+  switch (cmd) {
+    case "state":
+    case "ui":
+      return {};
+
+    case "screenshot": {
+      const scale = src.scale ?? DEFAULT_SCREENSHOT_SCALE;
+      if (!isPositive(scale)) return "scale must be a number above 0";
+      return { scale };
+    }
+
+    case "tap": {
+      if (!isNumber(src.x) || !isNumber(src.y)) return "x and y must be numbers";
+      const scale = src.scale ?? 1;
+      if (!isPositive(scale)) return "scale must be a number above 0";
+      return { x: src.x, y: src.y, scale };
+    }
+
+    case "swipe": {
+      const { x1, y1, x2, y2 } = src;
+      if (!isNumber(x1) || !isNumber(y1) || !isNumber(x2) || !isNumber(y2)) return "x1, y1, x2, y2 must be numbers";
+      const ms = src.ms ?? DEFAULT_SWIPE_MS;
+      if (!isNumber(ms) || ms < 0) return "ms must be a number 0 or above";
+      const scale = src.scale ?? 1;
+      if (!isPositive(scale)) return "scale must be a number above 0";
+      return { x1, y1, x2, y2, ms, scale };
+    }
+
+    case "type": {
+      const err = validateText(src.text);
+      if (err) return err;
+      return { text: src.text };
+    }
+
+    case "key": {
+      if (!isKey(src.key)) return `key must be one of ${KEY_NAMES.join(", ")}, a KEYCODE_* name or a key number`;
+      if (src.longpress !== undefined && typeof src.longpress !== "boolean") return "longpress must be true or false";
+      return src.longpress === undefined ? { key: src.key } : { key: src.key, longpress: src.longpress };
+    }
+
+    case "launch": {
+      if (typeof src.package !== "string" || !PACKAGE_RE.test(src.package)) return "package must be an Android package name";
+      return { package: src.package };
+    }
+  }
+}
+
+// A GET takes its fields from the query string, a POST from its JSON body.
 export function validateCommand(
   cmd: CommandName,
   query: URLSearchParams,
   body: Record<string, unknown> | null,
 ): ValidationResult {
-  switch (cmd) {
-    case "state":
-    case "ui":
-      return { ok: true, command: { cmd, args: {} } };
-
-    case "screenshot": {
-      const raw = query.get("scale");
-      const scale = raw === null ? DEFAULT_SCREENSHOT_SCALE : Number(raw);
-      if (!isScale(scale)) return fail(`scale must be between ${MIN_SCALE} and ${MAX_SCALE}`);
-      return { ok: true, command: { cmd, args: { scale } } };
-    }
-
-    case "tap": {
-      if (!body) return fail("JSON object body required");
-      const bad = checkKeys(body, ["x", "y", "scale"]);
-      if (bad) return fail(bad);
-      if (!isCoord(body.x) || !isCoord(body.y)) return fail(`x and y must be integers 0-${MAX_COORD}`);
-      const scale = body.scale ?? 1;
-      if (!isScale(scale)) return fail(`scale must be between ${MIN_SCALE} and ${MAX_SCALE}`);
-      return { ok: true, command: { cmd, args: { x: body.x, y: body.y, scale } } };
-    }
-
-    case "swipe": {
-      if (!body) return fail("JSON object body required");
-      const bad = checkKeys(body, ["x1", "y1", "x2", "y2", "ms", "scale"]);
-      if (bad) return fail(bad);
-      const { x1, y1, x2, y2 } = body;
-      if (!isCoord(x1) || !isCoord(y1) || !isCoord(x2) || !isCoord(y2)) {
-        return fail(`x1, y1, x2, y2 must be integers 0-${MAX_COORD}`);
-      }
-      const ms = body.ms ?? DEFAULT_SWIPE_MS;
-      if (typeof ms !== "number" || !Number.isInteger(ms) || ms < MIN_SWIPE_MS || ms > MAX_SWIPE_MS) {
-        return fail(`ms must be an integer ${MIN_SWIPE_MS}-${MAX_SWIPE_MS}`);
-      }
-      const scale = body.scale ?? 1;
-      if (!isScale(scale)) return fail(`scale must be between ${MIN_SCALE} and ${MAX_SCALE}`);
-      return { ok: true, command: { cmd, args: { x1, y1, x2, y2, ms, scale } } };
-    }
-
-    case "type": {
-      if (!body) return fail("JSON object body required");
-      const bad = checkKeys(body, ["text"]);
-      if (bad) return fail(bad);
-      const err = validateText(body.text);
-      if (err) return fail(err);
-      return { ok: true, command: { cmd, args: { text: body.text as string } } };
-    }
-
-    case "key": {
-      if (!body) return fail("JSON object body required");
-      const bad = checkKeys(body, ["key"]);
-      if (bad) return fail(bad);
-      if (!isAllowedKey(body.key)) {
-        return fail(`key must be one of ${ALLOWED_KEYS.join(", ")} or a KEYCODE_* name (not power, calls, volume, media)`);
-      }
-      return { ok: true, command: { cmd, args: { key: body.key } } };
-    }
-
-    case "launch": {
-      if (!body) return fail("JSON object body required");
-      const bad = checkKeys(body, ["package"]);
-      if (bad) return fail(bad);
-      if (typeof body.package !== "string" || !(ALLOWED_PACKAGES as readonly string[]).includes(body.package)) {
-        return fail(`package must be one of: ${ALLOWED_PACKAGES.join(", ")}`);
-      }
-      return { ok: true, command: { cmd, args: { package: body.package } } };
-    }
-  }
+  const src = body ?? queryFields(query);
+  const common = commonArgs(src);
+  if (typeof common === "string") return fail(common);
+  const args = commandArgs(cmd, src);
+  if (typeof args === "string") return fail(args);
+  // Always send the deadline, so the phone and the relay use the same one.
+  const timeout = common.timeout ?? defaultTimeout(cmd, args);
+  const command: Command = { cmd, args: { ...args, ...common, timeout } };
+  const ignored = Object.keys(src).filter((k) => !FIELDS[cmd].includes(k) && !COMMON_FIELDS.includes(k));
+  if (ignored.length) command.ignored = ignored;
+  return { ok: true, command };
 }
 
 // Summary of a command for the action log. Typed text is never logged, only its length.
-export function summariseArgs(command: Command): Record<string, string | number> {
+export function summariseArgs(command: Command): Record<string, unknown> {
   if (command.cmd === "type") return { length: String(command.args.text ?? "").length };
   return { ...command.args };
 }

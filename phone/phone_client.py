@@ -2,9 +2,9 @@
 """Phone client for the phone relay (phase 1: adb, from Termux on the phone or from a computer).
 
 Dials out to the relay over WSS, receives commands, runs them through adb and
-replies. The app allowlist is enforced here, next to the phone, regardless of
-what the relay sends. Every input is sent in the same shell command as a
-focus check, so it only runs while an allowed app has focus.
+replies. There is no app allowlist: every app, key and setting is reachable.
+A command given `if_foreground` (a package or a list) runs in the same shell
+command as a focus check, so it only runs while one of those apps has focus.
 
 `ui` (the UI tree) runs `uiautomator dump`, which unbinds every accessibility
 service on the phone for a moment. Nothing else uses it, including --selftest.
@@ -22,6 +22,7 @@ import base64
 import io
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -30,13 +31,10 @@ import stat
 import sys
 import xml.etree.ElementTree as ET
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
-# ---- policy (edit deliberately; the relay has its own copy) ----
+# ---- key names and defaults (the relay has its own copy of the key names) ----
 
-ALLOWED_PACKAGES = ("com.google.android.gm", "com.android.chrome")
-# /launch may also start from the home screen (Samsung One UI Home).
-HOME_PACKAGES = ("com.sec.android.app.launcher",)
 KEYCODES = {
     "back": "KEYCODE_BACK",
     "home": "KEYCODE_HOME",
@@ -45,27 +43,18 @@ KEYCODES = {
     "tab": "KEYCODE_TAB",
     "delete": "KEYCODE_DEL",
 }
-# Any other key may be sent by its Android name (KEYCODE_PAGE_DOWN, KEYCODE_ESCAPE, ...),
-# except keys that act on the phone outside the app in front: power and sleep, calls,
-# camera, assistant, volume, brightness and media playback.
+# Any other key may be sent by its Android name (KEYCODE_PAGE_DOWN, KEYCODE_POWER, ...) or number.
+# These patterns only keep values shell-safe; they deny no key.
 _RAW_KEY_RE = re.compile(r"^KEYCODE_[A-Z0-9_]{1,40}$")
-_DENIED_KEY_PREFIXES = (
-    "KEYCODE_POWER", "KEYCODE_SLEEP", "KEYCODE_SOFT_SLEEP", "KEYCODE_WAKEUP", "KEYCODE_CALL",
-    "KEYCODE_ENDCALL", "KEYCODE_CAMERA", "KEYCODE_VOICE_ASSIST", "KEYCODE_ASSIST", "KEYCODE_VOLUME_",
-    "KEYCODE_MUTE", "KEYCODE_BRIGHTNESS_", "KEYCODE_MEDIA_", "KEYCODE_HEADSETHOOK", "KEYCODE_SYSRQ",
-)
+_KEY_NUMBER_RE = re.compile(r"^\d{1,4}$")
+_PACKAGE_RE = re.compile(r"^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*$")
 DEFAULT_STOP_FILE = os.path.expanduser("~/STOP_PHONE_AGENT")
 
-MAX_COORD = 10000
-MIN_SCALE = 0.1
-MAX_SCALE = 1.0
-MIN_SWIPE_MS = 50
-MAX_SWIPE_MS = 5000
-MAX_TEXT_LENGTH = 500
 JPEG_QUALITY = 60
-MAX_UI_ELEMENTS = 300
-MAX_UI_TEXT = 200
-ADB_TIMEOUT_S = 20
+# A command's deadline when the relay sends none; the agent can set any `timeout`.
+DEFAULT_TIMEOUT_S = 30
+# Characters per `input text` call, so a long text never becomes an over-long adb command.
+TEXT_CHUNK = 1000
 UI_DUMP_PATH = "/data/local/tmp/phone_relay_ui.xml"
 # Printed by a guarded command when the focus check fails, instead of running the action.
 REFUSED_MARKER = "PHONE_RELAY_REFUSED"
@@ -90,7 +79,8 @@ class Adb:
         self.adb_bin = adb_bin
         self.serial = serial
 
-    async def run(self, *args: str, timeout: float = ADB_TIMEOUT_S) -> bytes:
+    async def run(self, *args: str, timeout: float | None = None) -> bytes:
+        """One adb call. No timeout by default: the command's deadline (PhoneController.handle) cancels it."""
         # A .py "adb" (the tests' fake) runs with this Python: no shell wrapper, so it works on Windows too.
         cmd = [sys.executable, self.adb_bin] if self.adb_bin.endswith(".py") else [self.adb_bin]
         if self.serial:
@@ -105,18 +95,28 @@ class Adb:
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout)
         except asyncio.TimeoutError as e:
-            proc.kill()
-            await proc.wait()
-            raise CommandError("adb_timeout", " ".join(args[:2])) from e
+            await _kill(proc)
+            raise CommandError("timeout", " ".join(args[:2])) from e
+        except asyncio.CancelledError:
+            await _kill(proc)  # the command's deadline passed: never leave adb running behind it
+            raise
         if proc.returncode != 0:
             raise CommandError("adb_failed", err.decode(errors="replace").strip()[:200])
         return out
 
-    async def shell(self, command: str, timeout: float = ADB_TIMEOUT_S) -> str:
+    async def shell(self, command: str, timeout: float | None = None) -> str:
         return (await self.run("shell", command, timeout=timeout)).decode(errors="replace")
 
-    async def exec_out(self, command: str, timeout: float = ADB_TIMEOUT_S) -> bytes:
+    async def exec_out(self, command: str, timeout: float | None = None) -> bytes:
         return await self.run("exec-out", command, timeout=timeout)
+
+
+async def _kill(proc: asyncio.subprocess.Process) -> None:
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
+    await proc.wait()
 
 
 # ---- parsing helpers (pure, unit-tested) ----
@@ -136,8 +136,7 @@ def parse_foreground(dumpsys: str) -> str | None:
     """Return the package (or window name) of the focused window, or None if unknown.
 
     Uses the first mCurrentFocus line. A lock screen shows up as NotificationShade
-    or com.android.systemui, which is not on the allowlist, so it is refused.
-    In-app popups (e.g. Chrome's overflow menu) are titled PopupWindow:<id> with no
+    or com.android.systemui. In-app popups (e.g. Chrome's overflow menu) are titled PopupWindow:<id> with no
     package; only for those, the owning app is taken from mFocusedApp.
     """
     m = _FOCUS_RE.search(dumpsys)
@@ -175,11 +174,10 @@ def _short(name: str) -> str:
     return name.rsplit("/", 1)[-1].rsplit(".", 1)[-1] if name else ""
 
 
-def parse_ui(xml_bytes: bytes, allowlist: tuple[str, ...] = ALLOWED_PACKAGES) -> list[dict]:
-    """Compact list of useful elements from a uiautomator dump.
+def parse_ui(xml_bytes: bytes) -> list[dict]:
+    """Compact list of useful elements from a uiautomator dump, from every package on screen.
 
-    Nodes from packages outside the allowlist (status bar, keyboard, other
-    apps' overlays) are dropped. Password field contents are never returned.
+    Nodes with no text, description or flag worth acting on are dropped; nothing else is.
     """
     start = xml_bytes.find(b"<?xml")
     if start < 0:
@@ -195,15 +193,13 @@ def parse_ui(xml_bytes: bytes, allowlist: tuple[str, ...] = ALLOWED_PACKAGES) ->
     elements: list[dict] = []
     for node in root.iter("node"):
         a = node.attrib
-        if a.get("package") not in allowlist:
-            continue
         bounds = parse_bounds(a.get("bounds", ""))
         if not bounds or bounds[2] <= bounds[0] or bounds[3] <= bounds[1]:
             continue
         cls = a.get("class", "")
         password = a.get("password") == "true"
-        text = "" if password else a.get("text", "")[:MAX_UI_TEXT]
-        desc = a.get("content-desc", "")[:MAX_UI_TEXT]
+        text = a.get("text", "")
+        desc = a.get("content-desc", "")
         clickable = a.get("clickable") == "true"
         scrollable = a.get("scrollable") == "true"
         editable = "EditText" in cls
@@ -230,8 +226,6 @@ def parse_ui(xml_bytes: bytes, allowlist: tuple[str, ...] = ALLOWED_PACKAGES) ->
             if value:
                 el[flag] = True
         elements.append(el)
-        if len(elements) >= MAX_UI_ELEMENTS:
-            break
     return elements
 
 
@@ -293,25 +287,30 @@ def guarded(action: str, packages: tuple[str, ...]) -> str:
 
 
 def validate_text(text: object) -> str:
+    """Any length of ASCII. Newlines and tabs are typed as Enter and Tab; other control characters cannot be."""
     if not isinstance(text, str) or not text:
         raise CommandError("invalid_args", "text must be a non-empty string")
-    if len(text) > MAX_TEXT_LENGTH:
-        raise CommandError("invalid_args", f"text longer than {MAX_TEXT_LENGTH} characters")
-    if any(not (0x20 <= ord(c) <= 0x7E) for c in text):
-        raise CommandError("invalid_args", "text must be printable ASCII")
+    for c in text:
+        if ord(c) > 0x7E:
+            raise CommandError("invalid_args", "non-ASCII text is not supported yet")
+        if ord(c) < 0x20 and c not in "\n\r\t":
+            raise CommandError("invalid_args", "control characters other than newline and tab cannot be typed")
     return text
 
 
 def escape_text(text: str) -> str:
     """Shell-quoted argument for one `input text`. Spaces become %s (input's own escape).
 
-    The text must not contain a literal "%s"; input_text_command splits around those.
+    The text must be one line of printable ASCII without a literal "%s";
+    input_text_command splits around those, and type_commands around newlines and tabs.
     """
-    return shlex.quote(validate_text(text).replace(" ", "%s"))
+    if any(not 0x20 <= ord(c) <= 0x7E for c in validate_text(text)):
+        raise CommandError("invalid_args", "one `input text` call takes one line of printable ASCII")
+    return shlex.quote(text.replace(" ", "%s"))
 
 
 def input_text_command(text: str) -> str:
-    """Shell command typing `text` exactly, '%' included.
+    """Shell command typing one line of `text` exactly, '%' included.
 
     `input text` turns every "%s" into a space, so a literal "%s" is sent as two
     calls ("...%" then "s..."). Spaces still go through as %s.
@@ -325,29 +324,84 @@ def input_text_command(text: str) -> str:
     return " && ".join(f"input text {escape_text(s)}" for s in segments if s)
 
 
+def type_commands(text: object) -> list[str]:
+    """Shell commands typing `text` exactly: `input text` per line, Enter for a newline, Tab for a tab.
+
+    A line longer than TEXT_CHUNK characters is typed in several calls. Consecutive
+    commands are joined with && into one adb call while that stays short.
+    """
+    text = validate_text(text).replace("\r\n", "\n").replace("\r", "\n")
+    steps: list[str] = []
+    for piece in re.split(r"([\n\t])", text):
+        if piece == "\n":
+            steps.append("input keyevent KEYCODE_ENTER")
+        elif piece == "\t":
+            steps.append("input keyevent KEYCODE_TAB")
+        else:
+            steps += [input_text_command(piece[i : i + TEXT_CHUNK]) for i in range(0, len(piece), TEXT_CHUNK)]
+    commands: list[str] = []
+    for step in steps:
+        if commands and len(commands[-1]) + len(step) < 4 * TEXT_CHUNK:
+            commands[-1] += " && " + step
+        else:
+            commands.append(step)
+    return commands
+
+
 def resolve_key(key: object) -> str:
-    """Android keycode for a short name (back, home, ...) or a KEYCODE_* name, unless denied."""
+    """Android keycode for a short name (back, home, ...), a KEYCODE_* name or a key number."""
+    if isinstance(key, int) and not isinstance(key, bool) and 0 <= key <= 9999:
+        return str(key)
     if isinstance(key, str) and key in KEYCODES:
         return KEYCODES[key]
-    if isinstance(key, str) and _RAW_KEY_RE.match(key):
-        if key.startswith(_DENIED_KEY_PREFIXES):
-            raise CommandError("invalid_args", f"{key} acts outside the app (power, calls, volume, media, ...)")
+    if isinstance(key, str) and (_RAW_KEY_RE.match(key) or _KEY_NUMBER_RE.match(key)):
         return key
-    raise CommandError("invalid_args", f"key must be one of {', '.join(KEYCODES)} or a KEYCODE_* name")
+    raise CommandError("invalid_args", f"key must be one of {', '.join(KEYCODES)}, a KEYCODE_* name or a key number")
+
+
+def _is_number(v: object) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
 
 def _coord(args: dict, name: str, scale: float) -> int:
     v = args.get(name)
-    if not isinstance(v, int) or isinstance(v, bool) or not 0 <= v <= MAX_COORD:
-        raise CommandError("invalid_args", f"{name} must be an integer 0-{MAX_COORD}")
+    if not _is_number(v):
+        raise CommandError("invalid_args", f"{name} must be a number")
     return round(v / scale)
 
 
 def _scale(args: dict, default: float = 1.0) -> float:
     v = args.get("scale", default)
-    if isinstance(v, bool) or not isinstance(v, (int, float)) or not MIN_SCALE <= v <= MAX_SCALE:
-        raise CommandError("invalid_args", f"scale must be between {MIN_SCALE} and {MAX_SCALE}")
+    if not _is_number(v) or v <= 0:
+        raise CommandError("invalid_args", "scale must be a number above 0")
     return float(v)
+
+
+def _timeout(args: dict, default: float) -> float:
+    v = args.get("timeout", default)
+    if not _is_number(v) or v <= 0:
+        raise CommandError("invalid_args", "timeout must be a number of seconds above 0")
+    return float(v)
+
+
+def default_timeout(cmd: str, args: dict) -> float:
+    """Deadline when the agent sets none: 30 s, plus the time typing or a long swipe itself takes."""
+    if cmd == "type" and isinstance(args.get("text"), str):
+        return DEFAULT_TIMEOUT_S + len(args["text"]) / 10
+    if cmd == "swipe" and _is_number(args.get("ms")):
+        return DEFAULT_TIMEOUT_S + max(args["ms"], 0) / 1000
+    return DEFAULT_TIMEOUT_S
+
+
+def _if_foreground(args: dict) -> tuple[str, ...] | None:
+    """Packages named by the optional if_foreground argument (one name or a list), or None."""
+    v = args.get("if_foreground")
+    if v is None:
+        return None
+    names = [v] if isinstance(v, str) else v
+    if not isinstance(names, list) or not names or not all(isinstance(p, str) and _PACKAGE_RE.match(p) for p in names):
+        raise CommandError("invalid_args", "if_foreground must be a package name or a list of them")
+    return tuple(names)
 
 
 # ---- controller ----
@@ -357,13 +411,11 @@ class PhoneController:
     def __init__(
         self,
         adb: Adb,
-        allowlist: tuple[str, ...] = ALLOWED_PACKAGES,
         stop_file: str = DEFAULT_STOP_FILE,
         focus_retries: int = 3,
         focus_retry_delay: float = 0.3,
     ) -> None:
         self.adb = adb
-        self.allowlist = allowlist
         self.stop_file = stop_file
         self.focus_retries = focus_retries
         self.focus_retry_delay = focus_retry_delay
@@ -386,14 +438,6 @@ class PhoneController:
                 await asyncio.sleep(self.focus_retry_delay)
         return fg, wake
 
-    async def require_allowed(self) -> str:
-        fg, wake = await self.foreground_and_wake()
-        if wake is not None and wake != "Awake":
-            raise CommandError("screen_off", f"wakefulness={wake}")
-        if fg not in self.allowlist:
-            raise CommandError("foreground_not_allowed", f"foreground={fg}")
-        return fg
-
     async def screen_size(self) -> tuple[int, int]:
         if self._screen_size is None:
             size = parse_size(await self.adb.shell("wm size"))
@@ -402,37 +446,39 @@ class PhoneController:
             self._screen_size = size
         return self._screen_size
 
-    async def _check_point(self, x: int, y: int) -> None:
-        # Accept either orientation; the device clips anything off-screen.
-        w, h = await self.screen_size()
-        limit = max(w, h)
-        if not (0 <= x < limit and 0 <= y < limit):
-            raise CommandError("invalid_args", f"point ({x},{y}) outside screen {w}x{h}")
+    async def _mismatch(self, packages: tuple[str, ...]) -> CommandError:
+        fg, wake = await self.foreground_and_wake()
+        return CommandError("foreground_mismatch", f"wanted {', '.join(packages)}; foreground={fg}, wakefulness={wake}")
 
-    async def _dump_ui(self) -> bytes:
-        """uiautomator dump, guarded like every action. Unbinds all accessibility services for a moment."""
+    async def _dump_ui(self, packages: tuple[str, ...] | None) -> bytes:
+        """uiautomator dump, guarded if asked. Unbinds all accessibility services for a moment."""
         dump = f"uiautomator dump {UI_DUMP_PATH} >/dev/null && cat {UI_DUMP_PATH}; rm -f {UI_DUMP_PATH}"
+        command = dump if packages is None else guarded(dump, packages)
         last: CommandError | None = None
         for _ in range(2):  # uiautomator fails if the screen is animating; retry once
             try:
-                out = await self.adb.exec_out(guarded(dump, self.allowlist), timeout=30)
+                out = await self.adb.exec_out(command)
                 if out.startswith(REFUSED_MARKER.encode()):
-                    raise CommandError("foreground_not_allowed", "focus changed before the UI dump")
+                    raise await self._mismatch(packages or ())
                 if b"</hierarchy>" in out:
                     return out
                 last = CommandError("ui_unavailable", out.decode(errors="replace").strip()[:200])
             except CommandError as e:
-                if e.code == "foreground_not_allowed":
+                if e.code == "foreground_mismatch":
                     raise
                 last = CommandError("ui_unavailable", e.detail)
             await asyncio.sleep(0.5)
         raise last or CommandError("ui_unavailable")
 
-    async def _guarded(self, action: str, packages: tuple[str, ...] | None = None, timeout: float = ADB_TIMEOUT_S) -> str:
-        """Run `action` on the phone only while an allowed app has focus (checked in the same command)."""
-        out = await self.adb.shell(guarded(action, packages or self.allowlist), timeout=timeout)
+    async def _guarded(self, action: str, args: dict) -> str:
+        """Run `action` on the phone. With if_foreground, only while one of those apps has focus,
+        checked in the same shell command, so a focus change just before the action refuses it."""
+        packages = _if_foreground(args)
+        if packages is None:
+            return await self.adb.shell(action)
+        out = await self.adb.shell(guarded(action, packages))
         if REFUSED_MARKER in out:
-            raise CommandError("foreground_not_allowed", "focus changed before the action ran")
+            raise await self._mismatch(packages)
         return out
 
     # ---- commands ----
@@ -454,7 +500,13 @@ class PhoneController:
         }.get(cmd)
         if handler is None:
             raise CommandError("invalid_args", f"unknown command: {cmd}")
-        return await handler(args)
+        _if_foreground(args)  # validates
+        timeout = _timeout(args, default_timeout(cmd, args))
+        try:
+            # The deadline cancels the command; Adb.run kills the adb call it was waiting on.
+            return await asyncio.wait_for(handler(args), timeout)
+        except asyncio.TimeoutError as e:
+            raise CommandError("timeout", f"{cmd} took longer than {timeout:g} s; pass a larger timeout") from e
 
     async def cmd_state(self, args: dict) -> dict:
         fg, wake = await self.foreground_and_wake()
@@ -462,24 +514,24 @@ class PhoneController:
         w, h = await self.screen_size()
         return {
             "foreground": fg,
-            "foreground_allowed": fg in self.allowlist,
             "awake": wake == "Awake",
             "battery": battery,
             "screen": {"width": w, "height": h},
-            "allowlist": list(self.allowlist),
             "client_version": VERSION,
         }
 
     async def cmd_screenshot(self, args: dict) -> dict:
-        scale = _scale(args, 0.5)
-        fg = await self.require_allowed()
-        png = await self.adb.exec_out(guarded("screencap -p", self.allowlist), timeout=30)
+        scale = min(_scale(args, 0.5), 1.0)  # no upscaling: it adds no detail
+        packages = _if_foreground(args)
+        png = await self.adb.exec_out("screencap -p" if packages is None else guarded("screencap -p", packages))
         if png.startswith(REFUSED_MARKER.encode()):
-            raise CommandError("foreground_not_allowed", "focus changed before the capture")
+            raise await self._mismatch(packages or ())
         if not png.startswith(b"\x89PNG"):
             raise CommandError("device_error", "screencap did not return a PNG")
-        # Re-check: if the foreground changed while capturing, discard the image.
-        await self.require_allowed()
+        fg, _ = await self.foreground_and_wake()
+        # With if_foreground: if the app in front changed while capturing, discard the image.
+        if packages is not None and fg not in packages:
+            raise CommandError("foreground_mismatch", f"foreground changed to {fg} during the capture")
         try:
             from PIL import Image
         except ImportError:
@@ -494,18 +546,19 @@ class PhoneController:
         return _image_result(buf.getvalue(), "image/jpeg", img.size[0], img.size[1], rw, rh, scale, fg)
 
     async def cmd_ui(self, args: dict) -> dict:
-        fg = await self.require_allowed()
-        xml_bytes = await self._dump_ui()
-        await self.require_allowed()
-        elements = parse_ui(xml_bytes, self.allowlist)
+        packages = _if_foreground(args)
+        xml_bytes = await self._dump_ui(packages)
+        fg, _ = await self.foreground_and_wake()
+        # With if_foreground: if the app in front changed during the dump, discard it.
+        if packages is not None and fg not in packages:
+            raise CommandError("foreground_mismatch", f"foreground changed to {fg} during the UI dump")
+        elements = parse_ui(xml_bytes)
         return {"foreground": fg, "count": len(elements), "elements": elements}
 
     async def cmd_tap(self, args: dict) -> dict:
         scale = _scale(args)
         x, y = _coord(args, "x", scale), _coord(args, "y", scale)
-        await self._check_point(x, y)
-        await self._refuse_keyboard_on_password(await self.require_allowed())
-        await self._guarded(f"input tap {x} {y}")
+        await self._guarded(f"input tap {x} {y}", args)
         return {"x": x, "y": y}
 
     async def cmd_swipe(self, args: dict) -> dict:
@@ -513,12 +566,10 @@ class PhoneController:
         x1, y1 = _coord(args, "x1", scale), _coord(args, "y1", scale)
         x2, y2 = _coord(args, "x2", scale), _coord(args, "y2", scale)
         ms = args.get("ms", 300)
-        if not isinstance(ms, int) or isinstance(ms, bool) or not MIN_SWIPE_MS <= ms <= MAX_SWIPE_MS:
-            raise CommandError("invalid_args", f"ms must be an integer {MIN_SWIPE_MS}-{MAX_SWIPE_MS}")
-        await self._check_point(x1, y1)
-        await self._check_point(x2, y2)
-        await self._refuse_keyboard_on_password(await self.require_allowed())
-        await self._guarded(f"input swipe {x1} {y1} {x2} {y2} {ms}", timeout=ADB_TIMEOUT_S + ms / 1000)
+        if not _is_number(ms) or ms < 0:
+            raise CommandError("invalid_args", "ms must be a number 0 or above")
+        ms = round(ms)
+        await self._guarded(f"input swipe {x1} {y1} {x2} {y2} {ms}", args)
         return {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "ms": ms}
 
     async def input_state(self) -> tuple[tuple[str, int] | None, bool | None]:
@@ -529,55 +580,41 @@ class PhoneController:
     async def text_field(self) -> tuple[str, int] | None:
         return (await self.input_state())[0]
 
-    async def _refuse_keyboard_on_password(self, fg: str) -> None:
-        """No taps or swipes while the keyboard is open on a password field.
-
-        The keyboard window never takes focus, so the focus guard lets taps on its keys
-        through: without this, a password could be typed key by key (or pasted from
-        the keyboard's clipboard bar). Back closes the keyboard; then taps work again.
-        """
-        field, shown = await self.input_state()
-        if field is not None and field[0] == fg and is_password_type(field[1]) and shown is not False:
-            raise CommandError("password_field", "the keyboard is open on a password field; press back first")
-
     async def cmd_type(self, args: dict) -> dict:
-        command = input_text_command(args.get("text"))  # validates
-        fg = await self.require_allowed()
-        # Typing with no field focused is the agent's call: it checks the result itself.
+        commands = type_commands(args.get("text"))  # validates
+        # Typing with no field focused is the agent's call: the reply says what was focused.
         field = await self.text_field()
-        if field is not None and field[0] == fg and is_password_type(field[1]):
-            raise CommandError("password_field", "refusing to type into a password field")
-        await self._guarded(command, timeout=45)
-        return {"length": len(args["text"]), "field_input_type": field[1] if field and field[0] == fg else None}
+        for command in commands:
+            if self.stopped():  # a long text: the owner's stop file halts it between chunks
+                raise CommandError("stopped", "stop file present")
+            await self._guarded(command, args)
+        return {
+            "length": len(args["text"]),
+            "field_package": field[0] if field else None,
+            "field_input_type": field[1] if field else None,
+            "password_field": is_password_type(field[1]) if field else False,
+        }
 
     async def cmd_key(self, args: dict) -> dict:
         keycode = resolve_key(args.get("key"))
-        # Home is guarded too: never press it over another app (e.g. a widget's automation in front).
-        await self.require_allowed()
-        await self._guarded(f"input keyevent {keycode}")
+        longpress = args.get("longpress", False)
+        if not isinstance(longpress, bool):
+            raise CommandError("invalid_args", "longpress must be true or false")
+        await self._guarded(f"input keyevent {'--longpress ' if longpress else ''}{keycode}", args)
         return {"key": args.get("key")}
 
     async def cmd_launch(self, args: dict) -> dict:
         package = args.get("package")
-        if package not in self.allowlist:
-            raise CommandError("invalid_args", f"package must be one of: {', '.join(self.allowlist)}")
-        # Start only from an allowed app or the home screen, never over anything else.
-        from_packages = self.allowlist + HOME_PACKAGES
-        fg, wake = await self.foreground_and_wake()
-        if wake is not None and wake != "Awake":
-            raise CommandError("screen_off", f"wakefulness={wake}")
-        if fg not in from_packages:
-            raise CommandError("foreground_not_allowed", f"foreground={fg}")
+        if not isinstance(package, str) or not _PACKAGE_RE.match(package):
+            raise CommandError("invalid_args", "package must be an Android package name")
         out = await self.adb.shell(
             f"cmd package resolve-activity --brief -c android.intent.category.LAUNCHER {shlex.quote(package)}"
         )
         component = next((ln.strip() for ln in reversed(out.splitlines()) if ln.strip().startswith(package + "/")), None)
         if component:
-            await self._guarded(f"am start -W -n {shlex.quote(component)}", from_packages, timeout=30)
+            await self._guarded(f"am start -W -n {shlex.quote(component)}", args)
         else:
-            out = await self._guarded(
-                f"monkey -p {shlex.quote(package)} -c android.intent.category.LAUNCHER 1", from_packages
-            )
+            out = await self._guarded(f"monkey -p {shlex.quote(package)} -c android.intent.category.LAUNCHER 1", args)
             if "Events injected: 1" not in out:
                 raise CommandError("launch_failed", out.strip()[-200:])
         return {"package": package}
@@ -640,8 +677,9 @@ def _ws_connect(url: str, token: str):
     except ImportError:
         from websockets import connect  # legacy API
 
-        return connect(url, extra_headers=headers, ping_interval=20, ping_timeout=20, open_timeout=15)
-    return connect(url, additional_headers=headers, ping_interval=20, ping_timeout=20, open_timeout=15)
+        return connect(url, extra_headers=headers, ping_interval=20, ping_timeout=20, open_timeout=15, max_size=None)
+    # max_size=None: no cap on a command's size (the library's default is 1 MiB; the relay's own limit is 32 MiB)
+    return connect(url, additional_headers=headers, ping_interval=20, ping_timeout=20, open_timeout=15, max_size=None)
 
 
 def _rejected_status(exc: Exception) -> int | None:
@@ -668,18 +706,12 @@ async def relay_loop(controller: PhoneController, url: str, token: str) -> int:
                             "type": "hello",
                             "client": "termux-adb",
                             "version": VERSION,
-                            "allowlist": list(controller.allowlist),
                         }
                     )
                 )
                 watcher = asyncio.create_task(_watch_stop(controller, ws))
                 try:
-                    async for raw in ws:  # one command at a time: adb actions are serialised
-                        reply = await dispatch(controller, raw)
-                        if reply is not None:
-                            await ws.send(json.dumps(reply))
-                        if controller.stopped():
-                            await ws.close(1000, "stop file")
+                    await serve(controller, ws)
                 finally:
                     watcher.cancel()
             log.info("connection closed")
@@ -700,6 +732,38 @@ async def relay_loop(controller: PhoneController, url: str, token: str) -> int:
         log.info("reconnecting in %.1fs", delay)
         await asyncio.sleep(delay)
         backoff = min(backoff * 2, 60.0)
+
+
+async def serve(controller: PhoneController, ws) -> None:
+    """Run the relay's commands one at a time, in order, while reading the socket.
+
+    Reading goes on while a command runs, so when the connection closes (the owner's
+    disable, the stop file, a network drop) the running command is cancelled, and with
+    it the adb call it was waiting on, instead of carrying on unseen.
+    """
+    commands: asyncio.Queue = asyncio.Queue()
+
+    async def worker() -> None:
+        while True:
+            raw = await commands.get()  # one command at a time: adb actions are serialised
+            reply = await dispatch(controller, raw)
+            if reply is not None:
+                await ws.send(json.dumps(reply))
+            if controller.stopped():
+                await ws.close(1000, "stop file")
+
+    task = asyncio.create_task(worker())
+    try:
+        async for raw in ws:
+            commands.put_nowait(raw)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # a reply that could not be sent: the connection is gone anyway
+            log.warning("command worker stopped", exc_info=True)
 
 
 async def _watch_stop(controller: PhoneController, ws) -> None:
@@ -725,16 +789,18 @@ async def selftest(controller: PhoneController) -> int:
         print("   ", line.strip())
     state = await controller.cmd_state({})
     print("state:", json.dumps(state))
-    if not state["foreground_allowed"]:
-        print("FAIL: open Chrome or Gmail on the phone, then re-run the self-test")
+    fg = state["foreground"]
+    if not isinstance(fg, str) or not _PACKAGE_RE.match(fg) or "." not in fg:
+        print("FAIL: no app has focus; unlock the phone and open an app, then re-run the self-test")
         return 1
-    # The guard with a harmless action: proves the on-phone focus check works in this shell.
-    probe = await controller.adb.shell(guarded("echo GUARD_OK", controller.allowlist))
-    if "GUARD_OK" in probe:
-        print("input guard: passes while", state["foreground"], "has focus")
+    # The if_foreground guard with a harmless action: proves the on-phone focus check works in this shell.
+    probe = await controller.adb.shell(guarded("echo GUARD_OK", (fg,)))
+    refused = await controller.adb.shell(guarded("echo GUARD_OK", ("com.example.not.in.front",)))
+    if "GUARD_OK" in probe and REFUSED_MARKER in refused:
+        print("if_foreground guard: passes for", fg, "and refuses another package")
     else:
         ok = False
-        print("FAIL input guard: refused although an allowed app has focus:", probe.strip()[:200])
+        print("FAIL if_foreground guard:", probe.strip()[:200], "/", refused.strip()[:200])
     field = await controller.text_field()
     print("text field:", "none" if field is None else f"package={field[0]} inputType={field[1]:#x} password={is_password_type(field[1])}")
     try:
@@ -794,7 +860,8 @@ def main(argv: list[str] | None = None) -> int:
     controller = PhoneController(adb, stop_file=opts.stop_file or env.get("STOP_FILE") or DEFAULT_STOP_FILE)
 
     if opts.selftest:
-        return asyncio.run(selftest(controller))
+        # adb calls have no timeout of their own; a hung one stops the self-test after two minutes
+        return asyncio.run(asyncio.wait_for(selftest(controller), 120))
 
     url, token = env.get("RELAY_URL"), env.get("DEVICE_TOKEN")
     if not url or not token:
