@@ -42,6 +42,7 @@ class RelayService : Service() {
         statusJob = app.scope.launch {
             app.connection.status.collectLatest { status ->
                 getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification(status.label))
+                ToggleWidget.refresh(this@RelayService)
             }
         }
     }

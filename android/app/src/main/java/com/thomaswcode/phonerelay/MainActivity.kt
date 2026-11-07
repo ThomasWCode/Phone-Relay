@@ -110,7 +110,7 @@ private fun Screen(@Suppress("UNUSED_PARAMETER") tick: Int) {
     val context = LocalContext.current
     val app = RelayApp.of(context)
     val status by app.connection.status.collectAsStateWithLifecycle()
-    // Shared state: the tile and the notification switch it too, while this screen is open.
+    // Shared state: the tile, the widget and the notification switch it too, while this screen is open.
     val enabled by app.enabled.collectAsStateWithLifecycle()
     val askNotifications = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
@@ -132,7 +132,7 @@ private fun Screen(@Suppress("UNUSED_PARAMETER") tick: Int) {
                     })
                 }
                 Text(
-                    "Also from the Quick Settings tile and the notification. It stays as you leave it after a reboot.",
+                    "Also from the Quick Settings tile, the home screen widget and the notification. It stays as you leave it after a reboot.",
                     style = MaterialTheme.typography.bodySmall,
                 )
             }

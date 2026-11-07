@@ -14,7 +14,7 @@ These come from the owner's own instructions for working on this phone, cut down
 
 ## Before you touch the screen
 
-- The owner can turn the relay off on the phone at any moment (a Quick Settings tile, the app's notification). When the phone goes offline, stop; don't ask them to turn it back on unless your task needs it.
+- The owner can turn the relay off on the phone at any moment (a Quick Settings tile, a home screen widget, the app's notification). When the phone goes offline, stop; don't ask them to turn it back on unless your task needs it.
 - The owner may be using the phone. Check `/state` and a screenshot first. If they seem to be using it (an app unrelated to your task is in front, or the screen changes between two screenshots), ask before you send input.
 - Some of the owner's apps run automations that bring another app to the front by themselves for a few seconds. Never send input while one is running: if an app you didn't open appears, wait and check again.
 - Give every input `if_foreground` with the app you mean to act on. The phone checks it just before the action, so a focus change between your screenshot and your tap refuses the tap instead of landing in another app.

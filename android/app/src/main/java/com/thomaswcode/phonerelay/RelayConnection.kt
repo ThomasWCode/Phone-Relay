@@ -30,7 +30,7 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 
-/** Where the connection stands, for the app's screen, its notification and the tile. */
+/** Where the connection stands, for the app's screen, its notification, the tile and the widget. */
 sealed class Status(val label: String) {
     data object Off : Status("Off")
     data object NoSettings : Status("No relay URL or device token yet")
