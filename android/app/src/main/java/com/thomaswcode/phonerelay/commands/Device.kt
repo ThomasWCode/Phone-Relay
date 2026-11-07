@@ -50,6 +50,9 @@ data class IntentSpec(
 
 data class FileEntry(val name: String, val type: String, val size: Long, val modified: Long)
 
+/** The owner's answer to a request: true to accept, false to deny, null when it expired unanswered; and what they typed. */
+data class Answer(val accepted: Boolean?, val message: String?)
+
 /** A node of the UI tree, as far as the relay's elements need it. */
 interface UiNode {
     val text: String?
@@ -145,4 +148,11 @@ interface Device {
     fun deleteFile(path: String)
     /** Tells the media library about a file written to shared storage. */
     fun scanFile(path: String)
+    /**
+     * Asks the owner whether the agent may use the phone: a card over whatever is in front (which they
+     * can keep using meanwhile) and a notification, with the agent's `reason` and the `steps` it will
+     * run straight after an Accept. Returns their answer once they give it, or an expired one after
+     * `seconds`, with the card gone from the screen either way.
+     */
+    suspend fun ask(reason: String, steps: List<String>, seconds: Double): Answer
 }

@@ -16,6 +16,8 @@ private val PACKAGE_RE = Regex("^[A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)*$")
 /** A command's deadline when the relay sends none (seconds), as the adb client's DEFAULT_TIMEOUT_S. */
 const val DEFAULT_TIMEOUT_S = 30.0
 const val TRANSFER_TIMEOUT_S = 300.0
+/** How long a request waits for the owner's answer when the agent gives no `seconds`, as the relay's DEFAULT_REQUEST_S. */
+const val DEFAULT_REQUEST_S = 300.0
 
 fun JsonObject.number(name: String): Double? {
     val v = this[name] as? JsonPrimitive ?: return null
@@ -96,6 +98,9 @@ fun defaultTimeout(cmd: String, args: JsonObject): Double = when (cmd) {
         if (cmdName == "sleep") maxOf(stepArgs.number("ms") ?: 0.0, 0.0) / 1000
         else stepArgs.number("timeout")?.takeIf { it > 0 } ?: defaultTimeout(cmdName, stepArgs)
     }
+    // The wait for the owner's answer, then the queued steps' own time (as the relay's).
+    "request" -> (args.number("seconds") ?: DEFAULT_REQUEST_S) +
+        if (args["steps"] is JsonArray) defaultTimeout("batch", args) else DEFAULT_TIMEOUT_S
     else -> DEFAULT_TIMEOUT_S
 }
 

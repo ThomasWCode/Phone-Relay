@@ -64,6 +64,7 @@ class Commands(
         "chrome_activate" to { a, _ -> device.devtools(DevTools.socket(a)) { DevTools.tabAction(it, a, "activate") } },
         "wait" to { a, _ -> wait(a) },
         "batch" to { a, _ -> batch(a) },
+        "request" to { a, _ -> request(a) },
         "files" to { a, _ -> files(a) },
         "pull" to { a, s -> pull(a, s ?: noStream("pull")) },
         "push" to { a, s -> push(a, s ?: noStream("push")) },
@@ -76,8 +77,8 @@ class Commands(
         val handler = handlers[cmd] ?: throw CommandError("invalid_args", "unknown command: $cmd")
         val packages = args.ifForeground()
         val timeout = args.timeoutArg(defaultTimeout(cmd, args))
-        // Checked before the command starts; a batch checks each step instead.
-        if (packages != null && cmd != "batch") requireForeground(packages)
+        // Checked before the command starts; a batch (and a request's queued steps) checks each step instead.
+        if (packages != null && cmd != "batch" && cmd != "request") requireForeground(packages)
         // withTimeoutOrNull: only this deadline turns into "timeout"; an outer one cancels as usual.
         return withTimeoutOrNull((timeout * 1000).toLong()) { handler(args, stream) }
             ?: throw CommandError("timeout", "$cmd took longer than ${fmt(timeout)} s; pass a larger timeout")
@@ -507,7 +508,8 @@ class Commands(
         if (ms > 0) delay(ms) else yield()
     }
 
-    private suspend fun batch(args: JsonObject): JsonObject {
+    /** A batch's steps (a request's queued ones too), each a command a batch may run. */
+    private fun steps(args: JsonObject): JsonArray {
         val steps = args["steps"] as? JsonArray
         if (steps.isNullOrEmpty()) throw CommandError("invalid_args", "steps must be a non-empty list")
         steps.forEachIndexed { i, step ->
@@ -516,6 +518,11 @@ class Commands(
             val a = (step as JsonObject)["args"]
             if (a != null && a !is JsonObject && a !is JsonNull) throw CommandError("invalid_args", "step $i: args must be an object")
         }
+        return steps
+    }
+
+    private suspend fun batch(args: JsonObject): JsonObject {
+        val steps = steps(args)
         val stopOnError = args.boolArg("stop_on_error", true)
         val inherited = args["if_foreground"]
         val results = mutableListOf<JsonObject>()
@@ -542,6 +549,31 @@ class Commands(
             put("results", JsonArray(results))
             put("completed", results.size)
             put("all_ok", results.size == steps.size && results.all { (it["ok"] as JsonPrimitive).content == "true" })
+        }
+    }
+
+    // ---- asking the owner ----
+
+    /**
+     * Asks the owner whether the agent may use the phone (Device.ask), and on an Accept runs the queued
+     * steps at once, as a batch (if_foreground applying to each step), before anything else can come
+     * to the front. Every answer is a reply, not an error: accepted, denied or expired, with the
+     * owner's message.
+     */
+    private suspend fun request(args: JsonObject): JsonObject {
+        val reason = args.stringArg("reason")!!
+        if (reason.isBlank()) throw CommandError("invalid_args", "reason must be a non-empty string")
+        val seconds = args.numberArg("seconds", DEFAULT_REQUEST_S)
+        if (seconds <= 0) throw CommandError("invalid_args", "seconds must be a number above 0")
+        val queued = if (args["steps"] == null || args["steps"] is JsonNull) null else steps(args)
+        val started = System.nanoTime()
+        val answer = device.ask(reason, queued?.map { Ask.describe(it as JsonObject) }.orEmpty(), seconds)
+        val waited = (System.nanoTime() - started) / 1_000_000
+        return buildJsonObject {
+            put("answer", when (answer.accepted) { true -> "accepted"; false -> "denied"; null -> "expired" })
+            put("message", answer.message)
+            put("waited_ms", waited)
+            if (answer.accepted == true && queued != null) put("batch", batch(args))
         }
     }
 
@@ -602,7 +634,8 @@ class Commands(
         val WAIT_KINDS = listOf("change", "stable", "foreground", "text")
         val BATCH_COMMANDS = listOf(
             "state", "screenshot", "ui", "tap", "swipe", "type", "key", "launch", "open", "intent", "notifications",
-            "statusbar", "rotation", "wait", "files", "gesture", "clipboard_set", "clipboard_get", "record_start", "sleep",
+            "statusbar", "rotation", "wait", "files", "gesture", "clipboard_set", "clipboard_get", "record_start",
+            "chrome_tabs", "chrome_eval", "chrome_cdp", "chrome_new", "chrome_close", "chrome_activate", "sleep",
         )
         /** A key the shell may be given: a KEYCODE_* name or a number. */
         private val SHELL_KEY = Regex("^(KEYCODE_[A-Z0-9_]{1,40}|\\d{1,4})$")

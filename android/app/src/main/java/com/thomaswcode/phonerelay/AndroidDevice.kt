@@ -543,6 +543,8 @@ class AndroidDevice(
         MediaScannerConnection.scanFile(context, arrayOf(path), null, null)
     }
 
+    override suspend fun ask(reason: String, steps: List<String>, seconds: Double) = RequestPrompt.ask(context, reason, steps, seconds)
+
     private companion object {
         const val CLIPBOARD_MS = 5_000L
     }

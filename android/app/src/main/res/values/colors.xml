@@ -2,4 +2,12 @@
 <resources>
     <color name="ic_launcher_background">#1E3A8A</color>
     <color name="widget_off">#99424242</color>
+    <!-- The request card (dark mode's in values-night). -->
+    <color name="request_card">#FFFFFFFF</color>
+    <color name="request_stroke">#FFDADCE0</color>
+    <color name="request_field">#FFF1F3F4</color>
+    <color name="request_text">#FF1B1B1F</color>
+    <color name="request_subtle">#FF5F6368</color>
+    <color name="request_accent">#FF1E3A8A</color>
+    <color name="request_on_accent">#FFFFFFFF</color>
 </resources>
