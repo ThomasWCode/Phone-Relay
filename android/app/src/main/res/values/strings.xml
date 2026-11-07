@@ -15,4 +15,14 @@
     <string name="pairing_code">Pairing code</string>
     <string name="pairing_digits">The code is six digits: try again.</string>
     <string name="pairing_done">Paired: the shell bridge is ready.</string>
+    <string name="request_channel">Requests</string>
+    <string name="request_channel_description">When Claude asks to use the phone</string>
+    <string name="request_title">Claude wants to use the phone</string>
+    <string name="request_then">Then, on Accept:</string>
+    <string name="request_message_hint">Message to Claude (optional)</string>
+    <string name="request_accept">Accept</string>
+    <string name="request_deny">Deny</string>
+    <string name="request_deny_reason">Deny with a reason</string>
+    <string name="request_reason">Reason</string>
+    <string name="request_left">%1$s left</string>
 </resources>

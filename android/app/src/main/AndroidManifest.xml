@@ -146,6 +146,11 @@
             android:name=".PairingReceiver"
             android:exported="false" />
 
+        <!-- An answer to the agent's request, given on its notification. -->
+        <receiver
+            android:name=".RequestReceiver"
+            android:exported="false" />
+
         <receiver
             android:name=".BootReceiver"
             android:exported="true">

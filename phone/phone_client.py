@@ -866,6 +866,9 @@ class PhoneController:
             raise CommandError("stopped", "stop file present")
         if not isinstance(args, dict):
             raise CommandError("invalid_args", "args must be an object")
+        if cmd == "request":
+            # Asking the owner needs something on the screen for them to answer; only the Android app has one.
+            raise CommandError("unsupported", "only the Android app can ask the owner; ask them in your chat instead")
         handler = {
             "state": self.cmd_state,
             "screenshot": self.cmd_screenshot,

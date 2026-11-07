@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The request card in dark mode. -->
+    <color name="request_card">#FF2B2D31</color>
+    <color name="request_stroke">#FF44474E</color>
+    <color name="request_field">#FF3C4043</color>
+    <color name="request_text">#FFE8EAED</color>
+    <color name="request_subtle">#FF9AA0A6</color>
+    <color name="request_accent">#FF8AB4F8</color>
+    <color name="request_on_accent">#FF062E6F</color>
+</resources>

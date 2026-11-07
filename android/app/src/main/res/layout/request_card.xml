@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The card asking the owner whether the agent may use the phone (RequestCard): the agent's reason,
+     the steps it will run on an Accept, a message box, and the answers. The header drags it. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:background="@drawable/request_card"
+    android:elevation="8dp"
+    android:orientation="vertical"
+    android:padding="16dp">
+
+    <LinearLayout
+        android:id="@+id/request_header"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <ImageView
+            android:layout_width="20dp"
+            android:layout_height="20dp"
+            android:importantForAccessibility="no"
+            android:src="@drawable/ic_relay"
+            android:tint="@color/request_accent" />
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:layout_weight="1"
+            android:text="@string/request_title"
+            android:textColor="@color/request_text"
+            android:textSize="16sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/request_timer"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:textColor="@color/request_subtle"
+            android:textSize="13sp" />
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/request_reason"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:ellipsize="end"
+        android:maxLines="8"
+        android:textColor="@color/request_text"
+        android:textSize="15sp" />
+
+    <TextView
+        android:id="@+id/request_steps"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:ellipsize="end"
+        android:maxLines="9"
+        android:textColor="@color/request_subtle"
+        android:textSize="13sp"
+        android:visibility="gone" />
+
+    <EditText
+        android:id="@+id/request_message"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:background="@drawable/request_field"
+        android:hint="@string/request_message_hint"
+        android:importantForAutofill="no"
+        android:inputType="textCapSentences|textMultiLine"
+        android:maxLines="3"
+        android:padding="10dp"
+        android:textColor="@color/request_text"
+        android:textColorHint="@color/request_subtle"
+        android:textSize="14sp" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:gravity="end"
+        android:orientation="horizontal">
+
+        <Button
+            android:id="@+id/request_deny"
+            style="?android:attr/borderlessButtonStyle"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/request_deny"
+            android:textColor="@color/request_text" />
+
+        <Button
+            android:id="@+id/request_accept"
+            style="?android:attr/borderlessButtonStyle"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:background="@drawable/request_accept"
+            android:paddingStart="20dp"
+            android:paddingEnd="20dp"
+            android:text="@string/request_accept"
+            android:textColor="@color/request_on_accent" />
+    </LinearLayout>
+</LinearLayout>

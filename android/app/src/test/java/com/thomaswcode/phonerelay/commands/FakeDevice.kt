@@ -227,6 +227,14 @@ class FakeDevice : Device {
         scanned += path
     }
 
+    /** The owner's answer to the next request, and what each request showed them (reason, steps, seconds). */
+    var answer = Answer(true, null)
+    val asked = mutableListOf<Triple<String, List<String>, Double>>()
+    override suspend fun ask(reason: String, steps: List<String>, seconds: Double): Answer {
+        asked += Triple(reason, steps, seconds)
+        return answer
+    }
+
     companion object {
         const val UNIX_SOCKETS = """Num       RefCount Protocol Flags    Type St Inode Path
 0000000000000000: 00000002 00000000 00010000 0001 01 12345 @chrome_devtools_remote

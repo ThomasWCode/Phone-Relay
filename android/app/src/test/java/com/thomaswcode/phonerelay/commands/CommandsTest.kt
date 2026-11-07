@@ -377,6 +377,74 @@ class CommandsTest {
     }
 
     @Test
+    fun requestAcceptedRunsTheQueuedStepsAtOnce() = runTest {
+        device.answer = Answer(true, "not WhatsApp")
+        val res = run("request", """{"reason": "Check the bus times", "seconds": 60, "steps": [
+            {"cmd": "launch", "args": {"package": "com.android.chrome"}}, {"cmd": "type", "args": {"text": "bus 7"}}]}""")
+        assertEquals("accepted", res.str("answer"))
+        assertEquals("not WhatsApp", res.str("message"))
+        assertEquals(listOf("com.android.chrome"), device.launched)
+        assertEquals(JsonPrimitive(true), res["batch"]!!.jsonObject["all_ok"])
+        // The owner saw the reason, each step in words (typed text included) and the wait.
+        assertEquals(Triple("Check the bus times", listOf("Open com.android.chrome", "Type “bus 7”"), 60.0), device.asked.single())
+    }
+
+    @Test
+    fun requestDeniedOrExpiredRunsNothing() = runTest {
+        device.answer = Answer(false, "after 6pm")
+        val denied = run("request", """{"reason": "x", "steps": [{"cmd": "tap", "args": {"x": 1, "y": 1}}]}""")
+        assertEquals("denied", denied.str("answer"))
+        assertEquals("after 6pm", denied.str("message"))
+        assertEquals(null, denied["batch"])
+        device.answer = Answer(null, null)
+        val expired = run("request", """{"reason": "x", "steps": [{"cmd": "tap", "args": {"x": 1, "y": 1}}]}""")
+        assertEquals("expired", expired.str("answer"))
+        assertEquals(JsonNull, expired["message"])
+        assertTrue(device.gestures.isEmpty())
+        assertEquals(DEFAULT_REQUEST_S, device.asked.last().third)
+        // Accepted with nothing queued: just the answer.
+        device.answer = Answer(true, null)
+        assertEquals(null, run("request", """{"reason": "x"}""")["batch"])
+    }
+
+    @Test
+    fun requestGuardsTheStepsNotTheAsking() = runTest {
+        device.fg = "com.android.settings" // the owner is elsewhere when the agent asks
+        val res = run("request", """{"reason": "x", "if_foreground": "com.android.chrome", "steps": [{"cmd": "tap", "args": {"x": 1, "y": 1}}]}""")
+        assertEquals("accepted", res.str("answer"))
+        assertEquals("foreground_mismatch", res["batch"]!!.jsonObject["results"]!!.jsonArray[0].jsonObject.str("error"))
+        for (bad in listOf("""{}""", """{"reason": " "}""", """{"reason": "x", "seconds": 0}""", """{"reason": "x", "steps": []}""",
+            """{"reason": "x", "steps": [{"cmd": "request"}]}""")) {
+            assertEquals("invalid_args", error("request", bad).code, bad)
+        }
+        assertEquals(1, device.asked.size) // a bad request is refused before the owner sees it
+        assertEquals(300.0 + 30 + 30, defaultTimeout("request", args("""{"steps": [{"cmd": "tap", "args": {}}]}""")))
+        assertEquals(60.0 + 30, defaultTimeout("request", args("""{"seconds": 60}""")))
+    }
+
+    @Test
+    fun askDescribesSteps() {
+        fun d(json: String) = Ask.describe(args(json))
+        assertEquals("Tap at 540, 1170 (only in com.android.chrome)", d("""{"cmd": "tap", "args": {"x": 540, "y": 1170, "if_foreground": "com.android.chrome"}}"""))
+        assertEquals("Pause 500 ms", d("""{"cmd": "sleep", "args": {"ms": 500}}"""))
+        assertEquals("Press back (held)", d("""{"cmd": "key", "args": {"key": "back", "longpress": true}}"""))
+        assertEquals("Open https://example.com in com.android.chrome", d("""{"cmd": "open", "args": {"url": "https://example.com", "package": "com.android.chrome"}}"""))
+        assertEquals("Wait for the screen to settle", d("""{"cmd": "wait", "args": {"for": "stable"}}"""))
+        assertEquals("Empty the clipboard", d("""{"cmd": "clipboard_set", "args": {"text": null}}"""))
+        val long = d("""{"cmd": "type", "args": {"text": "${"a".repeat(200)}"}}""")
+        assertEquals(Ask.TEXT_MAX + 7, long.length) // Type + the quotes around TEXT_MAX characters, the last an ellipsis
+        assertTrue(long.endsWith("…”"))
+    }
+
+    @Test
+    fun batchRunsChromeSteps() = runTest {
+        // The relay and the adb client let a batch run DevTools commands; the app did not.
+        device.shellPaired = true
+        val res = run("batch", """{"steps": [{"cmd": "chrome_tabs"}, {"cmd": "chrome_eval", "args": {"expression": "1+1"}}]}""")
+        assertEquals(JsonPrimitive(true), res["all_ok"])
+    }
+
+    @Test
     fun filesPullAndPush() = runTest {
         val listing = run("files", """{"path": "/sdcard/Download"}""")
         assertEquals("a.txt", listing["entries"]!!.jsonArray[0].jsonObject.str("name"))

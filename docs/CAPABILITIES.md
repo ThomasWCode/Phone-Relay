@@ -25,6 +25,7 @@ The phone side is either the **Android app** (always on; it drives the phone thr
 | Reading the clipboard | An invisible window of the app comes forward for a moment (Android lets only the app in front read it) | Through the helper |
 | Screen recording, audio | MediaProjection: Android's consent prompt shows for a moment before each, and the app answers it; the status bar shows the capture. One MP4 at any length. The sound output is captured as it plays, without apps that refuse capture (and calls) | `screenrecord` (MP4 segments past 180 s) and the helper (the output goes quiet on the phone meanwhile) |
 | Chrome DevTools, any key, typing with no field focused | Through the **shell bridge**: the app's own adb connection to this phone's wireless debugging, so only on Wi-Fi, and only once the owner has paired it (503 `shell_unavailable` otherwise, with the reason). The app switches wireless debugging back on by itself when Android has turned it off, if it holds the secure-settings grant | Direct |
+| Asking the owner (`/request`) | A card over the screen and a notification, with Accept, Deny and a message box | Not built (501 `unsupported`): nothing of its own to draw on the screen |
 | Grants the owner gives once | Accessibility service, notification access, all-files access, modify system settings, no battery optimisation, the microphone; for the shell bridge, pairing (the code typed into a notification) and, optionally, the secure-settings grant over adb | Wireless debugging pairing |
 
 ## Can do
@@ -77,6 +78,11 @@ The phone side is either the **Android app** (always on; it drives the phone thr
 ### Waiting and batches
 - **Wait** (`/wait`) until the screen changes, stops changing (an animation or page load has settled), an app comes to the front, or some text appears in the UI tree. Screens are compared at 1/8 scale, so a blinking cursor does not count as a change.
 - **Batch** (`/batch`): several commands in one request, with sleeps between them. Each step has its own deadline and takes the batch's `if_foreground` unless it sets its own. A batch stops at the first error unless told not to.
+
+### Asking the owner (the app)
+- **Request** (`POST /request`): asks the owner whether the agent may use the phone. A card appears at the top of the screen, over any app, with the agent's reason, the steps it queued (in words, typed text and URLs included), a countdown, a message box and Accept and Deny; a notification carries the same, with Accept, Deny and Deny with a reason, for when the card is out of sight. The card is an accessibility overlay: it needs no "display over other apps" grant, touches outside it reach the app beneath, so the owner can keep using the phone before answering, and dragging its header moves it. It takes the keyboard only while the owner types a message.
+- The reply comes when they answer, or after `seconds` (default 300) as `expired`: `accepted` or `denied`, with what they typed. On an Accept the queued steps (any `/batch` steps) run at once, before anything else can come to the front, the card already gone.
+- Nothing enforces it: the agent decides when to ask (the owner's rules say: when the phone seems in use), and a Deny refuses nothing; it is a reply, which the agent's rules say to follow. The relay keeps the last request's outcome (`GET /request`), for an agent whose own call was cut off.
 
 ### The helper (adb client)
 Gestures, the clipboard, pasted text, audio and the UI tree go through a small Java helper (`phone/helper/`), which the phone client pushes to `/data/local/tmp` on first use and runs as the shell user with `app_process`, as scrcpy does. It reaches hidden framework APIs by reflection; if a future Android changes one, that command fails with 502 `helper_failed` and its reason, and nothing falls back silently.

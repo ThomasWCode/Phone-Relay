@@ -102,6 +102,8 @@ For **Chrome DevTools, any key and typing with no field focused**, the app needs
 
 Turn **Relay** on at the top. It stays as you leave it: on again after an update of the app or Android rebinding its accessibility service, and after a reboot as soon as you first unlock the phone (Android starts apps only then; not yet tested), with nothing to start. To turn it off or on from anywhere: the **Phone Relay** Quick Settings tile (edit the tiles and drag it in), the **Phone Relay** home screen widget (long-press the home screen, **Widgets**, drag the 1x1 button in: blue and the connection's state while on, grey while off), or **Turn off** on its notification. Off means no connection at all.
 
+When the agent sees you using the phone, it can ask first (`POST /request`): a card appears at the top of the screen with its reason and the steps it would run, which you can drag aside while you carry on using the phone, then **Accept** or **Deny**, with an optional message to the agent (a condition, or when to come back). The same request is in a notification (Accept, Deny, Deny with a reason). On Accept, any steps it queued run straight away. Nothing new to grant: the card is drawn by the accessibility service. Its notification channel, **Requests**, can be silenced in the app's notification settings.
+
 What the app does differently from the adb client: see [docs/CAPABILITIES.md](docs/CAPABILITIES.md#two-clients).
 
 ## 2b. Or: the adb client (Termux, or a computer)

@@ -31,6 +31,9 @@ curl -sS -X POST $R/type   -H 'Content-Type: application/json' -d '{"text":"Grü
 curl -sS $R/clipboard
 curl -sS $R/chrome/tabs
 curl -sS -X POST $R/chrome/eval -H 'Content-Type: application/json' -d '{"expression":"document.title"}'
+# The owner is using the phone: ask, and queue what to do the moment they accept (waits up to 5 minutes for their answer)
+curl -sS -m 400 -X POST $R/request -H 'Content-Type: application/json' -d '{"reason":"Check the first bus tomorrow in the bus app (about a minute)","steps":[{"cmd":"launch","args":{"package":"com.example.bus"}},{"cmd":"wait","args":{"for":"stable"}}]}'
+curl -sS $R/request                                            # the last request's outcome, if your call above was cut off
 ```
 
 ## Endpoints
@@ -64,6 +67,8 @@ curl -sS -X POST $R/chrome/eval -H 'Content-Type: application/json' -d '{"expres
 | `POST /chrome/cdp {method,params?,tab?}` | Any [DevTools protocol](https://chromedevtools.github.io/devtools-protocol/) method on a tab, or on the browser with `"tab":"browser"`; the reply's `result` is DevTools' own |
 | `POST /chrome/new {url}`, `POST /chrome/activate {tab}`, `POST /chrome/close {tab}` | Open a tab, bring one to the front, close one |
 | `GET /chrome/sockets` | DevTools sockets on the phone (Chrome's, and any debuggable WebView's); every `/chrome/*` call takes `socket=` for another one |
+| `POST /request {reason,seconds?,steps?,stop_on_error?}` | Ask the owner whether you may use the phone (the Android app only; the adb client gives 501 `unsupported`). A card shows on their screen, over whatever they are doing, with your `reason`, the `steps` you queued (each in words, typed text included) and Accept and Deny; they can keep using the phone before they answer, and type a message to you. It waits `seconds` (default 300) for the answer. The reply's `answer` is `accepted`, `denied` or `expired` (no answer in time), always with HTTP 200; `message` is what they typed (or `null`), `waited_ms` how long they took. On `accepted`, the queued `steps` (a `/batch`'s: `if_foreground` applies to each) run straight away, and their results are in `batch`. One command at a time still: while a request waits, your other commands wait behind it |
+| `GET /request` | The last request's outcome, kept by the relay (it answers at once, even while a request holds the phone): `request` is `null`, or has `answer` (`pending` while the card is up, then as above, or `failed` with an `error`), `message`, `asked_at`, `answered_at` and `batch` |
 | `GET /audio?seconds=&source=` | Record `seconds` (default 10) of the phone's sound output (`source=output`, the default; with the adb client it is silent on the phone meanwhile; with the app, sound already playing when the capture starts can stay out of it: have the playback start after it begins) or its microphone (`source=mic`), as WAV |
 
 Every endpoint also takes:
@@ -82,6 +87,7 @@ What you can and cannot do, in full: [CAPABILITIES.md](CAPABILITIES.md). From th
 - **`/ui`** gives exact element centres and text. It leaves the phone's accessibility services alone; only `engine=uiautomator` unbinds them for a moment, so, with the adb client, use that only if the default fails (502 `helper_failed`), and say so; the app has one tree.
 - There are no rate limits. One command runs at a time; a slow one (a long `/wait`, `/record`, a big file) holds up the next. To record what your own actions do, use `/record/start` and `/record/stop`: the recording runs on the phone while your other commands go through.
 - `/wait {"for":"stable"}` after a tap that loads something is cheaper than polling screenshots yourself.
+- **Asking first** (`POST /request`): when the owner seems to be using the phone (see the owner's rules for when, and what to do with each answer). The call stays open until they answer, up to `seconds` plus the queued steps' time: give your HTTP client (`curl -m`) and your shell command's own time limit more than that, or run it in the background. If the call is cut off anyway, the card stays up and the steps still run on an Accept: `GET /request` tells you what happened, and the phone is yours again once its `answer` is no longer `pending`.
 
 ## Errors
 

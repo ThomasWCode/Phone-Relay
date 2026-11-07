@@ -14,8 +14,8 @@ android {
         // phone with (screenshots, the shade's dismissal, the d-pad actions), with no version checks.
         minSdk = 34
         targetSdk = 36
-        versionCode = 4
-        versionName = "1.3.0"
+        versionCode = 5
+        versionName = "1.4.0"
     }
 
     signingConfigs {
