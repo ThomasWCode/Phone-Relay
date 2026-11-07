@@ -15,6 +15,8 @@ const MAX_TIMER_MS = 2 ** 31 - 1; // setTimeout's limit (about 24.8 days); longe
 // Files cross the phone's socket in chunks of this size, at most STREAM_WINDOW unacknowledged (as the phone client).
 const STREAM_CHUNK = 256 * 1024;
 const STREAM_WINDOW = 8;
+// The last request's outcome is kept whole up to this size (SQLite holds it in the meta table).
+const REQUEST_KEEP_BYTES = 256 * 1024;
 
 // Device error code -> HTTP status. Unknown codes become 502.
 const DEVICE_ERROR_STATUS: Record<string, number> = {
@@ -144,6 +146,23 @@ export class DeviceHub extends DurableObject<Env> {
   private notes(): string {
     const row = this.sql.exec(`SELECT value FROM meta WHERE key = 'notes'`).toArray()[0];
     return row ? String(row.value) : "";
+  }
+
+  // The last request to the owner: pending while the phone shows it, then its answer (and the queued
+  // steps' results), so an agent whose own call was cut off can still find out how it went.
+  private recordRequest(outcome: Record<string, unknown>): void {
+    let text = JSON.stringify(outcome);
+    // A queued screenshot's image can be megabytes: past REQUEST_KEEP_BYTES, the steps' results are left out.
+    if (text.length > REQUEST_KEEP_BYTES && outcome.batch && typeof outcome.batch === "object") {
+      const { results: _results, ...batch } = outcome.batch as Record<string, unknown>;
+      text = JSON.stringify({ ...outcome, batch: { ...batch, results_omitted: true } });
+    }
+    this.sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('request', ?)`, text);
+  }
+
+  private lastRequest(): Record<string, unknown> | null {
+    const row = this.sql.exec(`SELECT value FROM meta WHERE key = 'request'`).toArray()[0];
+    return row ? (JSON.parse(String(row.value)) as Record<string, unknown>) : null;
   }
 
   // ---- socket helpers ----
@@ -296,13 +315,23 @@ export class DeviceHub extends DurableObject<Env> {
       return json(status, error ? { ok: false, error, ...extra, ...ignored } : { ok: true, ...extra, ...ignored });
     };
 
+    // The last request's outcome, from the relay's own record: it answers while a request still holds the phone.
+    if (command.cmd === "request_status") return json(200, { ok: true, request: this.lastRequest(), ...ignored });
+
     if (this.isDisabled()) return done(503, "disabled");
     const ws = this.openSockets()[0];
     if (!ws) return done(503, "device_offline");
 
     if (DOWNLOAD_COMMANDS.includes(command.cmd)) return this.download(ws, command, done);
+    const asking = command.cmd === "request";
+    if (asking) this.recordRequest({ answer: "pending", asked_at: new Date(started).toISOString() });
     const reply = await (command.cmd === UPLOAD_COMMAND ? this.upload(ws, command, body) : this.dispatch(ws, command)).reply;
 
+    if (asking) {
+      const asked_at = new Date(started).toISOString();
+      if (reply.ok) this.recordRequest({ ...(reply.result ?? {}), asked_at, answered_at: new Date().toISOString() });
+      else this.recordRequest({ answer: "failed", asked_at, error: reply.error ?? "device_error", ...(reply.detail ? { detail: reply.detail } : {}) });
+    }
     if (!reply.ok) return done(...this.failure(reply));
 
     const result = reply.result ?? {};

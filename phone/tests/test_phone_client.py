@@ -1020,6 +1020,14 @@ class WaitBatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([r["cmd"] for r in res["results"]], ["tap", "sleep", "type", "state"])
         self.assertEqual(adb.inputs(), ["input tap 1 2", "input text hi"])
 
+    async def test_request_is_unsupported(self):
+        ctl, adb = controller({"foreground": "com.android.settings"})
+        with self.assertRaises(pc.CommandError) as cm:
+            await ctl.handle("request", {"reason": "x", "if_foreground": "com.android.chrome",
+                                         "steps": [{"cmd": "tap", "args": {"x": 1, "y": 1}}]})
+        self.assertEqual(cm.exception.code, "unsupported")  # not foreground_mismatch: it never gets that far
+        self.assertEqual(adb.inputs(), [])
+
     async def test_batch_stops_on_error_unless_told_not_to(self):
         steps = [{"cmd": "tap", "args": {"x": 1, "y": 1}}, {"cmd": "launch", "args": {"package": "x y"}},
                  {"cmd": "tap", "args": {"x": 2, "y": 2}}]

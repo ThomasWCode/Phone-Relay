@@ -230,6 +230,42 @@ describe("Chrome DevTools commands", () => {
   });
 });
 
+describe("requests to the owner", () => {
+  it("POST asks the phone, GET reads the relay's record", () => {
+    expect(findRoute("/request", "POST")).toEqual({ method: "POST", cmd: "request" });
+    expect(findRoute("/request", "GET")).toEqual({ method: "GET", cmd: "request_status" });
+    expect(findRoute("/request", "PUT")).toBe("method");
+  });
+
+  it("needs a reason, and waits five minutes for the answer by default", () => {
+    expect(args(v("request", { reason: "Check the bus times" }))).toEqual({ reason: "Check the bus times", timeout: 330 });
+    expect(args(v("request", { reason: "x", seconds: 60 }))?.timeout).toBe(90);
+    for (const bad of [{}, { reason: "" }, { reason: "  " }, { reason: 1 }, { reason: "x", seconds: 0 }, { reason: "x", seconds: "60" }]) {
+      expect(v("request", bad).ok, JSON.stringify(bad)).toBe(false);
+    }
+  });
+
+  it("queues a batch's steps, checked as a batch's, with their time on top of the wait", () => {
+    const r = v("request", { reason: "x", seconds: 60, steps: [{ cmd: "launch", args: { package: "com.android.chrome" } }, { cmd: "sleep", args: { ms: 2000 } }], stop_on_error: false, if_foreground: "com.android.chrome" });
+    expect(r.ok).toBe(true);
+    // 60 s for the answer, then the batch: 30 s, the launch's 30 s and the 2 s sleep.
+    expect(args(r)).toEqual({
+      reason: "x", seconds: 60, stop_on_error: false, if_foreground: ["com.android.chrome"], timeout: 122,
+      steps: [{ cmd: "launch", args: { package: "com.android.chrome", timeout: 30 } }, { cmd: "sleep", args: { ms: 2000 } }],
+    });
+    for (const bad of [{ reason: "x", steps: [] }, { reason: "x", steps: [{ cmd: "request" }] }, { reason: "x", steps: [{ cmd: "pull", args: { path: "/x" } }] }]) {
+      expect(v("request", bad).ok, JSON.stringify(bad)).toBe(false);
+    }
+    // stop_on_error with nothing queued has nothing to apply to.
+    expect(v("request", { reason: "x", stop_on_error: true })).toMatchObject({ ok: true, command: { ignored: ["stop_on_error"] } });
+  });
+
+  it("logs the reason's length and the steps' shapes, never their text", () => {
+    expect(summariseArgs({ cmd: "request", args: { reason: "secret plan", seconds: 60, steps: [{ cmd: "type", args: { text: "secret" } }], timeout: 120 } }))
+      .toEqual({ seconds: 60, steps: [{ cmd: "type", args: { length: 6 } }], timeout: 120, reason_length: 11 });
+  });
+});
+
 describe("parseBody", () => {
   it("accepts only JSON objects, of any size", () => {
     expect(parseBody('{"a":1}')).toEqual({ a: 1 });

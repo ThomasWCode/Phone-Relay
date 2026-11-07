@@ -30,6 +30,8 @@ const AUDIO_SOURCES = ["output", "mic"];
 const DEVTOOLS_SOCKET_RE = /^[\w.-]{1,100}$/;
 const CDP_METHOD_RE = /^[A-Za-z]+\.[A-Za-z]+$/;
 const TAB_ID_RE = /^[\w-]{1,100}$/;
+// How long a request waits for the owner's answer when the agent gives no `seconds`.
+export const DEFAULT_REQUEST_S = 300;
 // Commands a batch may run (the JSON ones, plus sleep). Same list as the phone client.
 export const BATCH_COMMANDS = [
   "state", "screenshot", "ui", "tap", "swipe", "type", "key", "launch", "open", "intent",
@@ -43,7 +45,8 @@ export type CommandName =
   | "open" | "intent" | "notifications" | "statusbar" | "rotation" | "wait" | "batch"
   | "files" | "pull" | "push" | "record" | "record_start" | "record_stop"
   | "gesture" | "clipboard_get" | "clipboard_set" | "audio"
-  | "chrome_sockets" | "chrome_tabs" | "chrome_eval" | "chrome_cdp" | "chrome_new" | "chrome_close" | "chrome_activate";
+  | "chrome_sockets" | "chrome_tabs" | "chrome_eval" | "chrome_cdp" | "chrome_new" | "chrome_close" | "chrome_activate"
+  | "request" | "request_status";
 // Commands whose reply is a file streamed from the phone, and the one that streams a file to it.
 export const DOWNLOAD_COMMANDS: readonly CommandName[] = ["pull", "record", "record_stop", "audio"];
 export const UPLOAD_COMMAND: CommandName = "push";
@@ -97,6 +100,8 @@ export const AGENT_ROUTES: Record<string, Route | Route[]> = {
   "/chrome/new": { method: "POST", cmd: "chrome_new" },
   "/chrome/close": { method: "POST", cmd: "chrome_close" },
   "/chrome/activate": { method: "POST", cmd: "chrome_activate" },
+  // Asking the owner on the phone; the GET is the relay's record of the last request, not the phone's.
+  "/request": [{ method: "GET", cmd: "request_status" }, { method: "POST", cmd: "request" }],
 };
 
 // The route for a path and method: null for no such path, "method" for a path without that method.
@@ -140,6 +145,8 @@ const FIELDS: Record<CommandName, string[]> = {
   chrome_new: ["url", "socket"],
   chrome_close: ["tab", "socket"],
   chrome_activate: ["tab", "socket"],
+  request: ["reason", "seconds", "steps", "stop_on_error"],
+  request_status: [],
 };
 // Query-string fields read as numbers.
 const NUMERIC_QUERY_FIELDS = ["scale", "timeout", "seconds", "bit_rate"];
@@ -205,6 +212,11 @@ export function defaultTimeout(cmd: CommandName, args: Fields): number {
       total += step.cmd === "sleep" ? Number(step.args.ms ?? 0) / 1000 : Number(step.args.timeout);
     }
     return total;
+  }
+  // The wait for the owner's answer, then the queued steps' own time.
+  if (cmd === "request") {
+    const wait = isNumber(args.seconds) ? args.seconds : DEFAULT_REQUEST_S;
+    return wait + (Array.isArray(args.steps) ? defaultTimeout("batch", args) : DEFAULT_TIMEOUT_S);
   }
   return DEFAULT_TIMEOUT_S;
 }
@@ -525,6 +537,27 @@ function commandArgs(cmd: CommandName, src: Fields, ignored: string[]): Fields |
     case "batch":
       return batchArgs(src, ignored);
 
+    case "request": {
+      if (typeof src.reason !== "string" || src.reason.trim().length === 0) return "reason must be a non-empty string";
+      const out: Fields = { reason: src.reason };
+      if (src.seconds !== undefined) {
+        if (!isPositive(src.seconds)) return "seconds must be a number above 0";
+        out.seconds = src.seconds;
+      }
+      // The steps run on the phone straight after the owner accepts: a batch's steps, checked the same way.
+      if (src.steps !== undefined) {
+        const queued = batchArgs(src, ignored);
+        if (typeof queued === "string") return queued;
+        Object.assign(out, queued);
+      } else if (src.stop_on_error !== undefined) {
+        ignored.push("stop_on_error");
+      }
+      return out;
+    }
+
+    case "request_status":
+      return {};
+
     case "files":
     case "pull":
     case "push":
@@ -563,6 +596,11 @@ export function summariseArgs(command: Command): Record<string, unknown> {
 
 function summarise(cmd: string, args: Fields): Fields {
   if (cmd === "type" || cmd === "clipboard_set") return { length: String(args.text ?? "").length };
+  // A request's reason is the agent's own text, but it can name what is on the screen: its length only.
+  if (cmd === "request") {
+    const { reason, ...rest } = summarise("batch", args);
+    return { ...rest, reason_length: String(reason ?? "").length };
+  }
   if (cmd === "batch" && Array.isArray(args.steps)) {
     return { ...args, steps: (args.steps as Fields[]).map((s) => ({ cmd: s.cmd, args: summarise(String(s.cmd), (s.args ?? {}) as Fields) })) };
   }

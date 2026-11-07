@@ -308,6 +308,16 @@ def main():
         check("batch passes if_foreground down", s == 200 and j(b)["results"][0].get("error") == "foreground_mismatch",
               f"{s} {b[:300]}")
 
+        # ---- asking the owner: only the Android app can; the relay keeps the outcome either way ----
+        s, _, b = request("GET", "/request")
+        check("no request yet", s == 200 and j(b).get("request") is None, f"{s} {b[:200]}")
+        s, _, b = request("POST", "/request", body={"reason": "requestsecret", "steps": [{"cmd": "tap", "args": {"x": 1, "y": 1}}]})
+        check("the adb client cannot ask", s == 501 and j(b).get("error") == "unsupported", f"{s} {b[:200]}")
+        s, _, b = request("GET", "/request")
+        last = j(b).get("request") or {}
+        check("the relay keeps the last request's outcome",
+              s == 200 and last.get("answer") == "failed" and last.get("error") == "unsupported" and "asked_at" in last, f"{s} {b[:300]}")
+
         # ---- the helper: gestures, clipboard, audio, waiting for text ----
         s, _, b = request("POST", "/gesture", body={"pointers": [[[500, 1000], [300, 800]], [[580, 1080], [780, 1280]]],
                                                     "ms": 300})
@@ -381,7 +391,7 @@ def main():
         entries = j(b).get("entries", [])
         check("admin log readable", s == 200 and len(entries) > 10, f"{s}")
         check("typed text not logged", b"hello world" not in b and b"hunter2" not in b and b"batchsecret" not in b
-              and b"intentsecret" not in b and b"clipsecret" not in b and b"evalsecret" not in b)
+              and b"intentsecret" not in b and b"clipsecret" not in b and b"evalsecret" not in b and b"requestsecret" not in b)
         check("type logged as length", any(e.get("action") == "type" and e.get("detail") == {"length": 11} for e in entries))
 
         # ---- kill switch (admin) ----
