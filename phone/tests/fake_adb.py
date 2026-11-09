@@ -13,6 +13,14 @@ State is a JSON file named by FAKE_ADB_STATE:
 (a FakeDevTools server); "forwards" lists the forwards still open.
 The app_process helper is played too: "clipboard" holds its text, "pasted" and "gestures"
 collect what it was given, and "helper_error" makes it fail with that message.
+"packages" are the installed apps `dumpsys package` and `pm install` know (name -> version_code,
+version_name, debuggable, enabled, apk; their APKs are in "files"), and an app's own data is in
+"files" under /data/user/0/<package>/, read through `run-as`. "a11y_enabled" and "a11y_bound" are
+the accessibility services (`settings get secure enabled_accessibility_services`, `dumpsys
+accessibility`), "settings" maps "namespace key" to a value, "night_mode" is `cmd uimode night`'s,
+"logcat" holds the log's lines, "calendar" the rows `content query` gives for the calendar's
+events, "running" the packages with a process (pidof) and "signals" the run-as kills sent,
+"stopped" the packages force-stopped.
 Every invocation is appended to the file named by FAKE_ADB_LOG (one JSON list per line).
 
 Guarded commands (`if <focus guard>; then <action>; else echo PHONE_RELAY_REFUSED; fi`)
@@ -45,6 +53,21 @@ HELPER_PREFIX = f"CLASSPATH={HELPER_REMOTE} app_process / com.thomaswcode.phoner
 FAKE_WAV = b"RIFF\x24\x00\x00\x00WAVEfmt fake audio"
 MISSING_MARKER = "PHONE_RELAY_MISSING"
 MTIME = 1700000000
+SPLIT_MARKER = "PHONE_RELAY_SPLIT"
+TINY_APK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "tiny.apk")
+# tiny.apk: com.example.tiny 1.2.3-test (42), signed with a test key whose certificate's SHA-256 is this
+TINY_SHA256 = "db0a3e2dce9ae04bcdd279f2276bcf8300c153b356de6b4d9426264eecb69a6a"
+TINY_INSTALLED = "/data/app/~~Zm9v==/com.example.tiny-YmFy==/base.apk"
+DATA_ROOT = "/data/user/0/"
+FOCUS = "com.example.tiny/com.example.tiny.FocusService"
+LOG_LINES = [
+    "--------- beginning of main",
+    "11-09 07:00:00.000  1234  1234 I Decrastination: started",
+    "11-09 07:00:01.000  1234  1234 W Decrastination: slow",
+    "11-09 07:00:02.000   999   999 I ActivityManager: Start proc",
+    "11-09 07:00:03.000  1234  1234 E AndroidRuntime: FATAL EXCEPTION: main",
+    "11-09 07:00:03.000  1234  1234 E AndroidRuntime: Process: com.example.tiny, PID: 1234",
+]
 # Made-up notifications in the shape `dumpsys notification --noredact` prints.
 NOTIFICATION_DUMP = """Current Notification Manager state:
   Notification List:
@@ -75,10 +98,25 @@ GREP_PATTERN_RE = re.compile(r"grep -qE '([^']*)'")
 
 
 def default_state():
+    with open(TINY_APK, "rb") as f:
+        tiny = base64.b64encode(f.read()).decode()
     return {"foreground": "com.android.chrome", "awake": True, "popup": False,
             "password_focused": False, "text_field": True, "keyboard": True, "hang": 0,
-            "shade": 48, "files": {"/sdcard/Download/a.txt": base64.b64encode(b"hello file").decode()},
-            "rotation": [1, 0]}
+            "shade": 48, "files": {"/sdcard/Download/a.txt": base64.b64encode(b"hello file").decode(), TINY_INSTALLED: tiny,
+                                   DATA_ROOT + "com.example.tiny/files/plan.json": base64.b64encode(b'{"plan": []}').decode()},
+            "rotation": [1, 0],
+            "packages": {"com.example.tiny": {"version_code": 41, "version_name": "1.2.2", "debuggable": True,
+                                              "enabled": 0, "apk": TINY_INSTALLED},
+                         "com.android.chrome": {"version_code": 700000000, "version_name": "140.0", "debuggable": False,
+                                                "enabled": 0, "apk": "/data/app/~~Y2hy==/com.android.chrome-Y2hy==/base.apk"}},
+            "a11y_enabled": [FOCUS.replace("/com.example.tiny.", "/."), "com.b/com.b.S"],
+            "a11y_bound": [FOCUS, "com.b/com.b.S"],
+            "settings": {"global stay_on_while_plugged_in": "0"}, "night_mode": "yes",
+            "logcat": LOG_LINES,
+            "calendar": [{"_id": "1", "dtstart": "1700000000000", "dtend": "1700003600000",
+                          "description": "Made up, with a comma, and a\nsecond line"},
+                         {"_id": "2", "dtstart": "1700007200000", "dtend": "1700010800000", "description": "NULL"}],
+            "running": {"com.example.tiny": 4321}}
 
 
 def load_state():
@@ -250,6 +288,144 @@ def am(cmd, state):
     return f"Starting: Intent {{ cmp={target}/.Main }}\nStatus: ok\n"
 
 
+def package_dump(name, state):
+    """`dumpsys package NAME` as Android 16 prints it, cut to what the client reads."""
+    p = state.get("packages", {}).get(name)
+    if p is None:
+        return f"Unable to find package: {name}\n"
+    flags = "DEBUGGABLE HAS_CODE ALLOW_CLEAR_USER_DATA" if p.get("debuggable") else "HAS_CODE ALLOW_CLEAR_USER_DATA"
+    return (f"Packages:\n  Package [{name}] (9a8b7c6):\n    appId=10345\n    pkg=Package{{1a2b {name}}}\n"
+            f"    codePath={os.path.dirname(p['apk'])}\n    resourcePath={os.path.dirname(p['apk'])}\n"
+            f"    versionCode={p['version_code']} minSdk=34 targetSdk=36\n    versionName={p['version_name']}\n"
+            f"    flags=[ {flags} ]\n    privateFlags=[ PRIVATE_FLAG_ACTIVITIES_RESIZE_MODE_RESIZEABLE ]\n"
+            f"    timeStamp=2026-11-09 06:58:41\n    lastUpdateTime={p.get('updated', '2026-11-09 06:58:42')}\n"
+            f"    signatures=PackageSignatures{{3c4d version:2, signatures:[5e6f7a8b], past signatures:[]}}\n"
+            f"    User 0: ceDataInode=12345 deDataInode=0 installed=true hidden=false suspended=false distractionFlags=0 "
+            f"stopped=false notLaunched=false enabled={p.get('enabled', 0)} instant=false virtual=false\n"
+            f"      firstInstallTime=2026-10-01 10:00:00\n      gids=[3003]\n"
+            f"Queries:\n  system apps queryable: false\n")
+
+
+def accessibility_dump(state):
+    bound = state.get("a11y_bound", [])
+    entries = ", \n                     ".join(
+        f"Service[label=App {i}, feedbackType[FEEDBACK_GENERIC], capabilities=1, id={c.replace('/' + c.split('/')[0] + '.', '/.')}, "
+        f"eventTypes=TYPES_ALL_MASK, notificationTimeout=0, requestA11yBtn=false]" for i, c in enumerate(bound))
+    if state.get("a11y_unnamed"):
+        entries = "Service[label=App 0, feedbackType[FEEDBACK_GENERIC], capabilities=1]"
+    enabled = ", ".join("{" + c + "}" for c in state.get("a11y_enabled", []))
+    return ("ACCESSIBILITY MANAGER (dumpsys accessibility)\n\nUser state[\n     attributes:{id=0, touchExplorationEnabled=false}\n"
+            f"     Bound services:{{{entries}}}\n     Enabled services:{{{enabled}}}\n     Binding services:{{}}\n"
+            "     Crashed services:{}\n]\n")
+
+
+def install(path, state):
+    """`pm install -r PATH`: the APK's manifest against what is installed, as Android checks it."""
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import phone_client
+    files = state.setdefault("files", {})
+    if state.get("install_error"):
+        return f"Failure [{state['install_error']}]\n"
+    if path not in files:
+        return f"Error: Unable to open file: {path}\nConsider using a file under /data/local/tmp/\n"
+    import io
+    import zipfile
+    with zipfile.ZipFile(io.BytesIO(base64.b64decode(files[path]))) as z:
+        apk = phone_client.parse_apk_manifest(z.read("AndroidManifest.xml"))
+    current = state.setdefault("packages", {}).get(apk["package"])
+    if current and apk["version_code"] < current["version_code"]:
+        return (f"Failure [INSTALL_FAILED_VERSION_DOWNGRADE: Downgrade detected: Update version code "
+                f"{apk['version_code']} is older than current {current['version_code']}]\n")
+    installed = current.get("apk") if current else f"/data/app/~~bmV3==/{apk['package']}-bmV3==/base.apk"
+    files[installed] = files[path]
+    state["packages"][apk["package"]] = {**(current or {"debuggable": False, "enabled": 0}), "apk": installed,
+                                         "version_code": apk["version_code"], "version_name": apk["version_name"],
+                                         "updated": "2026-11-09 07:10:00"}
+    save_state(state)
+    return "Success\n"
+
+
+def logcat(cmd, state):
+    """`logcat -d [-b B] [-t T] [-s TAG:L ...] 2>&1 | tail -n N`: the stored lines, by tag, then the last N."""
+    state["last_logcat"] = cmd
+    save_state(state)
+    words = shlex.split(cmd.split(" 2>&1 | tail -n ")[0].replace('"$(( $(date +%s) - ', "").replace(' )).000"', ""))
+    lines = state.get("logcat", [])
+    if "-s" in words:
+        tags = [w.split(":")[0] for w in words[words.index("-s") + 1:]]
+        lines = [ln for ln in lines if any(f" {t}: " in ln for t in tags)]
+    n = int(cmd.rsplit(" ", 1)[1])
+    return "".join(ln + "\n" for ln in lines[-n:])
+
+
+def run_as(cmd, state, stdin=None):
+    """`run-as PACKAGE ...` in the app's data folder: a listing, a stat, a cat or a tar of a relative
+    path; a write from stdin (`sh -c 'mkdir -p D && cat > P'`), mv, rm and kill."""
+    words = shlex.split(cmd.removesuffix(" 2>&1"))
+    pkg = words[1]
+    if not state.get("packages", {}).get(pkg, {}).get("debuggable"):
+        return f"run-as: package not debuggable: {pkg}\n".encode()
+    root = DATA_ROOT + pkg
+    files = state.setdefault("files", {})
+
+    def absolute(rel):
+        return root if rel in (".", "") else root + "/" + rel.rstrip("/")
+
+    if words[2:4] == ["sh", "-c"] and words[4].startswith("mkdir -p "):  # a write from stdin
+        part = shlex.split(words[4])[-1]
+        files[absolute(part)] = base64.b64encode(stdin or b"").decode()
+        save_state(state)
+        return b""
+    if words[2] == "stat" and words[4] == "%s":  # `stat -c %s -- PATH`, after a write
+        path = absolute(words[6])
+        return (f"{len(base64.b64decode(files[path]))}\n" if path in files else f"stat: {words[6]}: No such file\n").encode()
+    if words[2] == "mv":
+        files[absolute(words[6])] = files.pop(absolute(words[5]))
+        save_state(state)
+        return b""
+    if words[2] == "rm":
+        files.pop(absolute(words[5]), None)
+        save_state(state)
+        return b""
+    if words[2] == "kill":
+        state.setdefault("signals", []).append([pkg, words[3], int(words[4])])
+        save_state(state)
+        return b""
+    if words[2:4] == ["sh", "-c"] and words[4].startswith("tar -cf - "):
+        # `tar -cf - PATH 2>/dev/null || echo MARKER`: tar's messages dropped, the marker after a failed run.
+        # "tar_unreadable" leaves a file out as an unreadable one would be, so tar exits 1.
+        import io
+        import tarfile
+        rel = shlex.split(words[4])[3]
+        base = absolute(rel)
+        buf, found = io.BytesIO(), False
+        with tarfile.open(fileobj=buf, mode="w", format=tarfile.USTAR_FORMAT) as tar:
+            for path in sorted(files):
+                if path == base or path.startswith(base + "/"):
+                    found = True
+                    data = base64.b64decode(files[path])
+                    info = tarfile.TarInfo(rel.rstrip("/") + path[len(base):])
+                    info.size, info.mtime = len(data), MTIME
+                    tar.addfile(info, io.BytesIO(data))
+        failed = b"PHONE_RELAY_TAR_FAILED" + bytes([10])
+        if not found:  # nothing there: no archive, and tar fails
+            return failed
+        return buf.getvalue() + (failed if state.get("tar_unreadable") else b"")
+    if words[2:4] == ["sh", "-c"]:  # the client's folder listing, of a relative path
+        inner = words[4]
+        rel = shlex.split(inner[len("if [ -d "):inner.index(" ]")])[0]
+        return list_command(f"if [ -d {shlex.quote(absolute(rel))} ]", state).encode()
+    if words[2] == "stat":
+        line = stat_line(absolute(words[6]), files)
+        return ((line if line else MISSING_MARKER) + "\n").encode()
+    if words[2] == "cat":
+        path = absolute(words[3])
+        if path not in files:
+            return f"cat: {words[3]}: No such file or directory\n".encode()
+        return base64.b64decode(files[path])
+    return b"run-as: unsupported\n"
+
+
 def helper_text(arg, files):
     """The helper's text argument: base64, or @path of a stored file."""
     if arg.startswith("@"):
@@ -290,8 +466,24 @@ def helper(cmd, state):
     return out + "PHONE_RELAY_HELPER_OK\n"
 
 
-def run(cmd, state):
-    """Output of one `adb shell`/`exec-out` command (bytes)."""
+def content_query(cmd, state):
+    """`content query --uri U [--projection a:b] ...`: the stored calendar's rows, as `content` prints them."""
+    words = shlex.split(cmd.removesuffix(" 2>&1"))
+    opt = {words[i]: words[i + 1] for i in range(2, len(words) - 1, 2)}
+    state["last_content"] = opt
+    save_state(state)
+    if opt["--uri"] != "content://com.android.calendar/events":
+        return (f"Error while accessing provider:{opt['--uri']}\njava.lang.IllegalArgumentException: Unknown URL\n"
+                + "\tat com.android.commands.content.Content.main(Content.java:735)\n" * 10)
+    rows = state.get("calendar", [])
+    if not rows:
+        return "No result found.\n"
+    cols = opt["--projection"].split(":") if "--projection" in opt else None
+    return "".join(f"Row: {i} " + ", ".join(f"{k}={row[k]}" for k in (cols or row)) + "\n" for i, row in enumerate(rows))
+
+
+def run(cmd, state, stdin=None):
+    """Output of one `adb shell`/`exec-out` command (bytes); `stdin` is an `exec-in`'s input."""
     m = GUARD_RE.match(cmd)
     if m:
         if not guard_passes(m.group("guard"), state):
@@ -302,6 +494,57 @@ def run(cmd, state):
     files = state.setdefault("files", {})
     if cmd.startswith(HELPER_PREFIX):
         return helper(cmd, state).encode()
+    if cmd.startswith("run-as "):
+        return run_as(cmd, state, stdin)
+    if cmd.startswith("content query "):
+        return content_query(cmd, state).encode()
+    if cmd.startswith("pidof "):
+        pid = state.get("running", {}).get(cmd.split()[1].rstrip(";"))
+        return (f"{pid}\n" if pid else "").encode()
+    if cmd.startswith("cmd uimode night"):
+        words = cmd.split()
+        if len(words) > 3:
+            state["night_mode"] = words[3]
+            save_state(state)
+        return f"Night mode: {state.get('night_mode', 'no')}\n".encode()
+    if cmd.startswith("am force-stop "):
+        state.setdefault("stopped", []).append(cmd.split()[2])
+        save_state(state)
+        return b""
+    if cmd.startswith("dumpsys package "):
+        return package_dump(shlex.split(cmd)[2], state).encode()
+    if cmd.startswith("pm path "):
+        p = state.get("packages", {}).get(shlex.split(cmd)[2])
+        return (f"package:{p['apk']}\n" if p else "").encode()
+    m = re.match(r"cat (\S+) \| pm install -r -S \$\(stat -c %s \1\) 2>&1", cmd)
+    if m:  # the APK streamed in by the shell, which can read shared storage
+        return install(shlex.split(m.group(1))[0], state).encode()
+    if cmd.startswith("pm install -r "):
+        path = shlex.split(cmd)[3]
+        if path.startswith(("/sdcard/", "/storage/")):  # the system server opens the file itself, and SELinux refuses it
+            return (f"System server has no access to read file context u:object_r:fuse:s0 (from path {path}, context u:r:system_server:s0)\n"
+                    f"Error: Unable to open file: {path}\nConsider using a file under /data/local/tmp/\n").encode()
+        return install(path, state).encode()
+    if cmd.startswith("logcat -d"):
+        return logcat(cmd, state).encode()
+    if cmd == "settings get secure enabled_accessibility_services":
+        return (":".join(state.get("a11y_enabled", [])) + "\n").encode()
+    if cmd.startswith("settings get secure enabled_accessibility_services; "):
+        return (":".join(state.get("a11y_enabled", [])) + "\n" + SPLIT_MARKER + "\n" + accessibility_dump(state)).encode()
+    if cmd.startswith("settings get ") and SPLIT_MARKER in cmd:  # one setting, and dark mode
+        ns, key = cmd.split()[2:4]
+        value = state.get("settings", {}).get(f"{ns} {key.rstrip(';')}", "null")
+        return f"{value}\n{SPLIT_MARKER}\nNight mode: {state.get('night_mode', 'no')}\n".encode()
+    if cmd.startswith("tail -c +"):  # `tail -c +N PATH | head -c L`: part of a file
+        m = re.match(r"tail -c \+(\d+) (.+) \| head -c (\d+)$", cmd)
+        path = shlex.split(m.group(2))[0]
+        if path not in files:
+            return b""
+        start = int(m.group(1)) - 1
+        return base64.b64decode(files[path])[start:start + int(m.group(3))]
+    if cmd.startswith("stat -c %s "):
+        path = shlex.split(cmd)[3]
+        return (f"{len(base64.b64decode(files[path]))}\n" if path in files else "").encode()
     if cmd == "cat /proc/net/unix":
         return ("Num       RefCount Protocol Flags    Type St Inode Path\n"
                 "0000000000000000: 00000002 00000000 00010000 0001 01 123 @chrome_devtools_remote\n"
@@ -406,10 +649,11 @@ def main(argv):
         code, err = transfer(args, state)
         sys.stderr.write(err)
         return code
-    if args[0] not in ("shell", "exec-out") or len(args) < 2:
+    if args[0] not in ("shell", "exec-out", "exec-in") or len(args) < 2:
         sys.stderr.write("fake adb: unsupported\n")
         return 1
-    sys.stdout.buffer.write(run(" ".join(args[1:]), state))
+    stdin = sys.stdin.buffer.read() if args[0] == "exec-in" else None
+    sys.stdout.buffer.write(run(" ".join(args[1:]), state, stdin))
     return 0
 
 

@@ -29,7 +29,8 @@ object Ask {
             "key" -> "Press ${(a["key"] as? JsonPrimitive)?.content ?: "a key"}${if (a.boolFlag("longpress")) " (held)" else ""}"
             "launch" -> "Open ${s("package") ?: "an app"}"
             "open" -> "Open ${cut(s("url") ?: "a link")}${s("package")?.let { " in $it" } ?: ""}"
-            "intent" -> "${if (a.boolFlag("broadcast")) "Send a broadcast" else "Start an activity"}${(s("action") ?: s("component"))?.let { ": $it" } ?: ""}"
+            "intent" -> "${if (a.boolFlag("broadcast")) "Send a broadcast" else "Start an activity"}${(s("action") ?: s("component"))?.let { ": $it" } ?: ""}" +
+                if (a.boolFlag("as_shell")) " (as the shell)" else ""
             "notifications" -> "Read the notifications"
             "statusbar" -> when (s("action")) {
                 "notifications" -> "Open the notification shade"
@@ -53,6 +54,25 @@ object Ask {
             "chrome_new" -> "Open ${cut(s("url") ?: "a page")} in a new Chrome tab"
             "chrome_close" -> "Close a Chrome tab"
             "chrome_activate" -> "Switch Chrome tab"
+            "install" -> "Install ${s("path") ?: "an APK"} over ${s("package") ?: "an app"}"
+            "accessibility" -> "Check the accessibility services"
+            "logcat" -> "Read the log"
+            "package" -> "Check what is installed of ${s("name") ?: "an app"}"
+            "settings" -> "Read the setting ${s("key") ?: ""}".trimEnd()
+            "run_as_files" -> "List ${s("package") ?: "an app"}'s own files"
+            "run_as_delete" -> "Delete ${s("path") ?: "a file"} from ${s("package") ?: "an app"}'s own files"
+            "run_as_kill" -> when (s("signal")) {
+                "STOP" -> "Pause ${s("package") ?: "an app"}"
+                "CONT" -> "Let ${s("package") ?: "an app"} run on"
+                else -> "End ${s("package") ?: "an app"}'s process (Android starts it again)"
+            }
+            "content" -> "Read ${s("uri") ?: "a provider"}"
+            "night_mode" -> when (s("mode")) {
+                "no" -> "Turn dark mode off"
+                "auto" -> "Set dark mode to automatic"
+                else -> "Turn dark mode on"
+            }
+            "force_stop" -> "Force-stop ${s("package") ?: "an app"}"
             else -> cmd
         }
         val guard = a.ifForegroundOrNull()

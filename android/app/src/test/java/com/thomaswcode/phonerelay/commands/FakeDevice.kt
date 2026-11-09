@@ -29,7 +29,7 @@ class FakeDevice : Device {
     val intents = mutableListOf<IntentSpec>()
     val launched = mutableListOf<String>()
     var clip: String? = "old"
-    val files = mutableMapOf("/sdcard/Download/a.txt" to "hello file".toByteArray())
+    val files = mutableMapOf("/sdcard/Download/a.txt" to "hello file".toByteArray(), TINY_INSTALLED to "fake apk bytes".toByteArray())
     val written = mutableMapOf<String, ByteArray>()
     val scanned = mutableListOf<String>()
     var roots: List<UiNode> = listOf(node("com.android.chrome", "", children = listOf(
@@ -149,13 +149,50 @@ class FakeDevice : Device {
     val chrome = FakeChrome()
     /** Runs while the bridge is "set up", before the guard: a test changes the foreground there. */
     var duringShellSetup: (() -> Unit)? = null
+    /** What the shell prints for a command (null: nothing), and the bytes shellToFile gets. */
+    var shellReply: (String) -> String? = { null }
+    var shellBytes: (String) -> ByteArray = { ByteArray(0) }
     override suspend fun shell(command: String, guard: (() -> Unit)?): String {
         if (!shellPaired) throw CommandError("shell_unavailable", "pair the app with wireless debugging first")
         duringShellSetup?.invoke()
         guard?.invoke()
         shellCommands += command
-        return if (command == "cat /proc/net/unix") UNIX_SOCKETS else ""
+        return shellReply(command) ?: if (command == "cat /proc/net/unix") UNIX_SOCKETS else ""
     }
+
+    override suspend fun shellToFile(command: String, guard: (() -> Unit)?): String {
+        if (!shellPaired) throw CommandError("shell_unavailable", "pair the app with wireless debugging first")
+        guard?.invoke()
+        shellCommands += command
+        files[SHELL_OUT] = shellBytes(command)
+        return SHELL_OUT
+    }
+
+    /** What shellWithInput was given: (command, input). */
+    val shellInputs = mutableListOf<Pair<String, ByteArray>>()
+    override suspend fun shellWithInput(command: String, inputPath: String, guard: (() -> Unit)?) {
+        if (!shellPaired) throw CommandError("shell_unavailable", "pair the app with wireless debugging first")
+        guard?.invoke()
+        shellCommands += command
+        shellInputs += command to (written[inputPath] ?: throw CommandError("not_found", inputPath))
+    }
+
+    override fun newOwnFile(): String = UPLOAD
+
+    /** APK files on the phone, and the packages installed. */
+    val apks = mutableMapOf("/sdcard/Download/tiny.apk" to ApkInfo("com.example.tiny", "1.2.3", 42))
+    val packages = mutableMapOf(
+        "com.example.tiny" to PackageDetails(
+            "com.example.tiny", "1.2.2", 41, "2026-10-01 10:00:00", "2026-11-09 06:58:42", listOf("ab12"), debuggable = true,
+            enabledState = "default", apkPath = TINY_INSTALLED,
+        ),
+        "com.android.chrome" to PackageDetails(
+            "com.android.chrome", "140.0", 700000000, "2026-01-01 00:00:00", "2026-11-01 00:00:00", listOf("cd34"), debuggable = false,
+            enabledState = "default", apkPath = "/data/app/~~Y2hy==/com.android.chrome-Y2hy==/base.apk",
+        ),
+    )
+    override fun apkInfo(path: String): ApkInfo = apks[path] ?: throw CommandError("not_found", "$path does not exist or the app cannot read it")
+    override fun packageDetails(name: String): PackageDetails = packages[name] ?: throw CommandError("not_found", "$name is not installed")
 
     override suspend fun <T> devtools(socket: String, work: suspend (DevToolsLink) -> T): T {
         if (!shellPaired) throw CommandError("shell_unavailable", "pair the app with wireless debugging first")
@@ -220,7 +257,7 @@ class FakeDevice : Device {
 
     override fun deleteFile(path: String) {
         written.remove(path)
-        if (path == RECORDING || path == AUDIO) files.remove(path)
+        if (path == RECORDING || path == AUDIO || path == SHELL_OUT) files.remove(path)
     }
 
     override fun scanFile(path: String) {
@@ -244,6 +281,9 @@ class FakeDevice : Device {
 """
         const val RECORDING = "/data/user/0/com.thomaswcode.phonerelay/cache/record.mp4"
         const val AUDIO = "/data/user/0/com.thomaswcode.phonerelay/cache/audio.wav"
+        const val SHELL_OUT = "/data/user/0/com.thomaswcode.phonerelay/cache/shell.out"
+        const val UPLOAD = "/data/user/0/com.thomaswcode.phonerelay/cache/upload.part"
+        const val TINY_INSTALLED = "/data/app/~~Zm9v==/com.example.tiny-YmFy==/base.apk"
 
         fun node(
             pkg: String, text: String, desc: String = "", id: String = "", cls: String = "android.widget.TextView",

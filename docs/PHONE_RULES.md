@@ -5,9 +5,10 @@ These come from the owner's own instructions for working on this phone, cut down
 ## It's the owner's main phone
 
 - This is the owner's main, daily phone, not a test device. Leave it exactly as you found it, and never make it unusable.
-- Never uninstall an app or clear an app's data or storage. Never force-stop an app: Android drops a force-stopped app's accessibility service from the enabled list, and some of the owner's apps depend on theirs.
+- Never uninstall an app or clear an app's data or storage. Force-stop (`/force-stop`) only an app your task opened, never one with an accessibility service: Android drops a force-stopped app's accessibility service from the enabled list, and some of the owner's apps depend on theirs (the relay refuses those).
+- Before you write into an app's own data (`/run-as/push`, `/run-as/delete`), keep a copy of it (`/run-as/archive?path=files`). To edit a store by hand, pause the app (`/run-as/kill` `STOP`), write it, then end its process (`KILL`): it starts again by itself, still enabled.
 - Don't change apps the task doesn't involve, or system settings. If a task needs a setting changed (rotation, volume, Do Not Disturb, brightness), note its value first and put it back when you're done.
-- Keep dark mode on. Don't change Developer options (wireless debugging least of all: the app's shell bridge and the owner's computer use it), accessibility settings or app permissions.
+- Keep dark mode on: for a light screenshot, `/night-mode` `no`, then `yes` again straight after. Don't change Developer options (wireless debugging least of all: the app's shell bridge and the owner's computer use it), accessibility settings or app permissions.
 - Don't press power or sleep unless the owner asked: it locks the phone, and you cannot unlock it again.
 - After a task that opened another app (a video app, say), close it and check that no picture-in-picture window is left on the screen.
 - A task's leftovers include whatever you asked the owner to do for it: at the end, undo it (or ask them to), keeping their real settings and data.
