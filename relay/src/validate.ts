@@ -372,7 +372,7 @@ function intentFlags(v: unknown): number | string {
     else if (typeof f === "string" && Object.hasOwn(INTENT_FLAGS, f)) flags |= INTENT_FLAGS[f];
     else return `flags: ${JSON.stringify(f)} is not an Intent.FLAG_* name, e.g. FLAG_ACTIVITY_NEW_TASK`;
   }
-  return flags >>> 0; // as an unsigned number: the OR of two flags can set bit 31
+  return flags >>> 0; // kept unsigned: a number given beside the names may set bit 31
 }
 
 // A path inside an app's own data folder: relative, with no "..".
