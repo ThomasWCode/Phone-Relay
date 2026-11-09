@@ -616,6 +616,90 @@ class CommandsTest {
         assertTrue("install" in commands.capabilities && "run_as" in commands.capabilities)
     }
 
+
+    // ---- what Decrastination's workflow does over adb ----
+
+    @Test
+    fun contentQuery() = runTest {
+        device.shellPaired = true
+        device.shellReply = { if (it.startsWith("content query")) "Row: 0 _id=1, description=Made up, with a comma\nand a line\nRow: 1 _id=2, description=NULL\n" else null }
+        val r = run("content", """{"uri": "content://com.android.calendar/events", "projection": ["_id", "description"], "where": "calendar_id=3 AND deleted=0"}""")
+        assertEquals(2, r["count"]!!.jsonPrimitive.int)
+        assertEquals("Made up, with a comma\nand a line", r["rows"]!!.jsonArray[0].jsonObject.str("description"))
+        assertEquals(JsonNull, r["rows"]!!.jsonArray[1].jsonObject["description"])
+        assertEquals("content query --uri content://com.android.calendar/events --projection _id:description --where 'calendar_id=3 AND deleted=0' 2>&1",
+            device.shellCommands.last())
+        device.shellReply = { "Error while accessing provider:x\njava.lang.IllegalArgumentException: Unknown URL\n" }
+        assertEquals("content_failed", error("content", """{"uri": "content://x/y"}""").code)
+    }
+
+    @Test
+    fun runAsArchivePushDeleteAndKill() = runTest {
+        device.shellPaired = true
+        val tar = ByteArray(1024).also { "ustar".toByteArray().copyInto(it, 257) }
+        device.shellBytes = { tar }
+        val sent = mutableListOf<JsonObject>()
+        commands.handle("run_as_archive", args("""{"package": "com.example.tiny", "path": "files"}"""), sink(sent))
+        assertEquals("application/x-tar", sent.first().str("mime"))
+        assertEquals("run-as com.example.tiny tar -cf - files", device.shellCommands.last())
+        device.shellBytes = { "tar: nothing: No such file or directory\n".toByteArray() }
+        assertEquals("not_found", assertFailsWith<CommandError> {
+            commands.handle("run_as_archive", args("""{"package": "com.example.tiny", "path": "nothing"}"""), sink(mutableListOf()))
+        }.code)
+
+        val data = """{"made": "up"}""".toByteArray()
+        device.shellReply = { cmd -> if (cmd.startsWith("run-as com.example.tiny stat -c %s")) "${data.size}\n" else null }
+        val upload = Stream("u") { }
+        upload.inbox.trySend(kotlinx.serialization.json.buildJsonObject {
+            put("type", JsonPrimitive("chunk")); put("seq", JsonPrimitive(0)); put("data", JsonPrimitive(Base64.getEncoder().encodeToString(data)))
+        })
+        upload.inbox.trySend(kotlinx.serialization.json.buildJsonObject { put("type", JsonPrimitive("end")) })
+        val pushed = commands.handle("run_as_push", args("""{"package": "com.example.tiny", "path": "files/credentials.import"}"""), upload)
+        assertEquals(data.size, pushed["bytes"]!!.jsonPrimitive.int)
+        assertEquals("run-as com.example.tiny sh -c 'mkdir -p files && cat > files/.credentials.import.part'", device.shellInputs.single().first)
+        assertTrue(device.shellInputs.single().second.contentEquals(data))
+        assertEquals("run-as com.example.tiny mv -f -- files/.credentials.import.part files/credentials.import 2>&1", device.shellCommands.last())
+
+        device.shellReply = { cmd -> if (cmd.startsWith("run-as com.example.tiny stat -c '")) "regular file|14|1700000000|files/ai-prompts.json\n" else null }
+        run("run_as_delete", """{"package": "com.example.tiny", "path": "files/ai-prompts.json"}""")
+        assertEquals("run-as com.example.tiny rm -f -- files/ai-prompts.json 2>&1", device.shellCommands.last())
+        for (bad in listOf("""{"package": "com.example.tiny", "path": "files/"}""", """{"package": "com.example.tiny", "path": "-rf"}""")) {
+            assertEquals("invalid_args", error("run_as_delete", bad).code, bad)
+        }
+        assertEquals("not_debuggable", error("run_as_delete", """{"package": "com.android.chrome", "path": "files/x"}""").code)
+
+        device.shellReply = { cmd -> if (cmd.startsWith("pidof")) "4321\n" else null }
+        val killed = run("run_as_kill", """{"package": "com.example.tiny", "signal": "STOP"}""")
+        assertEquals(4321, killed["pid"]!!.jsonPrimitive.int)
+        assertEquals("run-as com.example.tiny kill -STOP 4321 2>&1", device.shellCommands.last())
+        device.shellReply = { null }
+        assertEquals("not_found", error("run_as_kill", """{"package": "com.example.tiny", "signal": "KILL"}""").code)
+        assertEquals("invalid_args", error("run_as_kill", """{"package": "com.example.tiny", "signal": "TERM"}""").code)
+    }
+
+    @Test
+    fun nightModeAndForceStop() = runTest {
+        device.shellPaired = true
+        var night = "yes"
+        device.shellReply = { cmd ->
+            when {
+                cmd.startsWith("cmd uimode night ") -> { night = cmd.substringAfterLast(' '); "Night mode: $night\n" }
+                cmd == "cmd uimode night" -> "Night mode: $night\n"
+                cmd == "settings get secure enabled_accessibility_services" -> "com.example.tiny/.FocusService\n"
+                else -> null
+            }
+        }
+        val r = run("night_mode", """{"mode": "no"}""")
+        assertEquals("no", r.str("night_mode"))
+        assertEquals("yes", r.str("previous"))
+        run("force_stop", """{"package": "com.android.chrome"}""")
+        assertEquals("am force-stop com.android.chrome", device.shellCommands.last())
+        for (pkg in listOf("com.example.tiny", "com.android.systemui", "com.thomaswcode.phonerelay")) {
+            assertEquals("stop_refused", error("force_stop", """{"package": "$pkg"}""").code, pkg)
+        }
+        assertEquals("not_found", error("force_stop", """{"package": "com.example.missing"}""").code)
+    }
+
 }
 
 class StreamTest {

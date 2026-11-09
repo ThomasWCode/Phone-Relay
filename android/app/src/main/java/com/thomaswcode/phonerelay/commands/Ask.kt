@@ -60,6 +60,19 @@ object Ask {
             "package" -> "Check what is installed of ${s("name") ?: "an app"}"
             "settings" -> "Read the setting ${s("key") ?: ""}".trimEnd()
             "run_as_files" -> "List ${s("package") ?: "an app"}'s own files"
+            "run_as_delete" -> "Delete ${s("path") ?: "a file"} from ${s("package") ?: "an app"}'s own files"
+            "run_as_kill" -> when (s("signal")) {
+                "STOP" -> "Pause ${s("package") ?: "an app"}"
+                "CONT" -> "Let ${s("package") ?: "an app"} run on"
+                else -> "End ${s("package") ?: "an app"}'s process (Android starts it again)"
+            }
+            "content" -> "Read ${s("uri") ?: "a provider"}"
+            "night_mode" -> when (s("mode")) {
+                "no" -> "Turn dark mode off"
+                "auto" -> "Set dark mode to automatic"
+                else -> "Turn dark mode on"
+            }
+            "force_stop" -> "Force-stop ${s("package") ?: "an app"}"
             else -> cmd
         }
         val guard = a.ifForegroundOrNull()

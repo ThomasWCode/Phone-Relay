@@ -168,6 +168,15 @@ class FakeDevice : Device {
         return SHELL_OUT
     }
 
+    /** What shellWithInput was given: (command, input). */
+    val shellInputs = mutableListOf<Pair<String, ByteArray>>()
+    override suspend fun shellWithInput(command: String, input: ByteArray, guard: (() -> Unit)?) {
+        if (!shellPaired) throw CommandError("shell_unavailable", "pair the app with wireless debugging first")
+        guard?.invoke()
+        shellCommands += command
+        shellInputs += command to input
+    }
+
     /** APK files on the phone, and the packages installed. */
     val apks = mutableMapOf("/sdcard/Download/tiny.apk" to ApkInfo("com.example.tiny", "1.2.3", 42))
     val packages = mutableMapOf(

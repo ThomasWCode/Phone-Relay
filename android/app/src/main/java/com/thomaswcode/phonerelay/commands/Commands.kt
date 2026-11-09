@@ -79,6 +79,13 @@ class Commands(
         "run_as" to { a, s -> runAs(a, s ?: noStream("run_as")) },
         "run_as_files" to { a, _ -> runAsFiles(a) },
         "settings" to { a, _ -> settings(a) },
+        "content" to { a, _ -> content(a) },
+        "run_as_archive" to { a, s -> runAsArchive(a, s ?: noStream("run_as_archive")) },
+        "run_as_push" to { a, s -> runAsPush(a, s ?: noStream("run_as_push")) },
+        "run_as_delete" to { a, _ -> runAsDelete(a) },
+        "run_as_kill" to { a, _ -> runAsKill(a) },
+        "night_mode" to { a, _ -> nightMode(a) },
+        "force_stop" to { a, _ -> forceStop(a) },
     )
 
     /** The commands this client runs, announced to the relay in hello and in /state. */
@@ -762,8 +769,123 @@ class Commands(
         }
     }
 
+    // ---- what Decrastination's workflow does over adb: a provider's rows; writing to, archiving and pausing a debuggable app; dark mode; force-stop ----
+
+    /** A provider's rows (`content query`, read-only): the calendar's events, say. */
+    private suspend fun content(args: JsonObject): JsonObject {
+        val (command, projection) = ShellCommands.contentCommand(args)
+        val rows = ShellCommands.parseContent(device.shell(command), projection)
+        return buildJsonObject {
+            put("count", rows.size)
+            put("rows", JsonArray(rows.map { row -> buildJsonObject { row.forEach { (k, v) -> put(k, v) } } }))
+        }
+    }
+
+    /** A folder of a debuggable app's own storage as a tar (`run-as PACKAGE tar -cf - PATH`), read-only. */
+    private suspend fun runAsArchive(args: JsonObject, stream: Stream): JsonObject {
+        val pkg = packageName(args, "package", "an Android package name")
+        val p = ShellCommands.dataPath(args, required = false) ?: "."
+        debuggable(pkg)
+        val out = device.shellToFile(ShellCommands.runAsTar(pkg, p))
+        try {
+            val size = device.ownFileSize(out)
+            val head = device.openRead(out).use { it.readNBytes(512) }
+            if (!ShellCommands.isTar(head)) {
+                throw CommandError("not_found", "$p could not be archived: ${String(head).trim().takeLast(200)}")
+            }
+            val sent = device.openRead(out).use { stream.sendFile(it, size, "application/x-tar", mapOf("X-Package" to pkg, "X-File-Path" to p)) }
+            return buildJsonObject { put("package", pkg); put("path", p); put("bytes", sent) }
+        } finally {
+            runCatching { device.deleteFile(out) }
+        }
+    }
+
+    /**
+     * Writes a file into a debuggable app's own storage: to a hidden .part beside it (through the
+     * shell bridge, as `adb exec-in run-as`), its size checked, then moved over the file, so a
+     * failed upload leaves the old file as it was.
+     */
+    private suspend fun runAsPush(args: JsonObject, stream: Stream): JsonObject {
+        val pkg = packageName(args, "package", "an Android package name")
+        val p = ShellCommands.dataPath(args, file = true)!!
+        debuggable(pkg)
+        val bytes = java.io.ByteArrayOutputStream().also { stream.recvFile(it) }.toByteArray()
+        val (folder, part) = ShellCommands.partPath(p)
+        device.shellWithInput(ShellCommands.runAsWrite(pkg, folder, part), bytes)
+        // The input's end reaches cat once adbd has written it: wait a little for the whole file.
+        var written = ""
+        for (attempt in 0 until WRITE_CHECKS) {
+            written = device.shell(ShellCommands.runAsSize(pkg, part)).trim()
+            if (written == bytes.size.toString()) break
+            delay(WRITE_CHECK_MS)
+        }
+        if (written != bytes.size.toString()) {
+            runCatching { device.shell(ShellCommands.runAsDelete(pkg, part)) }
+            throw CommandError("device_error", "wrote ${written.take(100)} bytes of ${bytes.size}")
+        }
+        device.shell(ShellCommands.runAsMove(pkg, part, p)).trim().takeIf { it.isNotEmpty() }?.let { throw CommandError("device_error", it.takeLast(300)) }
+        return buildJsonObject { put("package", pkg); put("path", p); put("bytes", bytes.size) }
+    }
+
+    /** Deletes one file (never a folder) in a debuggable app's own storage. */
+    private suspend fun runAsDelete(args: JsonObject): JsonObject {
+        val pkg = packageName(args, "package", "an Android package name")
+        val p = ShellCommands.dataPath(args, file = true)!!
+        debuggable(pkg)
+        val entry = device.shell(ShellCommands.runAsStat(pkg, p)).lines().firstNotNullOfOrNull(ShellCommands::parseStat)
+            ?: throw CommandError("not_found", "$p does not exist in $pkg's data, or cannot be read")
+        if (entry.type != "file") throw CommandError("invalid_args", "$p is a ${entry.type}; only a file is deleted")
+        device.shell(ShellCommands.runAsDelete(pkg, p)).trim().takeIf { it.isNotEmpty() }?.let { throw CommandError("device_error", it.takeLast(300)) }
+        return buildJsonObject { put("package", pkg); put("path", p); put("deleted", true) }
+    }
+
+    /**
+     * STOP, CONT or KILL to a debuggable app's main process, as the app's own user (run-as): to pause
+     * it while a store is edited by hand, and end it after (an app with a bound accessibility service
+     * is started again by Android, still enabled, unlike a force-stop).
+     */
+    private suspend fun runAsKill(args: JsonObject): JsonObject {
+        val pkg = packageName(args, "package", "an Android package name")
+        val signal = args.stringArg("signal")!!
+        if (signal !in ShellCommands.SIGNALS) throw CommandError("invalid_args", "signal must be one of ${ShellCommands.SIGNALS.joinToString(", ")}")
+        debuggable(pkg)
+        val pid = device.shell("pidof $pkg; true").trim().split(Regex("\\s+")).firstOrNull()?.toIntOrNull()
+            ?: throw CommandError("not_found", "$pkg is not running")
+        device.shell("run-as $pkg kill -$signal $pid 2>&1").trim().takeIf { it.isNotEmpty() }?.let { throw CommandError("device_error", it.takeLast(300)) }
+        return buildJsonObject { put("package", pkg); put("pid", pid); put("signal", signal) }
+    }
+
+    /** Dark mode on (yes), off (no) or automatic; the reply's `previous` is the old setting, to put back. */
+    private suspend fun nightMode(args: JsonObject): JsonObject {
+        val mode = args.stringArg("mode")!!
+        if (mode !in ShellCommands.NIGHT_MODES) throw CommandError("invalid_args", "mode must be one of ${ShellCommands.NIGHT_MODES.joinToString(", ")}")
+        val previous = ShellCommands.nightMode(device.shell("cmd uimode night"))
+        device.shell("cmd uimode night $mode", guard(args))
+        return buildJsonObject { put("night_mode", ShellCommands.nightMode(device.shell("cmd uimode night"))); put("previous", previous) }
+    }
+
+    /**
+     * Force-stops an app a task opened (`am force-stop`, through the shell bridge). Refused for an app
+     * with an enabled accessibility service, which Android would drop from the enabled list, and for
+     * the system's own.
+     */
+    private suspend fun forceStop(args: JsonObject): JsonObject {
+        val pkg = packageName(args, "package", "an Android package name")
+        if (pkg in ShellCommands.STOP_REFUSED) throw CommandError("stop_refused", "$pkg is never force-stopped")
+        val enabled = ShellCommands.parseAccessibility(device.shell("settings get secure enabled_accessibility_services")).enabled
+        if (enabled.any { it.substringBefore('/') == pkg }) {
+            throw CommandError("stop_refused", "$pkg has an enabled accessibility service, which a force-stop would turn off")
+        }
+        device.packageDetails(pkg)
+        device.shell("am force-stop $pkg", guard(args))
+        return buildJsonObject { put("package", pkg) }
+    }
+
     companion object {
         const val TAP_MS = 50L
+        /** How often, and how far apart, a write into an app's storage is checked for its whole size. */
+        const val WRITE_CHECKS = 25
+        const val WRITE_CHECK_MS = 200L
         const val APK_MIME = "application/vnd.android.package-archive"
         const val RECORD_BIT_RATE = 2_000_000
         val AUDIO_SOURCES = listOf("output", "mic")
@@ -772,7 +894,8 @@ class Commands(
             "state", "screenshot", "ui", "tap", "swipe", "type", "key", "launch", "open", "intent", "notifications",
             "statusbar", "rotation", "wait", "files", "gesture", "clipboard_set", "clipboard_get", "record_start",
             "chrome_tabs", "chrome_eval", "chrome_cdp", "chrome_new", "chrome_close", "chrome_activate", "install",
-            "accessibility", "logcat", "package", "settings", "run_as_files", "sleep",
+            "accessibility", "logcat", "package", "settings", "run_as_files", "content", "run_as_delete", "run_as_kill",
+            "night_mode", "force_stop", "sleep",
         )
         /** A key the shell may be given: a KEYCODE_* name or a number. */
         private val SHELL_KEY = Regex("^(KEYCODE_[A-Z0-9_]{1,40}|\\d{1,4})$")

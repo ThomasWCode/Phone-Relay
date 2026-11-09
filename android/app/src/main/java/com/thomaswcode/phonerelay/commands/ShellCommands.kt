@@ -23,7 +23,15 @@ object ShellCommands {
     val SETTINGS_NAMESPACES = listOf("system", "secure", "global")
     private val LOG_TAG_RE = Regex("^[\\w.$-]{1,64}$")
     private val LOG_TIME_RE = Regex("^(\\d{4}-)?\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}(\\.\\d{1,9})?$")
-    private val DATA_PATH_RE = Regex("^[\\w.@+ -]+(/[\\w.@+ -]+)*/?$")
+    // No part may start with "-", so none is read as an option of cat, rm or tar.
+    private val DATA_PATH_RE = Regex("^[\\w.@+ ][\\w.@+ -]*(/[\\w.@+ ][\\w.@+ -]*)*/?$")
+    private val CONTENT_URI_RE = Regex("^content://[\\w.-]+(/[\\w.%:@+-]*)*$")
+    private val COLUMN_RE = Regex("^\\w{1,64}$")
+    private val SORT_RE = Regex("^[\\w ,]{1,200}$")
+    val SIGNALS = listOf("STOP", "CONT", "KILL")
+    val NIGHT_MODES = listOf("yes", "no", "auto")
+    /** Never force-stopped: the system's own, and what runs this app or the adb client. */
+    val STOP_REFUSED = listOf("android", "com.android.systemui", "com.android.phone", "com.termux", "com.thomaswcode.phonerelay")
     private val SETTING_KEY_RE = Regex("^[\\w.:-]{1,100}$")
     val COMPONENT_RE = Regex("^[A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)*/[A-Za-z0-9_.$]+$")
     private val SAFE_RE = Regex("^[\\w@%+=:,./-]+$")
@@ -149,16 +157,105 @@ object ShellCommands {
 
     // ---- an app's own files (run-as) ----
 
-    /** A path inside an app's own data folder (run-as's working folder): relative, with no "..". */
-    fun dataPath(args: JsonObject, required: Boolean = true): String? {
+    /** A path inside an app's own data folder (run-as's working folder): relative, with no ".."; with `file`, a file's (no trailing /). */
+    fun dataPath(args: JsonObject, required: Boolean = true, file: Boolean = false): String? {
         val v = args["path"]
         if ((v == null || v is JsonNull) && !required) return null
         val p = (v as? JsonPrimitive)?.takeIf { it.isString }?.content
         if (p == null || !DATA_PATH_RE.matches(p) || ".." in p.split('/')) {
             throw CommandError("invalid_args", "path must be relative to the app's data folder, e.g. files/plan.json, with no ..")
         }
+        if (file && p.endsWith("/")) throw CommandError("invalid_args", "path must name a file, not a folder")
         return p
     }
+
+    fun runAsTar(pkg: String, path: String) = "run-as $pkg tar -cf - ${quote(path)}"
+
+    /** A tar archive's first header (ustar), not an error printed in its place. */
+    fun isTar(head: ByteArray): Boolean = head.size >= 512 && String(head, 257, 5, Charsets.US_ASCII) == "ustar"
+
+    /** (the folder, the hidden .part file beside `path`) a write goes to before it replaces the file. */
+    fun partPath(path: String): Pair<String, String> {
+        val folder = path.substringBeforeLast('/', "").ifEmpty { "." }
+        return folder to "$folder/.${path.substringAfterLast('/')}.part"
+    }
+
+    fun runAsWrite(pkg: String, folder: String, part: String) = "run-as $pkg sh -c ${quote("mkdir -p ${quote(folder)} && cat > ${quote(part)}")}"
+
+    fun runAsSize(pkg: String, path: String) = "run-as $pkg stat -c %s -- ${quote(path)} 2>&1"
+
+    fun runAsMove(pkg: String, from: String, to: String) = "run-as $pkg mv -f -- ${quote(from)} ${quote(to)} 2>&1"
+
+    fun runAsDelete(pkg: String, path: String) = "run-as $pkg rm -f -- ${quote(path)} 2>&1"
+
+    // ---- content query ----
+
+    /** `content query` for /content's arguments (read-only), and its projection's columns. */
+    fun contentCommand(args: JsonObject): Pair<String, List<String>?> {
+        val uri = args.stringArg("uri")!!
+        if (!CONTENT_URI_RE.matches(uri)) throw CommandError("invalid_args", "uri must be a content:// URI, e.g. content://com.android.calendar/events")
+        val parts = mutableListOf("content", "query", "--uri", quote(uri))
+        val projection = when (val p = args["projection"]) {
+            null, is JsonNull -> null
+            is JsonArray -> p.map { (it as? JsonPrimitive)?.takeIf { c -> c.isString && COLUMN_RE.matches(c.content) }?.content
+                ?: throw CommandError("invalid_args", "projection must be a list of column names") }
+            else -> throw CommandError("invalid_args", "projection must be a list of column names")
+        }
+        if (projection != null) {
+            if (projection.isEmpty()) throw CommandError("invalid_args", "projection must be a list of column names")
+            parts += listOf("--projection", projection.joinToString(":"))
+        }
+        args.stringArg("where", required = false)?.let { parts += listOf("--where", quote(it)) }
+        args.stringArg("sort", required = false)?.let {
+            if (!SORT_RE.matches(it)) throw CommandError("invalid_args", "sort must be columns, e.g. dtstart DESC")
+            parts += listOf("--sort", quote(it))
+        }
+        return parts.joinToString(" ") + " 2>&1" to projection
+    }
+
+    /**
+     * `content query`'s rows ("Row: 0 a=1, b=x, y"), each as column -> value, NULL as null. With a
+     * projection the columns are found in their order, so a value holding ", " or newlines comes back
+     * whole; without one, it is cut at each ", name=". The provider's errors go to stderr while
+     * `content` still exits 0, so they are looked for here.
+     */
+    fun parseContent(out: String, projection: List<String>?): List<Map<String, String?>> {
+        if (Regex("^(Error while accessing provider|Exception|java\\.|\\[ERROR\\])", RegexOption.MULTILINE).containsMatchIn(out)) {
+            throw CommandError("content_failed", out.trim().takeLast(300))
+        }
+        if (out.isBlank() || out.trim() == "No result found.") return emptyList()
+        val records = mutableListOf<String>()
+        for (line in out.lines()) {
+            val m = Regex("^Row: \\d+ (.*)$").find(line)
+            if (m != null) records += m.groupValues[1]
+            else if (records.isNotEmpty()) records[records.lastIndex] = records.last() + "\n" + line
+        }
+        // `content` ends its output with a newline, which the last row's text would otherwise keep
+        if (records.isNotEmpty() && out.endsWith("\n")) records[records.lastIndex] = records.last().removeSuffix("\n")
+        return records.map { text ->
+            val row = linkedMapOf<String, String?>()
+            if (projection != null) {
+                var rest = text
+                projection.forEachIndexed { i, col ->
+                    if (!rest.startsWith("$col=")) throw CommandError("content_failed", "unexpected row: ${text.take(200)}")
+                    rest = rest.substring(col.length + 1)
+                    val value = if (i + 1 < projection.size) {
+                        val cut = rest.indexOf(", ${projection[i + 1]}=")
+                        if (cut < 0) rest.also { rest = "" } else rest.substring(0, cut).also { rest = rest.substring(cut + 2) }
+                    } else rest
+                    row[col] = if (value == "NULL") null else value
+                }
+            } else {
+                for (pair in text.split(Regex(", (?=\\w+=)"))) {
+                    val value = pair.substringAfter('=', "")
+                    row[pair.substringBefore('=')] = if (value == "NULL") null else value
+                }
+            }
+            row
+        }
+    }
+
+    fun nightMode(out: String): String? = Regex("Night mode:\\s*(\\S+)").find(out)?.groupValues?.get(1)
 
     /** A directory's entries (or one file) as `stat -c '%F|%s|%Y|%n'` lines; MISSING_MARKER if it cannot be read. */
     fun listCommand(path: String): String {
