@@ -5,7 +5,8 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./index";
 import { json } from "./http";
-import { DEFAULT_TIMEOUT_S, DOWNLOAD_COMMANDS, UPLOAD_COMMAND, summariseArgs, type Command } from "./validate";
+import { evaluateCheck, type CheckRecord, type StepOutcome } from "./check";
+import { DEFAULT_TIMEOUT_S, DOWNLOAD_COMMANDS, UPLOAD_COMMAND, summariseArgs, type Command, type CommandName } from "./validate";
 
 const LOG_KEEP = 1000;
 // The phone enforces each command's `timeout` itself and replies "timeout". The relay waits this much
@@ -17,15 +18,20 @@ const STREAM_CHUNK = 256 * 1024;
 const STREAM_WINDOW = 8;
 // The last request's outcome is kept whole up to this size (SQLite holds it in the meta table).
 const REQUEST_KEEP_BYTES = 256 * 1024;
+// /check reads this many of the crash buffer's last lines.
+const CHECK_LOG_LINES = 2000;
 
 // Device error code -> HTTP status. Unknown codes become 502.
 const DEVICE_ERROR_STATUS: Record<string, number> = {
   invalid_args: 400,
+  package_mismatch: 400, // /install: the APK is another package than the one named
+  not_debuggable: 403, // /run-as: only a debuggable app's own files can be read
   not_found: 404,
   foreground_mismatch: 409,
   no_text_field: 409, // the Android app types into a focused field only
   gesture_cancelled: 409, // Android cancelled the app's gesture (a real touch, the screen changed)
   launch_failed: 422,
+  install_failed: 422, // Android refused the install: its own error (INSTALL_FAILED_...) is the detail
   unsupported: 501, // a command the connected client cannot run
   permission_missing: 503, // the app lacks a grant the owner gives on the phone
   shell_unavailable: 503, // the app's shell bridge: not paired, or wireless debugging is off or not reachable
@@ -323,6 +329,7 @@ export class DeviceHub extends DurableObject<Env> {
     if (!ws) return done(503, "device_offline");
 
     if (DOWNLOAD_COMMANDS.includes(command.cmd)) return this.download(ws, command, done);
+    if (command.cmd === "check") return this.check(ws, command, done);
     const asking = command.cmd === "request";
     if (asking) this.recordRequest({ answer: "pending", asked_at: new Date(started).toISOString() });
     const reply = await (command.cmd === UPLOAD_COMMAND ? this.upload(ws, command, body) : this.dispatch(ws, command)).reply;
@@ -355,6 +362,31 @@ export class DeviceHub extends DurableObject<Env> {
       });
     }
     return done(200, undefined, result);
+  }
+
+  // GET /check: the phone commands one after another, each with the check's own timeout and
+  // if_foreground, then the verdict against the last check's record (check.ts), which is kept here.
+  private async check(ws: WebSocket, command: Command, done: (s: number, e?: string, x?: Record<string, unknown>) => Response): Promise<Response> {
+    const args = command.args as { package: string; services?: string[]; accept_gone?: boolean; timeout?: number; if_foreground?: string[] };
+    const common = { timeout: args.timeout ?? DEFAULT_TIMEOUT_S, ...(args.if_foreground ? { if_foreground: args.if_foreground } : {}) };
+    const step = async (cmd: CommandName, stepArgs: Record<string, unknown>): Promise<StepOutcome> => {
+      const r = await this.dispatch(ws, { cmd, args: { ...stepArgs, ...common } }).reply;
+      return r.ok ? { ok: true, result: r.result ?? {} } : { ok: false, error: r.error ?? "device_error", ...(r.detail ? { detail: r.detail } : {}) };
+    };
+    const pkg = await step("package", { name: args.package });
+    const state = await step("state", {});
+    const accessibility = await step("accessibility", {});
+    const installed = pkg.ok ? pkg.result : null;
+    const since = typeof installed?.last_update_time === "string" ? { since: installed.last_update_time } : {};
+    const crashLog = installed ? await step("logcat", { buffer: "crash", lines: CHECK_LOG_LINES, ...since }) : null;
+    const files = installed?.debuggable === true ? await step("run_as_files", { package: args.package, path: "files" }) : null;
+
+    const key = `check:${args.package}`;
+    const row = this.sql.exec(`SELECT value FROM meta WHERE key = ?`, key).toArray()[0];
+    const last = row ? (JSON.parse(String(row.value)) as CheckRecord) : null;
+    const { report, record } = evaluateCheck(args, { package: pkg, state, accessibility, crashLog, files }, last);
+    this.sql.exec(`INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)`, key, JSON.stringify(record));
+    return done(200, undefined, report);
   }
 
   // A file from the phone (a pull, a recording), streamed to the agent as it arrives. The response

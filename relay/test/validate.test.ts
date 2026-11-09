@@ -276,6 +276,88 @@ describe("parseBody", () => {
   });
 });
 
+describe("building, installing and checking a release", () => {
+  it("install takes an APK's path on the phone and the package it must be", () => {
+    expect(args(v("install", { path: "/sdcard/Download/app.apk", package: "com.example.app" })))
+      .toEqual({ path: "/sdcard/Download/app.apk", package: "com.example.app", timeout: 120 });
+    expect(findRoute("/install", "POST")).toEqual({ method: "POST", cmd: "install" });
+    for (const bad of [{ path: "app.apk", package: "com.a" }, { path: "/sdcard/a.apk" }, { path: "/sdcard/a.apk", package: "a b" }, {}]) {
+      expect(v("install", bad).ok, JSON.stringify(bad)).toBe(false);
+    }
+  });
+
+  it("accessibility, package and package/apk", () => {
+    expect(args(v("accessibility"))).toEqual({ timeout: 30 });
+    expect(args(v("package", null, "name=com.example.app"))).toEqual({ name: "com.example.app", timeout: 30 });
+    expect(args(v("package_apk", null, "name=com.example.app"))).toEqual({ name: "com.example.app", timeout: 300 });
+    expect(findRoute("/package/apk", "GET")).toEqual({ method: "GET", cmd: "package_apk" });
+    for (const q of ["", "name=", "name=a%20b", "name=com.a;reboot"]) expect(v("package", null, q).ok, q).toBe(false);
+  });
+
+  it("logcat: tags, a level, since (seconds ago or a time), a line cap and a buffer", () => {
+    expect(args(v("logcat"))).toEqual({ lines: 500, timeout: 30 });
+    expect(args(v("logcat", null, "tag=Decrastination,AndroidRuntime&level=w&since=60&lines=50&buffer=crash"))).toEqual({
+      tag: ["Decrastination", "AndroidRuntime"], level: "W", since: 60, lines: 50, buffer: "crash", timeout: 30,
+    });
+    expect(args(v("logcat", null, "since=2026-11-09T06:58:42"))?.since).toBe("2026-11-09 06:58:42");
+    expect(args(v("logcat", null, "since=11-09 06:58:42.123"))?.since).toBe("11-09 06:58:42.123");
+    for (const q of ["tag=a;b", "tag=", "level=X", "since=0", "since=yesterday", "since=2026-11-09", "lines=0", "lines=1.5", "lines=x", "buffer=other"]) {
+      expect(v("logcat", null, q).ok, q).toBe(false);
+    }
+  });
+
+  it("run-as takes a package and a path inside its data folder", () => {
+    expect(args(v("run_as", null, "package=com.example.app&path=files/plan.json")))
+      .toEqual({ package: "com.example.app", path: "files/plan.json", timeout: 300 });
+    expect(args(v("run_as_files", null, "package=com.example.app"))).toEqual({ package: "com.example.app", timeout: 30 });
+    expect(args(v("run_as_files", null, "package=com.example.app&path=files/"))?.path).toBe("files/");
+    for (const q of ["package=com.a", "package=com.a&path=/data/x", "package=com.a&path=../b", "package=com.a&path=files/../../x",
+      "package=com.a&path=a//b", "package=com.a&path=a;b", "path=files/x"]) {
+      expect(v("run_as", null, q).ok, q).toBe(false);
+    }
+  });
+
+  it("settings reads one setting by namespace and name", () => {
+    expect(args(v("settings", null, "namespace=global&key=stay_on_while_plugged_in")))
+      .toEqual({ namespace: "global", key: "stay_on_while_plugged_in", timeout: 30 });
+    for (const q of ["namespace=global", "namespace=other&key=a", "namespace=secure&key=a;b", "key=a"]) expect(v("settings", null, q).ok, q).toBe(false);
+  });
+
+  it("check takes a package, services that must be bound, and accept_gone", () => {
+    expect(args(v("check", null, "package=com.example.app&services=com.example.app/.FocusService,com.b/com.b.S&accept_gone=true"))).toEqual({
+      package: "com.example.app", services: ["com.example.app/.FocusService", "com.b/com.b.S"], accept_gone: true, timeout: 30,
+    });
+    for (const q of ["", "package=com.a&services=com.a", "package=com.a&accept_gone=yes"]) expect(v("check", null, q).ok, q).toBe(false);
+  });
+
+  it("the new reads may be batch steps, and the files they stream may not", () => {
+    const r = v("batch", { steps: [{ cmd: "install", args: { path: "/sdcard/a.apk", package: "com.a" } }, { cmd: "accessibility" }] });
+    expect(r.ok && r.command.args.timeout).toBe(30 + 120 + 30);
+    for (const cmd of ["package_apk", "run_as", "check"]) expect(v("batch", { steps: [{ cmd, args: {} }] }).ok, cmd).toBe(false);
+  });
+});
+
+describe("intent flags by name, and as the shell", () => {
+  it("flags take a number, or names (and numbers) combined", () => {
+    expect(args(v("intent", { action: "a", flags: ["FLAG_ACTIVITY_NEW_TASK"] }))?.flags).toBe(268435456);
+    expect(args(v("intent", { action: "a", flags: ["FLAG_ACTIVITY_NEW_TASK", "FLAG_ACTIVITY_CLEAR_TASK", 1] }))?.flags).toBe(0x10008001);
+    expect(args(v("intent", { action: "a", flags: ["FLAG_ACTIVITY_NO_HISTORY", "FLAG_ACTIVITY_SINGLE_TOP"] }))?.flags).toBe(0x60000000);
+    for (const flags of [[], ["NEW_TASK"], ["FLAG_ACTIVITY_NEW_TASK", -1], ["toString"], "FLAG_ACTIVITY_NEW_TASK"]) {
+      expect(v("intent", { action: "a", flags }).ok, JSON.stringify(flags)).toBe(false);
+    }
+  });
+
+  it("as_shell needs an explicit component", () => {
+    const body = { component: "com.example.app/.debug.Command", extras: { cmd: "backup-now" }, as_shell: true };
+    expect(args(v("intent", body))).toEqual({ ...body, timeout: 30 });
+    expect(v("intent", { action: "a", as_shell: false }).ok).toBe(true);
+    for (const bad of [{ action: "a", as_shell: true }, { package: "com.a", as_shell: true }, { component: "com.a", as_shell: true },
+      { component: "com.a/.B", as_shell: "yes" }]) {
+      expect(v("intent", bad).ok, JSON.stringify(bad)).toBe(false);
+    }
+  });
+});
+
 describe("logging", () => {
   it("never includes typed text", () => {
     expect(summariseArgs({ cmd: "type", args: { text: "secret" } })).toEqual({ length: 6 });

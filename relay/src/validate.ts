@@ -22,6 +22,8 @@ export const DEFAULT_SWIPE_MS = 300;
 // batches get their own time on top. Moving a file, or stopping a recording and fetching it, gets five minutes.
 export const DEFAULT_TIMEOUT_S = 30;
 export const TRANSFER_TIMEOUT_S = 300;
+// Installing an APK: Android compiles it before it replies.
+export const INSTALL_TIMEOUT_S = 120;
 const STATUSBAR_ACTIONS = ["notifications", "settings", "collapse"];
 const WAIT_KINDS = ["change", "stable", "foreground", "text"];
 const TYPE_METHODS = ["keys", "paste"];
@@ -30,6 +32,58 @@ const AUDIO_SOURCES = ["output", "mic"];
 const DEVTOOLS_SOCKET_RE = /^[\w.-]{1,100}$/;
 const CDP_METHOD_RE = /^[A-Za-z]+\.[A-Za-z]+$/;
 const TAB_ID_RE = /^[\w-]{1,100}$/;
+// The phone's own read-only checks: logcat's tags, levels and buffers, a component, a setting's name,
+// and a path inside an app's own data folder (relative, no "..").
+const LOG_TAG_RE = /^[\w.$-]{1,64}$/;
+const LOG_LEVELS = ["V", "D", "I", "W", "E", "F"];
+const LOG_BUFFERS = ["main", "system", "crash", "events", "radio", "kernel", "default", "all"];
+// logcat's own time formats: [YYYY-]MM-DD hh:mm:ss[.mmm] (a T is taken for the space)
+const LOG_TIME_RE = /^(\d{4}-)?\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d{1,9})?$/;
+export const DEFAULT_LOG_LINES = 500;
+const COMPONENT_RE = /^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*\/[A-Za-z0-9_.$]+$/;
+const SETTINGS_NAMESPACES = ["system", "secure", "global"];
+const SETTING_KEY_RE = /^[\w.:-]{1,100}$/;
+const DATA_PATH_RE = /^[\w.@+ -]+(\/[\w.@+ -]+)*\/?$/;
+// Intent flags by name, as Android's Intent.FLAG_* (checked against android.jar of API 36).
+export const INTENT_FLAGS: Record<string, number> = {
+  FLAG_GRANT_READ_URI_PERMISSION: 0x1,
+  FLAG_GRANT_WRITE_URI_PERMISSION: 0x2,
+  FLAG_FROM_BACKGROUND: 0x4,
+  FLAG_DEBUG_LOG_RESOLUTION: 0x8,
+  FLAG_EXCLUDE_STOPPED_PACKAGES: 0x10,
+  FLAG_INCLUDE_STOPPED_PACKAGES: 0x20,
+  FLAG_GRANT_PERSISTABLE_URI_PERMISSION: 0x40,
+  FLAG_GRANT_PREFIX_URI_PERMISSION: 0x80,
+  FLAG_DIRECT_BOOT_AUTO: 0x100,
+  FLAG_ACTIVITY_REQUIRE_DEFAULT: 0x200,
+  FLAG_ACTIVITY_REQUIRE_NON_BROWSER: 0x400,
+  FLAG_ACTIVITY_MATCH_EXTERNAL: 0x800,
+  FLAG_ACTIVITY_LAUNCH_ADJACENT: 0x1000,
+  FLAG_ACTIVITY_RETAIN_IN_RECENTS: 0x2000,
+  FLAG_ACTIVITY_TASK_ON_HOME: 0x4000,
+  FLAG_ACTIVITY_CLEAR_TASK: 0x8000,
+  FLAG_ACTIVITY_NO_ANIMATION: 0x10000,
+  FLAG_ACTIVITY_REORDER_TO_FRONT: 0x20000,
+  FLAG_ACTIVITY_NO_USER_ACTION: 0x40000,
+  FLAG_ACTIVITY_CLEAR_WHEN_TASK_RESET: 0x80000,
+  FLAG_ACTIVITY_NEW_DOCUMENT: 0x80000,
+  FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY: 0x100000,
+  FLAG_ACTIVITY_RESET_TASK_IF_NEEDED: 0x200000,
+  FLAG_RECEIVER_VISIBLE_TO_INSTANT_APPS: 0x200000,
+  FLAG_ACTIVITY_BROUGHT_TO_FRONT: 0x400000,
+  FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS: 0x800000,
+  FLAG_ACTIVITY_PREVIOUS_IS_TOP: 0x1000000,
+  FLAG_ACTIVITY_FORWARD_RESULT: 0x2000000,
+  FLAG_ACTIVITY_CLEAR_TOP: 0x4000000,
+  FLAG_ACTIVITY_MULTIPLE_TASK: 0x8000000,
+  FLAG_RECEIVER_NO_ABORT: 0x8000000,
+  FLAG_ACTIVITY_NEW_TASK: 0x10000000,
+  FLAG_RECEIVER_FOREGROUND: 0x10000000,
+  FLAG_ACTIVITY_SINGLE_TOP: 0x20000000,
+  FLAG_RECEIVER_REPLACE_PENDING: 0x20000000,
+  FLAG_ACTIVITY_NO_HISTORY: 0x40000000,
+  FLAG_RECEIVER_REGISTERED_ONLY: 0x40000000,
+};
 // How long a request waits for the owner's answer when the agent gives no `seconds`.
 export const DEFAULT_REQUEST_S = 300;
 // Commands a batch may run (the JSON ones, plus sleep). Same list as the phone client.
@@ -37,7 +91,7 @@ export const BATCH_COMMANDS = [
   "state", "screenshot", "ui", "tap", "swipe", "type", "key", "launch", "open", "intent",
   "notifications", "statusbar", "rotation", "wait", "files", "record_start", "gesture",
   "clipboard_get", "clipboard_set", "chrome_tabs", "chrome_eval", "chrome_cdp", "chrome_new",
-  "chrome_close", "chrome_activate", "sleep",
+  "chrome_close", "chrome_activate", "install", "accessibility", "logcat", "package", "settings", "run_as_files", "sleep",
 ];
 
 export type CommandName =
@@ -46,9 +100,10 @@ export type CommandName =
   | "files" | "pull" | "push" | "record" | "record_start" | "record_stop"
   | "gesture" | "clipboard_get" | "clipboard_set" | "audio"
   | "chrome_sockets" | "chrome_tabs" | "chrome_eval" | "chrome_cdp" | "chrome_new" | "chrome_close" | "chrome_activate"
-  | "request" | "request_status";
+  | "request" | "request_status"
+  | "install" | "accessibility" | "logcat" | "package" | "package_apk" | "run_as" | "run_as_files" | "settings" | "check";
 // Commands whose reply is a file streamed from the phone, and the one that streams a file to it.
-export const DOWNLOAD_COMMANDS: readonly CommandName[] = ["pull", "record", "record_stop", "audio"];
+export const DOWNLOAD_COMMANDS: readonly CommandName[] = ["pull", "record", "record_stop", "audio", "package_apk", "run_as"];
 export const UPLOAD_COMMAND: CommandName = "push";
 
 export interface Command {
@@ -102,6 +157,17 @@ export const AGENT_ROUTES: Record<string, Route | Route[]> = {
   "/chrome/activate": { method: "POST", cmd: "chrome_activate" },
   // Asking the owner on the phone; the GET is the relay's record of the last request, not the phone's.
   "/request": [{ method: "GET", cmd: "request_status" }, { method: "POST", cmd: "request" }],
+  // Building, installing and checking a release; reading a debuggable app's own files; settings.
+  "/install": { method: "POST", cmd: "install" },
+  "/accessibility": { method: "GET", cmd: "accessibility" },
+  "/logcat": { method: "GET", cmd: "logcat" },
+  "/package": { method: "GET", cmd: "package" },
+  "/package/apk": { method: "GET", cmd: "package_apk" },
+  "/run-as": { method: "GET", cmd: "run_as" },
+  "/run-as/files": { method: "GET", cmd: "run_as_files" },
+  "/settings": { method: "GET", cmd: "settings" },
+  // Several of the above at once, run by the relay itself (see check.ts).
+  "/check": { method: "GET", cmd: "check" },
 };
 
 // The route for a path and method: null for no such path, "method" for a path without that method.
@@ -122,7 +188,7 @@ const FIELDS: Record<CommandName, string[]> = {
   key: ["key", "longpress"],
   launch: ["package"],
   open: ["url", "package"],
-  intent: ["action", "data", "type", "component", "package", "categories", "flags", "extras", "broadcast"],
+  intent: ["action", "data", "type", "component", "package", "categories", "flags", "extras", "broadcast", "as_shell"],
   notifications: [],
   statusbar: ["action"],
   rotation: ["rotation"],
@@ -147,9 +213,18 @@ const FIELDS: Record<CommandName, string[]> = {
   chrome_activate: ["tab", "socket"],
   request: ["reason", "seconds", "steps", "stop_on_error"],
   request_status: [],
+  install: ["path", "package"],
+  accessibility: [],
+  logcat: ["tag", "since", "level", "lines", "buffer"],
+  package: ["name"],
+  package_apk: ["name"],
+  run_as: ["package", "path"],
+  run_as_files: ["package", "path"],
+  settings: ["namespace", "key"],
+  check: ["package", "services", "accept_gone"],
 };
 // Query-string fields read as numbers.
-const NUMERIC_QUERY_FIELDS = ["scale", "timeout", "seconds", "bit_rate"];
+const NUMERIC_QUERY_FIELDS = ["scale", "timeout", "seconds", "bit_rate", "lines"];
 const COMMON_FIELDS = ["timeout", "if_foreground"];
 
 type Fields = Record<string, unknown>;
@@ -205,7 +280,8 @@ export function defaultTimeout(cmd: CommandName, args: Fields): number {
   if (cmd === "wait") return DEFAULT_TIMEOUT_S + (isNumber(args.seconds) ? args.seconds : 10);
   if (cmd === "record" || cmd === "audio") return 2 * DEFAULT_TIMEOUT_S + 2 * (isNumber(args.seconds) ? args.seconds : 10);
   if (cmd === "gesture" && isNumber(args.ms)) return DEFAULT_TIMEOUT_S + Math.max(args.ms, 0) / 1000;
-  if (cmd === "pull" || cmd === "push" || cmd === "record_stop") return TRANSFER_TIMEOUT_S;
+  if (cmd === "pull" || cmd === "push" || cmd === "record_stop" || cmd === "package_apk" || cmd === "run_as") return TRANSFER_TIMEOUT_S;
+  if (cmd === "install") return INSTALL_TIMEOUT_S;
   if (cmd === "batch" && Array.isArray(args.steps)) {
     let total = DEFAULT_TIMEOUT_S;
     for (const step of args.steps as { cmd: string; args: Fields }[]) {
@@ -284,6 +360,67 @@ function chromeArgs(cmd: CommandName, src: Fields): Fields | string {
     out.url = src.url;
   }
   return out;
+}
+
+// Intent flags: a whole number, or a list of Intent.FLAG_* names (and numbers), combined into one number.
+function intentFlags(v: unknown): number | string {
+  if (Number.isInteger(v) && (v as number) >= 0) return v as number;
+  if (!Array.isArray(v) || v.length === 0) return "flags must be a whole number or a list of FLAG_* names";
+  let flags = 0;
+  for (const f of v) {
+    if (Number.isInteger(f) && f >= 0) flags |= f;
+    else if (typeof f === "string" && Object.hasOwn(INTENT_FLAGS, f)) flags |= INTENT_FLAGS[f];
+    else return `flags: ${JSON.stringify(f)} is not an Intent.FLAG_* name, e.g. FLAG_ACTIVITY_NEW_TASK`;
+  }
+  return flags >>> 0; // as an unsigned number: the OR of two flags can set bit 31
+}
+
+// A path inside an app's own data folder: relative, with no "..".
+function dataPath(v: unknown, required: boolean): string | null | undefined {
+  if (v === undefined && !required) return undefined;
+  if (typeof v !== "string" || !DATA_PATH_RE.test(v) || v.split("/").includes("..")) return null;
+  return v;
+}
+
+// A list given as a list, or as one comma-separated string (a GET's query).
+function listOf(v: unknown): unknown[] | null {
+  if (typeof v === "string") return v.split(",").filter((s) => s.length > 0);
+  return Array.isArray(v) ? v : null;
+}
+
+function logcatArgs(src: Fields): Fields | string {
+  const out: Fields = {};
+  if (src.tag !== undefined) {
+    const tags = listOf(src.tag);
+    if (!tags || tags.length === 0 || !tags.every((t) => typeof t === "string" && LOG_TAG_RE.test(t))) {
+      return "tag must be a log tag or a list of them (letters, digits, _ . $ -)";
+    }
+    out.tag = tags;
+  }
+  if (src.level !== undefined) {
+    if (typeof src.level !== "string" || !LOG_LEVELS.includes(src.level.toUpperCase())) return `level must be one of ${LOG_LEVELS.join(", ")}`;
+    out.level = src.level.toUpperCase();
+  }
+  if (src.since !== undefined) {
+    // Seconds ago, or a time as logcat takes it ("2026-11-09 06:58:42", the time /package gives)
+    const since = typeof src.since === "string" && /^\d+(\.\d+)?$/.test(src.since) ? Number(src.since) : src.since;
+    if (isPositive(since)) out.since = since;
+    else if (typeof since === "string" && LOG_TIME_RE.test(since)) out.since = since.replace("T", " ");
+    else return 'since must be seconds ago (a number above 0) or a time, e.g. "2026-11-09 06:58:42"';
+  }
+  const lines = src.lines ?? DEFAULT_LOG_LINES;
+  if (!Number.isInteger(lines) || (lines as number) <= 0) return "lines must be a whole number above 0";
+  out.lines = lines;
+  if (src.buffer !== undefined) {
+    if (typeof src.buffer !== "string" || !LOG_BUFFERS.includes(src.buffer)) return `buffer must be one of ${LOG_BUFFERS.join(", ")}`;
+    out.buffer = src.buffer;
+  }
+  return out;
+}
+
+function packageName(src: Fields, name: string): string | null {
+  const v = src[name];
+  return typeof v === "string" && PACKAGE_RE.test(v) ? v : null;
 }
 
 // A batch's steps, each validated as its own command; their unknown fields are reported as steps[i].field.
@@ -474,8 +611,9 @@ function commandArgs(cmd: CommandName, src: Fields, ignored: string[]): Fields |
         out.categories = src.categories;
       }
       if (src.flags !== undefined) {
-        if (!Number.isInteger(src.flags) || (src.flags as number) < 0) return "flags must be a whole number";
-        out.flags = src.flags;
+        const flags = intentFlags(src.flags);
+        if (typeof flags === "string") return flags;
+        out.flags = flags;
       }
       if (src.extras !== undefined) {
         const e = src.extras;
@@ -490,6 +628,15 @@ function commandArgs(cmd: CommandName, src: Fields, ignored: string[]): Fields |
       if (src.broadcast !== undefined) {
         if (typeof src.broadcast !== "boolean") return "broadcast must be true or false";
         out.broadcast = src.broadcast;
+      }
+      // As the shell user (am start / am broadcast), whose permissions (DUMP, ...) the app lacks: only
+      // to a named component, so it is never a way to run anything else.
+      if (src.as_shell !== undefined) {
+        if (typeof src.as_shell !== "boolean") return "as_shell must be true or false";
+        if (src.as_shell && (typeof out.component !== "string" || !COMPONENT_RE.test(out.component))) {
+          return "as_shell needs component, e.g. com.example.app/.debug.Command";
+        }
+        out.as_shell = src.as_shell;
       }
       return out;
     }
@@ -556,7 +703,62 @@ function commandArgs(cmd: CommandName, src: Fields, ignored: string[]): Fields |
     }
 
     case "request_status":
+    case "accessibility":
       return {};
+
+    case "install": {
+      // An APK already on the phone, installed over the app that is there (pm install -r): never a
+      // downgrade, an uninstall or cleared data. `package` must be the APK's own.
+      if (typeof src.path !== "string" || !src.path.startsWith("/")) return "path must be absolute: the APK on the phone, e.g. /sdcard/Download/app.apk";
+      const pkg = packageName(src, "package");
+      if (!pkg) return "package must be the APK's Android package name";
+      return { path: src.path, package: pkg };
+    }
+
+    case "logcat":
+      return logcatArgs(src);
+
+    case "package":
+    case "package_apk": {
+      const name = packageName(src, "name");
+      return name ? { name } : "name must be an Android package name";
+    }
+
+    case "run_as":
+    case "run_as_files": {
+      const pkg = packageName(src, "package");
+      if (!pkg) return "package must be an Android package name";
+      const path = dataPath(src.path, cmd === "run_as");
+      if (path === null) return "path must be relative to the app's data folder, e.g. files/plan.json, with no ..";
+      return path === undefined ? { package: pkg } : { package: pkg, path };
+    }
+
+    case "settings": {
+      if (typeof src.namespace !== "string" || !SETTINGS_NAMESPACES.includes(src.namespace)) {
+        return `namespace must be one of ${SETTINGS_NAMESPACES.join(", ")}`;
+      }
+      if (typeof src.key !== "string" || !SETTING_KEY_RE.test(src.key)) return "key must be a setting's name, e.g. stay_on_while_plugged_in";
+      return { namespace: src.namespace, key: src.key };
+    }
+
+    case "check": {
+      const pkg = packageName(src, "package");
+      if (!pkg) return "package must be an Android package name";
+      const out: Fields = { package: pkg };
+      if (src.services !== undefined) {
+        const services = listOf(src.services);
+        if (!services || services.length === 0 || !services.every((c) => typeof c === "string" && COMPONENT_RE.test(c))) {
+          return "services must be a component or a list of them, e.g. com.example.app/.FocusService";
+        }
+        out.services = services;
+      }
+      if (src.accept_gone !== undefined) {
+        const v = src.accept_gone;
+        if (v !== true && v !== false && v !== "true" && v !== "false") return "accept_gone must be true or false";
+        out.accept_gone = v === true || v === "true";
+      }
+      return out;
+    }
 
     case "files":
     case "pull":
