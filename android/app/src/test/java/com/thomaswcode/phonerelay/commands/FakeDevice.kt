@@ -170,12 +170,14 @@ class FakeDevice : Device {
 
     /** What shellWithInput was given: (command, input). */
     val shellInputs = mutableListOf<Pair<String, ByteArray>>()
-    override suspend fun shellWithInput(command: String, input: ByteArray, guard: (() -> Unit)?) {
+    override suspend fun shellWithInput(command: String, inputPath: String, guard: (() -> Unit)?) {
         if (!shellPaired) throw CommandError("shell_unavailable", "pair the app with wireless debugging first")
         guard?.invoke()
         shellCommands += command
-        shellInputs += command to input
+        shellInputs += command to (written[inputPath] ?: throw CommandError("not_found", inputPath))
     }
+
+    override fun newOwnFile(): String = UPLOAD
 
     /** APK files on the phone, and the packages installed. */
     val apks = mutableMapOf("/sdcard/Download/tiny.apk" to ApkInfo("com.example.tiny", "1.2.3", 42))
@@ -280,6 +282,7 @@ class FakeDevice : Device {
         const val RECORDING = "/data/user/0/com.thomaswcode.phonerelay/cache/record.mp4"
         const val AUDIO = "/data/user/0/com.thomaswcode.phonerelay/cache/audio.wav"
         const val SHELL_OUT = "/data/user/0/com.thomaswcode.phonerelay/cache/shell.out"
+        const val UPLOAD = "/data/user/0/com.thomaswcode.phonerelay/cache/upload.part"
         const val TINY_INSTALLED = "/data/app/~~Zm9v==/com.example.tiny-YmFy==/base.apk"
 
         fun node(

@@ -56,6 +56,9 @@ class InProcessAdb:
 
     async def run(self, *args, timeout=None, stdin=None):
         self.calls.append(list(args))
+        if stdin is not None:  # a local file's path, as Adb.run takes it
+            with open(stdin, "rb") as f:
+                stdin = f.read()
         if self.state.get("hang"):
             await asyncio.sleep(self.state["hang"])
         if args[0] in ("pull", "push"):
@@ -83,8 +86,8 @@ class InProcessAdb:
     async def exec_out(self, command, timeout=None):
         return await self.run("exec-out", command)
 
-    async def exec_in(self, command, data, timeout=None):
-        return await self.run("exec-in", command, stdin=data)
+    async def exec_in(self, command, path, timeout=None):
+        return await self.run("exec-in", command, stdin=path)
 
     def inputs(self):
         return [c for c in self.executed if c.startswith("input ")]
@@ -833,6 +836,7 @@ class ReleaseParsingTests(unittest.TestCase):
         self.assertEqual(command, 'logcat -d -b crash -t "$(( $(date +%s) - 60 )).000" -s Decrastination:W AndroidRuntime:W 2>&1 | tail -n 11')
         self.assertEqual(pc.logcat_command({"since": "2026-11-09 06:58:42", "level": "E"})[0],
                          "logcat -d -t '2026-11-09 06:58:42.000' '*:E' 2>&1 | tail -n 501")
+        self.assertEqual(pc.logcat_command({"tag": ["My$Tag"]})[0], "logcat -d -s 'My$Tag:V' 2>&1 | tail -n 501")
         for bad in [{"tag": "a;b"}, {"level": "X"}, {"since": "now"}, {"since": 0}, {"lines": 0}, {"buffer": "x"}, {"tag": []}]:
             with self.assertRaises(pc.CommandError, msg=repr(bad)):
                 pc.logcat_command(bad)
@@ -1023,6 +1027,11 @@ class DecrastinationWorkflowTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(pc.CommandError) as cm:
             await ctl.handle("run_as_push", {"package": "com.android.chrome", "path": "files/x"}, FakeRelay(upload(b"x")))
         self.assertEqual(cm.exception.code, "not_debuggable")
+        # An existing folder is refused, not written into
+        with self.assertRaises(pc.CommandError) as cm:
+            await ctl.handle("run_as_push", {"package": "com.example.tiny", "path": "files"}, FakeRelay(upload(b"x")))
+        self.assertEqual(cm.exception.code, "invalid_args")
+        self.assertNotIn(root + "files/.files.part", adb.state["files"])
 
     async def test_run_as_kill(self):
         ctl, adb = controller()

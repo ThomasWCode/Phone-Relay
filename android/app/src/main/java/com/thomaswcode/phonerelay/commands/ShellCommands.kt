@@ -143,7 +143,7 @@ object ShellCommands {
                 else -> throw CommandError("invalid_args", "since must be seconds ago or a time, e.g. \"2026-11-09 06:58:42\"")
             }
         }
-        if (tags != null) parts += listOf("-s") + tags.map { "$it:${level ?: "V"}" }
+        if (tags != null) parts += listOf("-s") + tags.map { quote("$it:${level ?: "V"}") } // a tag may hold $
         else if (level != null) parts += "'*:$level'"
         return parts.joinToString(" ") + " 2>&1 | tail -n ${lines + 1}" to lines
     }

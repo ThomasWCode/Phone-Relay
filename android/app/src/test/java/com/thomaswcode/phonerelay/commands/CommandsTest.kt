@@ -649,6 +649,12 @@ class CommandsTest {
 
         val data = """{"made": "up"}""".toByteArray()
         device.shellReply = { cmd -> if (cmd.startsWith("run-as com.example.tiny stat -c %s")) "${data.size}\n" else null }
+        fun upload() = Stream("u") { }.also {
+            it.inbox.trySend(kotlinx.serialization.json.buildJsonObject {
+                put("type", JsonPrimitive("chunk")); put("seq", JsonPrimitive(0)); put("data", JsonPrimitive(Base64.getEncoder().encodeToString(data)))
+            })
+            it.inbox.trySend(kotlinx.serialization.json.buildJsonObject { put("type", JsonPrimitive("end")) })
+        }
         val upload = Stream("u") { }
         upload.inbox.trySend(kotlinx.serialization.json.buildJsonObject {
             put("type", JsonPrimitive("chunk")); put("seq", JsonPrimitive(0)); put("data", JsonPrimitive(Base64.getEncoder().encodeToString(data)))
@@ -659,6 +665,13 @@ class CommandsTest {
         assertEquals("run-as com.example.tiny sh -c 'mkdir -p files && cat > files/.credentials.import.part'", device.shellInputs.single().first)
         assertTrue(device.shellInputs.single().second.contentEquals(data))
         assertEquals("run-as com.example.tiny mv -f -- files/.credentials.import.part files/credentials.import 2>&1", device.shellCommands.last())
+        assertTrue(FakeDevice.UPLOAD !in device.written) // the app's own copy is gone
+        // An existing folder is refused before anything is sent, so mv cannot put the file inside it
+        device.shellReply = { cmd -> if (cmd.startsWith("run-as com.example.tiny stat -c '")) "directory|4096|1700000000|files\n" else null }
+        assertEquals("invalid_args", assertFailsWith<CommandError> {
+            commands.handle("run_as_push", args("""{"package": "com.example.tiny", "path": "files"}"""), upload())
+        }.code)
+        assertEquals(1, device.shellInputs.size)
 
         device.shellReply = { cmd -> if (cmd.startsWith("run-as com.example.tiny stat -c '")) "regular file|14|1700000000|files/ai-prompts.json\n" else null }
         run("run_as_delete", """{"package": "com.example.tiny", "path": "files/ai-prompts.json"}""")
@@ -880,6 +893,7 @@ class ShellCommandsTest {
             "logcat -d -b crash -t \"$(( $(date +%s) - 60 )).000\" -s Decrastination:W AndroidRuntime:W 2>&1 | tail -n 11",
             ShellCommands.logcatCommand(args("""{"tag": ["Decrastination", "AndroidRuntime"], "level": "W", "since": 60, "lines": 10, "buffer": "crash"}""")).first,
         )
+        assertEquals("logcat -d -s 'My\$Tag:V' 2>&1 | tail -n 501", ShellCommands.logcatCommand(args("""{"tag": ["My${'$'}Tag"]}""")).first)
         assertEquals("logcat -d -t '2026-11-09 06:58:42.000' '*:E' 2>&1 | tail -n 501",
             ShellCommands.logcatCommand(args("""{"since": "2026-11-09 06:58:42", "level": "E"}""")).first)
         for (bad in listOf("""{"tag": "a;b"}""", """{"level": "X"}""", """{"since": "now"}""", """{"since": 0}""", """{"lines": 0}""", """{"lines": 1.5}""", """{"buffer": "x"}""", """{"tag": []}""")) {

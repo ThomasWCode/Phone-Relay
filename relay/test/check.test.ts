@@ -11,6 +11,10 @@ const crashLines = [
   "11-09 07:00:00.000  1234  1234 E AndroidRuntime: java.lang.IllegalStateException: boom",
   "11-09 07:01:00.000  2345  2345 E AndroidRuntime: FATAL EXCEPTION: main",
   "11-09 07:01:00.000  2345  2345 E AndroidRuntime: Process: com.other.app, PID: 2345",
+  "11-09 07:02:00.000  3456  3456 E AndroidRuntime: FATAL EXCEPTION: main",
+  `11-09 07:02:00.000  3456  3456 E AndroidRuntime: Process: ${PKG}2, PID: 3456`,
+  "11-09 07:03:00.000  4567  4567 E AndroidRuntime: FATAL EXCEPTION: worker",
+  `11-09 07:03:00.000  4567  4567 E AndroidRuntime: Process: ${PKG}:sync, PID: 4567`,
 ];
 
 function inputs(over: Partial<CheckInputs> = {}): CheckInputs {
@@ -40,9 +44,9 @@ describe("evaluateCheck", () => {
     const { report } = evaluateCheck({ package: PKG }, inputs({ crashLog: ok({ lines: crashLines }) }), null);
     expect(report.ok).toBe(false);
     const crashes = report.crashes as { count: number; first: string[] };
-    expect(crashes.count).toBe(1);
+    expect(crashes.count).toBe(2); // its own :sync process too, not com.example.app2's
     expect(crashes.first[0]).toContain("FATAL EXCEPTION");
-    expect(report.problems).toEqual(["1 crash in the crash log since the install"]);
+    expect(report.problems).toEqual(["2 crashes in the crash log since the install"]);
   });
 
   it("a service enabled but not bound, a named one not enabled, and a dump that names none", () => {
@@ -78,6 +82,9 @@ describe("evaluateCheck", () => {
       "the crash log could not be read (shell_unavailable: wireless debugging is off)",
     ]);
     expect(record).toEqual({ enabled: [FOCUS] }); // nothing read, nothing replaced
+    const noState = evaluateCheck({ package: PKG }, inputs({ state: failed }), null);
+    expect(noState.report.ok).toBe(false);
+    expect(noState.report.problems).toEqual(["what is in front could not be read (shell_unavailable: wireless debugging is off)"]);
     const missing = evaluateCheck({ package: PKG }, inputs({ package: { ok: false, error: "not_found" }, crashLog: null, files: null }), null);
     expect(missing.report.ok).toBe(false);
     expect(missing.report.package).toBeNull();

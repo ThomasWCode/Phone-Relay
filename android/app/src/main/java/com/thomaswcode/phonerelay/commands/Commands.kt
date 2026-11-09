@@ -809,22 +809,31 @@ class Commands(
         val pkg = packageName(args, "package", "an Android package name")
         val p = ShellCommands.dataPath(args, file = true)!!
         debuggable(pkg)
-        val bytes = java.io.ByteArrayOutputStream().also { stream.recvFile(it) }.toByteArray()
-        val (folder, part) = ShellCommands.partPath(p)
-        device.shellWithInput(ShellCommands.runAsWrite(pkg, folder, part), bytes)
-        // The input's end reaches cat once adbd has written it: wait a little for the whole file.
-        var written = ""
-        for (attempt in 0 until WRITE_CHECKS) {
-            written = device.shell(ShellCommands.runAsSize(pkg, part)).trim()
-            if (written == bytes.size.toString()) break
-            delay(WRITE_CHECK_MS)
+        // mv would put the file inside a folder of that name: refused before anything is sent
+        val existing = device.shell(ShellCommands.runAsStat(pkg, p)).lines().firstNotNullOfOrNull(ShellCommands::parseStat)
+        if (existing?.type == "dir") throw CommandError("invalid_args", "$p is a folder; name the file to write")
+        // The upload goes to a file of the app's own first, never whole into memory
+        val upload = device.newOwnFile()
+        try {
+            val size = device.openWrite(upload).use { stream.recvFile(it) }
+            val (folder, part) = ShellCommands.partPath(p)
+            device.shellWithInput(ShellCommands.runAsWrite(pkg, folder, part), upload)
+            // The input's end reaches cat once adbd has written it: wait a little for the whole file.
+            var written = ""
+            for (attempt in 0 until WRITE_CHECKS) {
+                written = device.shell(ShellCommands.runAsSize(pkg, part)).trim()
+                if (written == size.toString()) break
+                delay(WRITE_CHECK_MS)
+            }
+            if (written != size.toString()) {
+                runCatching { device.shell(ShellCommands.runAsDelete(pkg, part)) }
+                throw CommandError("device_error", "wrote ${written.take(100)} bytes of $size")
+            }
+            device.shell(ShellCommands.runAsMove(pkg, part, p)).trim().takeIf { it.isNotEmpty() }?.let { throw CommandError("device_error", it.takeLast(300)) }
+            return buildJsonObject { put("package", pkg); put("path", p); put("bytes", size) }
+        } finally {
+            runCatching { device.deleteFile(upload) }
         }
-        if (written != bytes.size.toString()) {
-            runCatching { device.shell(ShellCommands.runAsDelete(pkg, part)) }
-            throw CommandError("device_error", "wrote ${written.take(100)} bytes of ${bytes.size}")
-        }
-        device.shell(ShellCommands.runAsMove(pkg, part, p)).trim().takeIf { it.isNotEmpty() }?.let { throw CommandError("device_error", it.takeLast(300)) }
-        return buildJsonObject { put("package", pkg); put("path", p); put("bytes", bytes.size) }
     }
 
     /** Deletes one file (never a folder) in a debuggable app's own storage. */

@@ -155,8 +155,13 @@ interface Device {
      * deleteFile take it.
      */
     suspend fun shellToFile(command: String, guard: (() -> Unit)? = null): String
-    /** Runs a command as shell() does with `input` as its standard input (as `adb exec-in`); it returns once the input is sent. */
-    suspend fun shellWithInput(command: String, input: ByteArray, guard: (() -> Unit)? = null)
+    /**
+     * Runs a command as shell() does with a file of the app's own (from newOwnFile) as its standard
+     * input, streamed (as `adb exec-in`); it returns once the input is sent.
+     */
+    suspend fun shellWithInput(command: String, inputPath: String, guard: (() -> Unit)? = null)
+    /** A new, empty file of the app's own (an upload on its way): openWrite, openRead, ownFileSize and deleteFile take it. */
+    fun newOwnFile(): String
     /** An APK file's package and version; not_found when the app cannot read it, invalid_args when it is not an APK. */
     fun apkInfo(path: String): ApkInfo
     /** What is installed of a package; not_found when it is not installed. */

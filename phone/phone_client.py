@@ -219,23 +219,26 @@ class Adb:
         self.adb_bin = adb_bin
         self.serial = serial
 
-    async def run(self, *args: str, timeout: float | None = None, stdin: bytes | None = None) -> bytes:
+    async def run(self, *args: str, timeout: float | None = None, stdin: str | None = None) -> bytes:
         """One adb call. No timeout by default: the command's deadline (PhoneController.handle) cancels it.
-        `stdin` is given to the command's standard input (`adb exec-in`)."""
+        `stdin` is a local file read as the command's standard input (`adb exec-in`), never whole into memory."""
         # A .py "adb" (the tests' fake) runs with this Python: no shell wrapper, so it works on Windows too.
         cmd = [sys.executable, self.adb_bin] if self.adb_bin.endswith(".py") else [self.adb_bin]
         if self.serial:
             cmd += ["-s", self.serial]
         cmd += list(args)
+        source = open(stdin, "rb") if stdin is not None else None
         try:
             proc = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                stdin=asyncio.subprocess.PIPE if stdin is not None else None,
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, stdin=source,
             )
         except FileNotFoundError as e:
             raise CommandError("adb_failed", f"adb not found: {self.adb_bin}") from e
+        finally:
+            if source is not None:
+                source.close()  # the child has its own copy of the file's descriptor
         try:
-            out, err = await asyncio.wait_for(proc.communicate(stdin), timeout)
+            out, err = await asyncio.wait_for(proc.communicate(), timeout)
         except asyncio.TimeoutError as e:
             await _kill(proc)
             raise CommandError("timeout", " ".join(args[:2])) from e
@@ -252,8 +255,9 @@ class Adb:
     async def exec_out(self, command: str, timeout: float | None = None) -> bytes:
         return await self.run("exec-out", command, timeout=timeout)
 
-    async def exec_in(self, command: str, data: bytes, timeout: float | None = None) -> bytes:
-        return await self.run("exec-in", command, timeout=timeout, stdin=data)
+    async def exec_in(self, command: str, path: str, timeout: float | None = None) -> bytes:
+        """`adb exec-in`: the local file at `path` is the command's standard input."""
+        return await self.run("exec-in", command, timeout=timeout, stdin=path)
 
 
 async def _kill(proc: asyncio.subprocess.Process) -> None:
@@ -576,7 +580,7 @@ def logcat_command(args: dict) -> tuple[str, int]:
         else:
             raise CommandError("invalid_args", 'since must be seconds ago or a time, e.g. "2026-11-09 06:58:42"')
     if tags:
-        parts += ["-s"] + [f"{t}:{level or 'V'}" for t in tags]
+        parts += ["-s"] + [shlex.quote(f"{t}:{level or 'V'}") for t in tags]  # a tag may hold $
     elif level:
         parts.append(f"'*:{level}'")
     return " ".join(parts) + f" 2>&1 | tail -n {lines + 1}", lines
@@ -1988,16 +1992,20 @@ class PhoneController:
             raise CommandError("invalid_args", "package must be an Android package name")
         path = data_path(args, file=True)
         await self._debuggable(package)
+        # mv would put the file inside a folder of that name: refused before anything is sent
+        out = await self.adb.shell(
+            f"run-as {package} stat -c '%F|%s|%Y|%n' -- {shlex.quote(path)} 2>/dev/null || echo {MISSING_MARKER}")
+        entry = next((e for e in map(parse_stat, out.splitlines()) if e), None)
+        if entry is not None and entry["type"] == "dir":
+            raise CommandError("invalid_args", f"{path} is a folder; name the file to write")
         folder, part = part_path(path)
         local = _local_temp(os.path.splitext(path)[1])
         try:
             size = await channel.recv_file(local)
-            with open(local, "rb") as f:
-                data = f.read()
+            script = f"mkdir -p {shlex.quote(folder)} && cat > {shlex.quote(part)}"
+            await self.adb.exec_in(f"run-as {package} sh -c {shlex.quote(script)}", local)
         finally:
             _remove(local)
-        script = f"mkdir -p {shlex.quote(folder)} && cat > {shlex.quote(part)}"
-        await self.adb.exec_in(f"run-as {package} sh -c {shlex.quote(script)}", data)
         written = (await self.adb.shell(f"run-as {package} stat -c %s -- {shlex.quote(part)} 2>&1")).strip()
         if written != str(size):
             await self.adb.shell(f"run-as {package} rm -f -- {shlex.quote(part)}")

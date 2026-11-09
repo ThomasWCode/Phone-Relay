@@ -204,13 +204,14 @@ class AdbShell(private val context: Context) {
      * Runs a command with `input` as its standard input, as `adb exec-in` does: the bytes are sent,
      * then the stream is closed, which adbd takes as the input's end once it has written them.
      */
-    suspend fun runWithInput(command: String, input: ByteArray, guard: (() -> Unit)? = null) {
+    suspend fun runWithInput(command: String, input: File, guard: (() -> Unit)? = null) {
         val stream = open("exec:$command", guard)
         try {
             runInterruptible(Dispatchers.IO) {
-                stream.openOutputStream().apply { write(input); flush() }
+                // A bounded buffer: the input is never in memory whole
+                input.inputStream().use { source -> stream.openOutputStream().let { source.copyTo(it); it.flush() } }
             }
-            Log.i(TAG, "shell: a ${command.length}-character command was given ${input.size} bytes")
+            Log.i(TAG, "shell: a ${command.length}-character command was given ${input.length()} bytes")
         } finally {
             runCatching { stream.close() }
         }

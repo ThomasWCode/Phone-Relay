@@ -400,7 +400,9 @@ class AndroidDevice(
 
     override suspend fun shell(command: String, guard: (() -> Unit)?): String = adb.run(command, guard)
 
-    override suspend fun shellWithInput(command: String, input: ByteArray, guard: (() -> Unit)?) = adb.runWithInput(command, input, guard)
+    override suspend fun shellWithInput(command: String, inputPath: String, guard: (() -> Unit)?) = adb.runWithInput(command, File(inputPath), guard)
+
+    override fun newOwnFile(): String = File.createTempFile("upload", ".part", context.cacheDir).path
 
     override suspend fun shellToFile(command: String, guard: (() -> Unit)?): String {
         val file = File.createTempFile("shell", ".out", context.cacheDir)

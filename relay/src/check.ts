@@ -59,6 +59,7 @@ export function evaluateCheck(
   if (!inputs.package.ok) problems.push(`the package could not be read (${failed(inputs.package)})`);
 
   const foreground = inputs.state.ok ? (inputs.state.result.foreground ?? null) : null;
+  if (!inputs.state.ok) problems.push(`what is in front could not be read (${failed(inputs.state)})`);
 
   // Accessibility: every enabled service bound, the ones named in `services` among them, none gone.
   let accessibility: Fields | null = null;
@@ -86,7 +87,8 @@ export function evaluateCheck(
     accessibility = { enabled, bound, missing, gone, services };
   }
 
-  // Crashes of the package in the crash buffer since its install: FATAL EXCEPTION, then its process.
+  // Crashes of the package in the crash buffer since its install: FATAL EXCEPTION, then its process,
+  // named exactly (its own :process ones too), so com.example.app2 is not com.example.app's.
   let crashes: Fields | null = null;
   if (inputs.crashLog !== null) {
     if (!inputs.crashLog.ok) {
@@ -96,7 +98,8 @@ export function evaluateCheck(
       let count = 0;
       let first: string[] = [];
       lines.forEach((line, i) => {
-        if (line.includes("FATAL EXCEPTION") && (lines[i + 1] ?? "").includes(`Process: ${pkg}`)) {
+        const process = /Process: ([^,\s]+)/.exec(lines[i + 1] ?? "")?.[1];
+        if (line.includes("FATAL EXCEPTION") && (process === pkg || process?.startsWith(`${pkg}:`))) {
           if (count === 0) first = lines.slice(i, i + CRASH_LINES);
           count++;
         }
