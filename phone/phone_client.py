@@ -638,7 +638,7 @@ def parse_content(out: str, projection: list[str] | None) -> list[dict]:
     The provider's errors go to stderr while `content` still exits 0, so they are looked for here.
     """
     if re.search(r"^(Error while accessing provider|Exception|java\.|\[ERROR\])", out, re.MULTILINE):
-        raise CommandError("content_failed", out.strip()[-300:])
+        raise CommandError("content_failed", out.strip()[:300])
     if out.strip() == "No result found." or not out.strip():
         return []
     records, current = [], None

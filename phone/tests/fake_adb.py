@@ -469,7 +469,8 @@ def content_query(cmd, state):
     state["last_content"] = opt
     save_state(state)
     if opt["--uri"] != "content://com.android.calendar/events":
-        return f"Error while accessing provider:{opt['--uri']}\njava.lang.IllegalArgumentException: Unknown URL\n"
+        return (f"Error while accessing provider:{opt['--uri']}\njava.lang.IllegalArgumentException: Unknown URL\n"
+                + "\tat com.android.commands.content.Content.main(Content.java:735)\n" * 10)
     rows = state.get("calendar", [])
     if not rows:
         return "No result found.\n"

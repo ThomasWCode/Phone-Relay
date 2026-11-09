@@ -990,6 +990,7 @@ class DecrastinationWorkflowTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(pc.CommandError) as cm:
             await ctl.handle("content", {"uri": "content://nowhere/x"})
         self.assertEqual(cm.exception.code, "content_failed")
+        self.assertTrue(cm.exception.detail.startswith("Error while accessing provider:content://nowhere/x"))
         for bad in [{"uri": "https://x"}, {"uri": "content://a", "projection": ["a;b"]}, {"uri": "content://a", "sort": "a;b"}]:
             with self.assertRaises(pc.CommandError, msg=repr(bad)):
                 await ctl.handle("content", bad)

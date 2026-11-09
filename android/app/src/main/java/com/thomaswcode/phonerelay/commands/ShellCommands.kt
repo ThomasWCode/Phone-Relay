@@ -221,7 +221,7 @@ object ShellCommands {
      */
     fun parseContent(out: String, projection: List<String>?): List<Map<String, String?>> {
         if (Regex("^(Error while accessing provider|Exception|java\\.|\\[ERROR\\])", RegexOption.MULTILINE).containsMatchIn(out)) {
-            throw CommandError("content_failed", out.trim().takeLast(300))
+            throw CommandError("content_failed", out.trim().take(300))
         }
         if (out.isBlank() || out.trim() == "No result found.") return emptyList()
         val records = mutableListOf<String>()

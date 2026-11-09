@@ -629,8 +629,11 @@ class CommandsTest {
         assertEquals(JsonNull, r["rows"]!!.jsonArray[1].jsonObject["description"])
         assertEquals("content query --uri content://com.android.calendar/events --projection _id:description --where 'calendar_id=3 AND deleted=0' 2>&1",
             device.shellCommands.last())
-        device.shellReply = { "Error while accessing provider:x\njava.lang.IllegalArgumentException: Unknown URL\n" }
-        assertEquals("content_failed", error("content", """{"uri": "content://x/y"}""").code)
+        device.shellReply = { "Error while accessing provider:x\njava.lang.IllegalArgumentException: Unknown URL\n" + "\tat a.b.C.d(C.java:1)\n".repeat(40) }
+        val failed = error("content", """{"uri": "content://x/y"}""")
+        assertEquals("content_failed", failed.code)
+        // The error's first lines, not the stack's last frames
+        assertTrue(failed.detail.startsWith("Error while accessing provider:x\njava.lang.IllegalArgumentException"))
     }
 
     @Test
