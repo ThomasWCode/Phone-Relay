@@ -25,7 +25,7 @@ The phone side is either the **Android app** (always on; it drives the phone thr
 | Reading the clipboard | An invisible window of the app comes forward for a moment (Android lets only the app in front read it) | Through the helper |
 | Screen recording, audio | MediaProjection: Android's consent prompt shows for a moment before each, and the app answers it; the status bar shows the capture. One MP4 at any length. The sound output is captured as it plays, without apps that refuse capture (and calls) | `screenrecord` (MP4 segments past 180 s) and the helper (the output goes quiet on the phone meanwhile) |
 | Chrome DevTools, any key, typing with no field focused | Through the **shell bridge**: the app's own adb connection to this phone's wireless debugging, so only on Wi-Fi, and only once the owner has paired it (503 `shell_unavailable` otherwise, with the reason). The app switches wireless debugging back on by itself when Android has turned it off, if it holds the secure-settings grant | Direct |
-| Installs, accessibility, logcat, settings, `/run-as`, `as_shell` intents | Through the shell bridge (Wi-Fi only, once paired). What is installed of a package (`/package`) and its APK (`/package/apk`) come from PackageManager, so they work anywhere | Direct (`/package` reads the signing certificate from the installed APK's signing block) |
+| Installs, accessibility, logcat, settings, `/run-as/*`, `/content`, `/night-mode`, `/force-stop`, `as_shell` intents | Through the shell bridge (Wi-Fi only, once paired). What is installed of a package (`/package`) and its APK (`/package/apk`) come from PackageManager, so they work anywhere | Direct (`/package` reads the signing certificate from the installed APK's signing block) |
 | Asking the owner (`/request`) | A card over the screen and a notification, with Accept, Deny and a message box | Not built (501 `unsupported`): nothing of its own to draw on the screen |
 | Grants the owner gives once | Accessibility service, notification access, all-files access, modify system settings, no battery optimisation, the microphone; for the shell bridge, pairing (the code typed into a notification) and, optionally, the secure-settings grant over adb | Wireless debugging pairing |
 
@@ -88,6 +88,10 @@ The phone side is either the **Android app** (always on; it drives the phone thr
 - **One setting** (`/settings`), read-only, from `system`, `secure` or `global`, with dark mode.
 - **A debuggable app's own files** (`/run-as`, `/run-as/files`): read and list them through `run-as`, read-only, inside its data folder.
 - **Intents as the shell user** (`/intent` with `as_shell`): for a component that needs a permission only the shell has (`DUMP`: a debug-command activity, say).
+- **Write into a debuggable app's own storage** (`/run-as/push`: atomically, through a hidden `.part`), **delete one file** there (`/run-as/delete`), **archive a folder** of it as a tar (`/run-as/archive`), and **pause, resume or end its process** (`/run-as/kill`), for a store edited by hand, credentials loaded for a debug command, and a copy of the data before an install.
+- **A provider's rows** (`/content`, `content query`, read-only): the calendar's events, for instance.
+- **Dark mode** on, off or automatic (`/night-mode`), the old setting in the reply.
+- **Force-stop** an app (`/force-stop`), other than one with an enabled accessibility service or the system's own.
 - **The after-install checks** (`/check`): the version, what is in front, the accessibility services (and any gone since the last check, which the relay remembers), crashes since the install, and a debuggable app's files beside the last check's; `ok` says whether all is well.
 
 ### Asking the owner (the app)
@@ -111,9 +115,10 @@ Gestures, the clipboard, pasted text, audio and the UI tree go through a small J
 | 2 | Owner kill switches: `/admin/disable`, the app's switch (tile, widget, notification, app) and the adb client's stop file | Worker + client | The owner's off switch. They end the relay's path to the phone, not `adb` from the owner's own computer |
 | 3 | One phone, one command at a time | Worker + client | Actions must not interleave; a second phone connection replaces the first |
 | 4 | `/install` installs only the package named (the APK's own, read from it first), with `pm install -r` and never `-d`; there is no uninstall and no clearing of data | Worker + client | A release replaces the app that is there, never another, and never loses its data |
-| 5 | `/run-as` and `/run-as/files` read only a debuggable app's files, by a path inside its data folder (no `..`), and write nothing | Worker + client | `run-as` itself refuses other apps; the relay says so first (403 `not_debuggable`) |
+| 5 | `/run-as/*` reach only a debuggable app's files and process, by a path inside its data folder (no `..`, no part starting with `-`); a write or a delete is of one file, never a folder, and a write goes through a `.part` whose size is checked | Worker + client | `run-as` itself refuses other apps; the relay says so first (403 `not_debuggable`) |
 | 6 | `/intent` with `as_shell` needs an explicit `component` | Worker + client | The shell user's intent reaches one named component, never anything a resolver would pick, so it is no general shell |
-| 7 | `/accessibility`, `/logcat`, `/package`, `/settings` and `/check` only read | Client | They run fixed read-only commands (`settings get`, `dumpsys`, `logcat -d`) |
+| 7 | `/accessibility`, `/logcat`, `/package`, `/settings`, `/content`, `/run-as/archive` and `/check` only read | Client | They run fixed read-only commands (`settings get`, `dumpsys`, `logcat -d`, `content query`, `tar -c`) |
+| 8 | `/force-stop` refuses an app with an enabled accessibility service, and the system's own (`android`, System UI, the phone app) and what runs the relay's client | Client | A force-stopped app's accessibility service is dropped from the enabled list |
 
 Requests are still checked for shape, in the Worker and again on the phone: numbers must be numbers, package and key names must match their patterns, and text typed as keys (`method: keys`) must be ASCII; anything else is pasted. That keeps values out of the shell's syntax; it refuses no action.
 
@@ -125,4 +130,6 @@ Nothing from the earlier list is left; the native app (phase 5) is built. The ow
 
 The app does all the adb client does. What only the shell user can do (Chrome DevTools, other keys, typing with no field focused, installs, accessibility, logcat, settings, `run-as`, intents as the shell) it does through the shell bridge, so on Wi-Fi only, and once the owner has paired it.
 
-Not part of `/check`, which keeps to what any app has: the checks of Decrastination's `scripts/phone-check.sh` that are that app's own (its calendar's slots, its crash records in `files/crashes`); read them with `/run-as` and `/run-as/files`.
+Not part of `/check`, which keeps to what any app has: the checks of Decrastination's `scripts/phone-check.sh` that are that app's own (its calendar's slots, its crash records in `files/crashes`); read them with `/content` and `/run-as/files`.
+
+Not built, as nothing in the phone can stand in for them: `adb reverse` (a stand-in server on the owner's computer reached from the phone, for Decrastination's `ai-check` and sync tests) and one-off set-up (`pm grant`, turning an accessibility service on), which the owner does over adb.
