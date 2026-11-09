@@ -337,6 +337,37 @@ describe("building, installing and checking a release", () => {
   });
 });
 
+describe("what Decrastination's workflow does over adb", () => {
+  it("content: a read-only query of a provider", () => {
+    expect(args(v("content", null, "uri=content://com.android.calendar/events&projection=dtstart,dtend&where=calendar_id=3 AND deleted=0&sort=dtstart DESC")))
+      .toEqual({ uri: "content://com.android.calendar/events", projection: ["dtstart", "dtend"], where: "calendar_id=3 AND deleted=0", sort: "dtstart DESC", timeout: 30 });
+    for (const q of ["", "uri=https://x", "uri=content://a b", "uri=content://a&projection=a;b", "uri=content://a&sort=a;b", "uri=content://a&where="]) {
+      expect(v("content", null, q).ok, q).toBe(false);
+    }
+    expect(summariseArgs({ cmd: "content", args: { uri: "content://a", where: "title='secret'" } })).toEqual({ uri: "content://a", where_length: 14 });
+  });
+
+  it("run-as: an archive, a push, a delete and a signal", () => {
+    expect(args(v("run_as_archive", null, "package=com.a&path=files"))).toEqual({ package: "com.a", path: "files", timeout: 300 });
+    expect(findRoute("/run-as/push", "POST")).toEqual({ method: "POST", cmd: "run_as_push", raw: true });
+    expect(args(v("run_as_push", null, "package=com.a&path=files/credentials.import"))).toEqual({ package: "com.a", path: "files/credentials.import", timeout: 300 });
+    expect(v("run_as_push", null, "package=com.a").ok).toBe(false);
+    expect(v("run_as_push", null, "package=com.a&path=../x").ok).toBe(false);
+    for (const path of ["files/", "-rf", "files/-x", "files/--to-command=x"]) expect(v("run_as_push", null, `package=com.a&path=${path}`).ok, path).toBe(false);
+    expect(v("run_as_files", null, "package=com.a&path=files/").ok).toBe(true);
+    expect(args(v("run_as_delete", { package: "com.a", path: "files/ai-prompts.json" }))).toEqual({ package: "com.a", path: "files/ai-prompts.json", timeout: 30 });
+    expect(args(v("run_as_kill", { package: "com.a", signal: "STOP" }))).toEqual({ package: "com.a", signal: "STOP", timeout: 30 });
+    for (const signal of ["TERM", "stop", 9, undefined]) expect(v("run_as_kill", { package: "com.a", signal }).ok, String(signal)).toBe(false);
+  });
+
+  it("night mode and force-stop", () => {
+    for (const mode of ["yes", "no", "auto"]) expect(v("night_mode", { mode }).ok).toBe(true);
+    expect(v("night_mode", { mode: "dark" }).ok).toBe(false);
+    expect(args(v("force_stop", { package: "com.google.android.youtube" }))).toEqual({ package: "com.google.android.youtube", timeout: 30 });
+    expect(v("force_stop", { package: "a b" }).ok).toBe(false);
+  });
+});
+
 describe("intent flags by name, and as the shell", () => {
   it("flags take a number, or names (and numbers) combined", () => {
     expect(args(v("intent", { action: "a", flags: ["FLAG_ACTIVITY_NEW_TASK"] }))?.flags).toBe(268435456);

@@ -6,7 +6,7 @@ import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./index";
 import { json } from "./http";
 import { evaluateCheck, type CheckRecord, type StepOutcome } from "./check";
-import { DEFAULT_TIMEOUT_S, DOWNLOAD_COMMANDS, UPLOAD_COMMAND, summariseArgs, type Command, type CommandName } from "./validate";
+import { DEFAULT_TIMEOUT_S, DOWNLOAD_COMMANDS, UPLOAD_COMMANDS, summariseArgs, type Command, type CommandName } from "./validate";
 
 const LOG_KEEP = 1000;
 // The phone enforces each command's `timeout` itself and replies "timeout". The relay waits this much
@@ -25,11 +25,12 @@ const CHECK_LOG_LINES = 2000;
 const DEVICE_ERROR_STATUS: Record<string, number> = {
   invalid_args: 400,
   package_mismatch: 400, // /install: the APK is another package than the one named
-  not_debuggable: 403, // /run-as: only a debuggable app's own files can be read
+  not_debuggable: 403, // /run-as: only a debuggable app's own files can be read or written
   not_found: 404,
   foreground_mismatch: 409,
   no_text_field: 409, // the Android app types into a focused field only
   gesture_cancelled: 409, // Android cancelled the app's gesture (a real touch, the screen changed)
+  stop_refused: 409, // /force-stop: an app with an enabled accessibility service (Android would drop it), or the system's own
   launch_failed: 422,
   install_failed: 422, // Android refused the install: its own error (INSTALL_FAILED_...) is the detail
   unsupported: 501, // a command the connected client cannot run
@@ -332,7 +333,7 @@ export class DeviceHub extends DurableObject<Env> {
     if (command.cmd === "check") return this.check(ws, command, done);
     const asking = command.cmd === "request";
     if (asking) this.recordRequest({ answer: "pending", asked_at: new Date(started).toISOString() });
-    const reply = await (command.cmd === UPLOAD_COMMAND ? this.upload(ws, command, body) : this.dispatch(ws, command)).reply;
+    const reply = await (UPLOAD_COMMANDS.includes(command.cmd) ? this.upload(ws, command, body) : this.dispatch(ws, command)).reply;
 
     if (asking) {
       const asked_at = new Date(started).toISOString();

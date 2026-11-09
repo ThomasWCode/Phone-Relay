@@ -43,7 +43,14 @@ export const DEFAULT_LOG_LINES = 500;
 const COMPONENT_RE = /^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*\/[A-Za-z0-9_.$]+$/;
 const SETTINGS_NAMESPACES = ["system", "secure", "global"];
 const SETTING_KEY_RE = /^[\w.:-]{1,100}$/;
-const DATA_PATH_RE = /^[\w.@+ -]+(\/[\w.@+ -]+)*\/?$/;
+// content query: a provider's URI, its columns, a sort order (the where clause is any text, quoted on the phone)
+const CONTENT_URI_RE = /^content:\/\/[\w.-]+(\/[\w.%:@+-]*)*$/;
+const COLUMN_RE = /^\w{1,64}$/;
+const SORT_RE = /^[\w ,]{1,200}$/;
+const SIGNALS = ["STOP", "CONT", "KILL"];
+const NIGHT_MODES = ["yes", "no", "auto"];
+// No part may start with "-", so none is read as an option of cat, rm or tar.
+const DATA_PATH_RE = /^[\w.@+ ][\w.@+ -]*(\/[\w.@+ ][\w.@+ -]*)*\/?$/;
 // Intent flags by name, as Android's Intent.FLAG_* (checked against android.jar of API 36).
 export const INTENT_FLAGS: Record<string, number> = {
   FLAG_GRANT_READ_URI_PERMISSION: 0x1,
@@ -91,7 +98,8 @@ export const BATCH_COMMANDS = [
   "state", "screenshot", "ui", "tap", "swipe", "type", "key", "launch", "open", "intent",
   "notifications", "statusbar", "rotation", "wait", "files", "record_start", "gesture",
   "clipboard_get", "clipboard_set", "chrome_tabs", "chrome_eval", "chrome_cdp", "chrome_new",
-  "chrome_close", "chrome_activate", "install", "accessibility", "logcat", "package", "settings", "run_as_files", "sleep",
+  "chrome_close", "chrome_activate", "install", "accessibility", "logcat", "package", "settings", "run_as_files", "content", "run_as_delete", "run_as_kill",
+  "night_mode", "force_stop", "sleep",
 ];
 
 export type CommandName =
@@ -101,10 +109,11 @@ export type CommandName =
   | "gesture" | "clipboard_get" | "clipboard_set" | "audio"
   | "chrome_sockets" | "chrome_tabs" | "chrome_eval" | "chrome_cdp" | "chrome_new" | "chrome_close" | "chrome_activate"
   | "request" | "request_status"
-  | "install" | "accessibility" | "logcat" | "package" | "package_apk" | "run_as" | "run_as_files" | "settings" | "check";
-// Commands whose reply is a file streamed from the phone, and the one that streams a file to it.
-export const DOWNLOAD_COMMANDS: readonly CommandName[] = ["pull", "record", "record_stop", "audio", "package_apk", "run_as"];
-export const UPLOAD_COMMAND: CommandName = "push";
+  | "install" | "accessibility" | "logcat" | "package" | "package_apk" | "run_as" | "run_as_files" | "settings" | "check"
+  | "content" | "run_as_archive" | "run_as_push" | "run_as_delete" | "run_as_kill" | "night_mode" | "force_stop";
+// Commands whose reply is a file streamed from the phone, and those that stream a file to it.
+export const DOWNLOAD_COMMANDS: readonly CommandName[] = ["pull", "record", "record_stop", "audio", "package_apk", "run_as", "run_as_archive"];
+export const UPLOAD_COMMANDS: readonly CommandName[] = ["push", "run_as_push"];
 
 export interface Command {
   cmd: CommandName;
@@ -165,6 +174,14 @@ export const AGENT_ROUTES: Record<string, Route | Route[]> = {
   "/package/apk": { method: "GET", cmd: "package_apk" },
   "/run-as": { method: "GET", cmd: "run_as" },
   "/run-as/files": { method: "GET", cmd: "run_as_files" },
+  "/run-as/archive": { method: "GET", cmd: "run_as_archive" },
+  // Writing to a debuggable app's own storage, and pausing or ending its process (to edit a store by hand).
+  "/run-as/push": { method: "POST", cmd: "run_as_push", raw: true },
+  "/run-as/delete": { method: "POST", cmd: "run_as_delete" },
+  "/run-as/kill": { method: "POST", cmd: "run_as_kill" },
+  "/content": { method: "GET", cmd: "content" },
+  "/night-mode": { method: "POST", cmd: "night_mode" },
+  "/force-stop": { method: "POST", cmd: "force_stop" },
   "/settings": { method: "GET", cmd: "settings" },
   // Several of the above at once, run by the relay itself (see check.ts).
   "/check": { method: "GET", cmd: "check" },
@@ -222,6 +239,13 @@ const FIELDS: Record<CommandName, string[]> = {
   run_as_files: ["package", "path"],
   settings: ["namespace", "key"],
   check: ["package", "services", "accept_gone"],
+  content: ["uri", "projection", "where", "sort"],
+  run_as_archive: ["package", "path"],
+  run_as_push: ["package", "path"],
+  run_as_delete: ["package", "path"],
+  run_as_kill: ["package", "signal"],
+  night_mode: ["mode"],
+  force_stop: ["package"],
 };
 // Query-string fields read as numbers.
 const NUMERIC_QUERY_FIELDS = ["scale", "timeout", "seconds", "bit_rate", "lines"];
@@ -280,7 +304,7 @@ export function defaultTimeout(cmd: CommandName, args: Fields): number {
   if (cmd === "wait") return DEFAULT_TIMEOUT_S + (isNumber(args.seconds) ? args.seconds : 10);
   if (cmd === "record" || cmd === "audio") return 2 * DEFAULT_TIMEOUT_S + 2 * (isNumber(args.seconds) ? args.seconds : 10);
   if (cmd === "gesture" && isNumber(args.ms)) return DEFAULT_TIMEOUT_S + Math.max(args.ms, 0) / 1000;
-  if (cmd === "pull" || cmd === "push" || cmd === "record_stop" || cmd === "package_apk" || cmd === "run_as") return TRANSFER_TIMEOUT_S;
+  if (["pull", "push", "record_stop", "package_apk", "run_as", "run_as_archive", "run_as_push"].includes(cmd)) return TRANSFER_TIMEOUT_S;
   if (cmd === "install") return INSTALL_TIMEOUT_S;
   if (cmd === "batch" && Array.isArray(args.steps)) {
     let total = DEFAULT_TIMEOUT_S;
@@ -725,12 +749,56 @@ function commandArgs(cmd: CommandName, src: Fields, ignored: string[]): Fields |
     }
 
     case "run_as":
-    case "run_as_files": {
+    case "run_as_files":
+    case "run_as_archive":
+    case "run_as_push":
+    case "run_as_delete": {
       const pkg = packageName(src, "package");
       if (!pkg) return "package must be an Android package name";
-      const path = dataPath(src.path, cmd === "run_as");
+      const path = dataPath(src.path, cmd !== "run_as_files" && cmd !== "run_as_archive");
       if (path === null) return "path must be relative to the app's data folder, e.g. files/plan.json, with no ..";
+      // A file is written or deleted, never a folder.
+      if ((cmd === "run_as_push" || cmd === "run_as_delete") && path?.endsWith("/")) return "path must name a file, not a folder";
       return path === undefined ? { package: pkg } : { package: pkg, path };
+    }
+
+    case "run_as_kill": {
+      const pkg = packageName(src, "package");
+      if (!pkg) return "package must be an Android package name";
+      if (typeof src.signal !== "string" || !SIGNALS.includes(src.signal)) return `signal must be one of ${SIGNALS.join(", ")}`;
+      return { package: pkg, signal: src.signal };
+    }
+
+    case "content": {
+      // content query only: read-only, whatever the provider
+      if (typeof src.uri !== "string" || !CONTENT_URI_RE.test(src.uri)) return "uri must be a content:// URI, e.g. content://com.android.calendar/events";
+      const out: Fields = { uri: src.uri };
+      if (src.projection !== undefined) {
+        const columns = listOf(src.projection);
+        if (!columns || columns.length === 0 || !columns.every((c) => typeof c === "string" && COLUMN_RE.test(c))) {
+          return "projection must be a column name or a list of them";
+        }
+        out.projection = columns;
+      }
+      if (src.where !== undefined) {
+        if (typeof src.where !== "string" || src.where.length === 0) return "where must be a non-empty string";
+        out.where = src.where;
+      }
+      if (src.sort !== undefined) {
+        if (typeof src.sort !== "string" || !SORT_RE.test(src.sort)) return "sort must be columns, e.g. dtstart DESC";
+        out.sort = src.sort;
+      }
+      return out;
+    }
+
+    case "night_mode": {
+      if (typeof src.mode !== "string" || !NIGHT_MODES.includes(src.mode)) return `mode must be one of ${NIGHT_MODES.join(", ")}`;
+      return { mode: src.mode };
+    }
+
+    case "force_stop": {
+      const pkg = packageName(src, "package");
+      return pkg ? { package: pkg } : "package must be an Android package name";
     }
 
     case "settings": {
@@ -810,5 +878,7 @@ function summarise(cmd: string, args: Fields): Fields {
   // A page's script and a DevTools call's parameters can carry typed text: their size and names only.
   if (cmd === "chrome_eval") return { ...args, expression: undefined, expression_length: String(args.expression ?? "").length };
   if (cmd === "chrome_cdp") return { ...args, params: Object.keys((args.params ?? {}) as object) };
+  // A query's where clause can name what it looks for (an event's title): its length only.
+  if (cmd === "content" && typeof args.where === "string") return { ...args, where: undefined, where_length: args.where.length };
   return { ...args };
 }
