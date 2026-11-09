@@ -81,7 +81,7 @@ The phone side is either the **Android app** (always on; it drives the phone thr
 - **Batch** (`/batch`): several commands in one request, with sleeps between them. Each step has its own deadline and takes the batch's `if_foreground` unless it sets its own. A batch stops at the first error unless told not to.
 
 ### Releases and debugging
-- **Install** an APK already on the phone over the app that is there (`/install`, `pm install -r`): only the package named (the APK's own is read first), never a downgrade, never an uninstall or cleared data. Android's own refusal comes back as it is (a signature mismatch, a downgrade). It can be queued in a `/request`'s steps, for the owner to accept while they use the phone.
+- **Install** an APK already on the phone over the app that is there (`/install`, `pm install -r` with the APK streamed in, as the installer cannot open shared storage itself): only the package named (the APK's own is read first), never a downgrade, never an uninstall or cleared data. Android's own refusal comes back as it is (a signature mismatch, a downgrade). It can be queued in a `/request`'s steps, for the owner to accept while they use the phone.
 - **What is installed** (`/package`): a package's version, install and update times, signing certificate (SHA-256), whether it is debuggable and its enabled state; **the installed APK** itself (`/package/apk`).
 - **Accessibility services** (`/accessibility`): those enabled, those bound, and those enabled but not bound (Android drops a service that crashes as it connects from the bound list without a word).
 - **The log** (`/logcat`): `logcat -d`, read-only, by tag, level, time and buffer (the crash buffer too), capped in lines.
