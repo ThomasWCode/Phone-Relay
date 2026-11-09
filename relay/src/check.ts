@@ -97,9 +97,12 @@ export function evaluateCheck(
       const lines = strings(inputs.crashLog.result.lines) ?? [];
       let count = 0;
       let first: string[] = [];
+      const ours = (process: string | undefined) => process === pkg || process?.startsWith(`${pkg}:`) === true;
       lines.forEach((line, i) => {
         const process = /Process: ([^,\s]+)/.exec(lines[i + 1] ?? "")?.[1];
-        if (line.includes("FATAL EXCEPTION") && (process === pkg || process?.startsWith(`${pkg}:`))) {
+        // A native crash (a signal in a JNI library, say): the tombstone's "pid: N, tid: N, name: T  >>> process <<<" line
+        const native = /pid: \d+, tid: \d+, name: .*>>> (\S+) <<</.exec(line)?.[1];
+        if ((line.includes("FATAL EXCEPTION") && ours(process)) || ours(native)) {
           if (count === 0) first = lines.slice(i, i + CRASH_LINES);
           count++;
         }

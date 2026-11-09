@@ -40,6 +40,22 @@ describe("evaluateCheck", () => {
     expect(record).toEqual({ enabled: [FOCUS, "com.b/com.b.S"], files: { "plan.json": 120 } });
   });
 
+  it("a native crash of the package counts, another app's does not", () => {
+    const native = [
+      "--------- beginning of crash",
+      "11-09 07:05:00.000  6789  6789 F DEBUG   : *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** ***",
+      "11-09 07:05:00.000  6789  6789 F DEBUG   : pid: 6700, tid: 6700, name: RenderThread  >>> com.other.app <<<",
+      "11-09 07:05:00.000  6789  6789 F DEBUG   : signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0",
+      "11-09 07:06:00.000  6790  6790 F DEBUG   : pid: 6800, tid: 6801, name: worker  >>> com.example.app:sync <<<",
+      "11-09 07:06:00.000  6790  6790 F DEBUG   : signal 6 (SIGABRT), code -1 (SI_QUEUE), fault addr --------",
+    ];
+    const { report } = evaluateCheck({ package: PKG }, inputs({ crashLog: ok({ lines: native }) }), null);
+    expect(report.ok).toBe(false);
+    const crashes = report.crashes as { count: number; first: string[] };
+    expect(crashes.count).toBe(1);
+    expect(crashes.first[0]).toContain(">>> com.example.app:sync <<<");
+  });
+
   it("a crash log longer than was read is no clean check", () => {
     const { report } = evaluateCheck({ package: PKG }, inputs({ crashLog: ok({ lines: ["--------- beginning of crash"], truncated: true }) }), null);
     expect(report.ok).toBe(false);
