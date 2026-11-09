@@ -503,12 +503,14 @@ class CommandsTest {
     @Test
     fun installOverTheInstalledApp() = runTest {
         device.shellPaired = true
-        device.shellReply = { if (it.startsWith("pm install")) "Performing Streamed Install\nSuccess\n" else null }
+        device.shellReply = { if (it.startsWith("cat /sdcard/Download/tiny.apk | pm install")) "Success\n" else null }
         device.packages["com.example.tiny"] = device.packages["com.example.tiny"]!!.copy(versionName = "1.2.3", versionCode = 42)
         val r = run("install", """{"path": "/sdcard/Download/tiny.apk", "package": "com.example.tiny", "if_foreground": "com.android.chrome"}""")
         assertEquals("1.2.3", r.str("version_name"))
         assertEquals(42, r["version_code"]!!.jsonPrimitive.int)
-        assertEquals("pm install -r /sdcard/Download/tiny.apk 2>&1 || true", device.shellCommands.single())
+        // Streamed in by the shell: the system server cannot open a file in shared storage itself
+        assertEquals("cat /sdcard/Download/tiny.apk | pm install -r -S $(stat -c %s /sdcard/Download/tiny.apk) 2>&1 || true",
+            device.shellCommands.single())
     }
 
     @Test
@@ -520,6 +522,9 @@ class CommandsTest {
         val e = error("install", """{"path": "/sdcard/Download/tiny.apk", "package": "com.example.tiny"}""")
         assertEquals("install_failed", e.code)
         assertEquals("INSTALL_FAILED_VERSION_DOWNGRADE: Downgrade detected", e.detail)
+        // An error that is no Failure [...] line comes back from its start, not the stack's last frames
+        device.shellReply = { "Error: Can't open file: x\n\nException occurred while executing 'install':\n" + "\tat a.b.C.d(C.java:1)\n".repeat(40) }
+        assertTrue(error("install", """{"path": "/sdcard/Download/tiny.apk", "package": "com.example.tiny"}""").detail.startsWith("Error: Can't open file"))
         assertEquals("not_found", error("install", """{"path": "/sdcard/Download/none.apk", "package": "com.example.tiny"}""").code)
         // The app in front is checked again just before the install, once the bridge is up.
         device.shellCommands.clear()
@@ -634,6 +639,9 @@ class CommandsTest {
         assertEquals("content_failed", failed.code)
         // The error's first lines, not the stack's last frames
         assertTrue(failed.detail.startsWith("Error while accessing provider:x\njava.lang.IllegalArgumentException"))
+        // A value's later line that starts like an error is still the value
+        assertEquals(listOf(mapOf("description" to "Notes\nException handling workshop")),
+            ShellCommands.parseContent("Row: 0 description=Notes\nException handling workshop\n", listOf("description")))
     }
 
     @Test
@@ -691,6 +699,28 @@ class CommandsTest {
         device.shellReply = { null }
         assertEquals("not_found", error("run_as_kill", """{"package": "com.example.tiny", "signal": "KILL"}""").code)
         assertEquals("invalid_args", error("run_as_kill", """{"package": "com.example.tiny", "signal": "TERM"}""").code)
+    }
+
+    @Test
+    fun runAsPushRechecksTheForegroundBeforeReplacing() = runTest {
+        device.shellPaired = true
+        val data = "new".toByteArray()
+        device.shellReply = { cmd ->
+            if (cmd.startsWith("run-as com.example.tiny stat -c %s")) {
+                device.fg = "com.android.settings" // the owner switched apps during the upload
+                "${data.size}\n"
+            } else null
+        }
+        val upload = Stream("u") { }
+        upload.inbox.trySend(kotlinx.serialization.json.buildJsonObject {
+            put("type", JsonPrimitive("chunk")); put("seq", JsonPrimitive(0)); put("data", JsonPrimitive(Base64.getEncoder().encodeToString(data)))
+        })
+        upload.inbox.trySend(kotlinx.serialization.json.buildJsonObject { put("type", JsonPrimitive("end")) })
+        assertEquals("foreground_mismatch", assertFailsWith<CommandError> {
+            commands.handle("run_as_push", args("""{"package": "com.example.tiny", "path": "files/plan.json", "if_foreground": "com.android.chrome"}"""), upload)
+        }.code)
+        assertTrue(device.shellCommands.none { it.contains(" mv ") })
+        assertEquals("run-as com.example.tiny rm -f -- files/.plan.json.part 2>&1", device.shellCommands.last())
     }
 
     @Test

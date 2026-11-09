@@ -78,7 +78,11 @@ object ShellCommands {
 
     // ---- install ----
 
-    fun install(path: String) = "pm install -r ${quote(path)} 2>&1 || true"
+    /**
+     * `pm install -r` (never -d) with the APK streamed in by the shell (-S its size): the system
+     * server cannot open a file in shared storage itself (SELinux), so `pm install /sdcard/...` fails.
+     */
+    fun install(path: String) = quote(path).let { "cat $it | pm install -r -S $(stat -c %s $it) 2>&1 || true" }
 
     /** `pm install`'s error ("INSTALL_FAILED_...: its reason"), or null when it says Success. */
     fun parseInstall(out: String): String? {
@@ -86,7 +90,7 @@ object ShellCommands {
         Regex("Failure \\[([A-Z_]+)(?::\\s*(.*?))?\\]\\s*$", RegexOption.MULTILINE).find(out)?.let { m ->
             return m.groupValues[1] + if (m.groupValues[2].isNotEmpty()) ": ${m.groupValues[2]}" else ""
         }
-        return out.trim().takeLast(300).ifEmpty { "pm install printed nothing" }
+        return out.trim().take(300).ifEmpty { "pm install printed nothing" }
     }
 
     // ---- settings ----
@@ -217,10 +221,12 @@ object ShellCommands {
      * `content query`'s rows ("Row: 0 a=1, b=x, y"), each as column -> value, NULL as null. With a
      * projection the columns are found in their order, so a value holding ", " or newlines comes back
      * whole; without one, it is cut at each ", name=". The provider's errors go to stderr while
-     * `content` still exits 0, so they are looked for here.
+     * `content` still exits 0, so they are looked for here, before the first row only: a value's
+     * later lines may start with anything ("Exception handling").
      */
     fun parseContent(out: String, projection: List<String>?): List<Map<String, String?>> {
-        if (Regex("^(Error while accessing provider|Exception|java\\.|\\[ERROR\\])", RegexOption.MULTILINE).containsMatchIn(out)) {
+        val beforeRows = if (out.startsWith("Row: ")) "" else out.substringBefore("\nRow: ")
+        if (Regex("^(Error while accessing provider|Exception|java\\.|\\[ERROR\\])", RegexOption.MULTILINE).containsMatchIn(beforeRows)) {
             throw CommandError("content_failed", out.trim().take(300))
         }
         if (out.isBlank() || out.trim() == "No result found.") return emptyList()

@@ -829,7 +829,14 @@ class Commands(
                 runCatching { device.shell(ShellCommands.runAsDelete(pkg, part)) }
                 throw CommandError("device_error", "wrote ${written.take(100)} bytes of $size")
             }
-            device.shell(ShellCommands.runAsMove(pkg, part, p)).trim().takeIf { it.isNotEmpty() }?.let { throw CommandError("device_error", it.takeLast(300)) }
+            // With if_foreground, the file is replaced only if that app is still in front (the upload took a while)
+            val moved = try {
+                device.shell(ShellCommands.runAsMove(pkg, part, p), guard(args))
+            } catch (e: CommandError) {
+                runCatching { device.shell(ShellCommands.runAsDelete(pkg, part)) }
+                throw e
+            }
+            moved.trim().takeIf { it.isNotEmpty() }?.let { throw CommandError("device_error", it.takeLast(300)) }
             return buildJsonObject { put("package", pkg); put("path", p); put("bytes", size) }
         } finally {
             runCatching { device.deleteFile(upload) }
