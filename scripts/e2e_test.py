@@ -16,6 +16,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import urllib.error
@@ -428,6 +429,41 @@ def main():
         request("GET", "/check?package=com.example.tiny&accept_gone=true")
         s, _, b = request("GET", "/check?package=com.example.tiny")
         check("check: all well once the loss is accepted", s == 200 and j(b).get("ok") is True, f"{s} {b[:600]}")
+
+        # ---- what Decrastination's workflow does over adb ----
+        q = urllib.parse.urlencode({"uri": "content://com.android.calendar/events", "projection": "_id,dtstart,description",
+                                    "where": "calendar_id=3 AND deleted=0"})
+        s, _, b = request("GET", f"/content?{q}")
+        check("a provider's rows", s == 200 and j(b).get("count") == 2 and j(b)["rows"][0]["description"].endswith("second line"),
+              f"{s} {b[:300]}")
+        s, h, b = request("GET", "/run-as/archive?package=com.example.tiny&path=files")
+        names = tarfile.open(fileobj=io.BytesIO(b)).getnames() if s == 200 else None
+        check("an app's data as a tar", s == 200 and names == ["files/plan.json"] and h.get("Content-Type") == "application/x-tar",
+              f"{s} {names}")
+        secret = b'{"made":"up"}'
+        s, _, b = request("POST", "/run-as/push?package=com.example.tiny&path=files/credentials.import", raw=secret)
+        st = json.load(open(state_path))
+        check("write into an app's data", s == 200 and j(b).get("bytes") == len(secret)
+              and st["files"].get("/data/user/0/com.example.tiny/files/credentials.import") is not None, f"{s} {b[:200]}")
+        s, _, b = request("POST", "/run-as/delete", body={"package": "com.example.tiny", "path": "files/credentials.import"})
+        st = json.load(open(state_path))
+        check("delete it", s == 200 and "/data/user/0/com.example.tiny/files/credentials.import" not in st["files"], f"{s} {b[:200]}")
+        check("write into another app's data -> 403",
+              request("POST", "/run-as/push?package=com.android.chrome&path=files/x", raw=b"x")[0] == 403)
+        s, _, b = request("POST", "/run-as/kill", body={"package": "com.example.tiny", "signal": "STOP"})
+        check("pause a debuggable app", s == 200 and j(b).get("pid") == 4321, f"{s} {b[:200]}")
+        s, _, b = request("POST", "/night-mode", body={"mode": "no"})
+        check("dark mode off, the old setting given", s == 200 and j(b).get("previous") == "yes" and j(b).get("night_mode") == "no",
+              f"{s} {b[:200]}")
+        request("POST", "/night-mode", body={"mode": "yes"})
+        set_fake(state_path, a11y_enabled=["com.example.tiny/.FocusService", "com.b/com.b.S"])
+        s, _, b = request("POST", "/force-stop", body={"package": "com.example.tiny"})
+        check("no force-stop of an app with an accessibility service", s == 409 and j(b).get("error") == "stop_refused", f"{s} {b[:200]}")
+        s, _, b = request("POST", "/force-stop", body={"package": "com.android.chrome"})
+        st = json.load(open(state_path))
+        check("force-stop another app", s == 200 and st.get("stopped") == ["com.android.chrome"], f"{s} {b[:200]}")
+        s, _, b = request("GET", "/admin/log?n=20", token=ADMIN)
+        check("credentials and where clauses stay out of the log", b'"made":"up"' not in b and b"calendar_id=3" not in b)
 
         # ---- screen recording ----
         s, h, b = request("GET", "/record?seconds=1")

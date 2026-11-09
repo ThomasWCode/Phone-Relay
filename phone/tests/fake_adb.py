@@ -18,7 +18,9 @@ version_name, debuggable, enabled, apk; their APKs are in "files"), and an app's
 "files" under /data/user/0/<package>/, read through `run-as`. "a11y_enabled" and "a11y_bound" are
 the accessibility services (`settings get secure enabled_accessibility_services`, `dumpsys
 accessibility`), "settings" maps "namespace key" to a value, "night_mode" is `cmd uimode night`'s,
-and "logcat" holds the log's lines.
+"logcat" holds the log's lines, "calendar" the rows `content query` gives for the calendar's
+events, "running" the packages with a process (pidof) and "signals" the run-as kills sent,
+"stopped" the packages force-stopped.
 Every invocation is appended to the file named by FAKE_ADB_LOG (one JSON list per line).
 
 Guarded commands (`if <focus guard>; then <action>; else echo PHONE_RELAY_REFUSED; fi`)
@@ -110,7 +112,11 @@ def default_state():
             "a11y_enabled": [FOCUS.replace("/com.example.tiny.", "/."), "com.b/com.b.S"],
             "a11y_bound": [FOCUS, "com.b/com.b.S"],
             "settings": {"global stay_on_while_plugged_in": "0"}, "night_mode": "yes",
-            "logcat": LOG_LINES}
+            "logcat": LOG_LINES,
+            "calendar": [{"_id": "1", "dtstart": "1700000000000", "dtend": "1700003600000",
+                          "description": "Made up, with a comma, and a\nsecond line"},
+                         {"_id": "2", "dtstart": "1700007200000", "dtend": "1700010800000", "description": "NULL"}],
+            "running": {"com.example.tiny": 4321}}
 
 
 def load_state():
@@ -352,9 +358,10 @@ def logcat(cmd, state):
     return "".join(ln + "\n" for ln in lines[-n:])
 
 
-def run_as(cmd, state):
-    """`run-as PACKAGE ...` in the app's data folder: a listing, a stat or a cat of a relative path."""
-    words = shlex.split(cmd)
+def run_as(cmd, state, stdin=None):
+    """`run-as PACKAGE ...` in the app's data folder: a listing, a stat, a cat or a tar of a relative
+    path; a write from stdin (`sh -c 'mkdir -p D && cat > P'`), mv, rm and kill."""
+    words = shlex.split(cmd.removesuffix(" 2>&1"))
     pkg = words[1]
     if not state.get("packages", {}).get(pkg, {}).get("debuggable"):
         return f"run-as: package not debuggable: {pkg}\n".encode()
@@ -364,6 +371,42 @@ def run_as(cmd, state):
     def absolute(rel):
         return root if rel in (".", "") else root + "/" + rel.rstrip("/")
 
+    if words[2:4] == ["sh", "-c"] and words[4].startswith("mkdir -p "):  # a write from stdin
+        part = shlex.split(words[4])[-1]
+        files[absolute(part)] = base64.b64encode(stdin or b"").decode()
+        save_state(state)
+        return b""
+    if words[2] == "stat" and words[4] == "%s":  # `stat -c %s -- PATH`, after a write
+        path = absolute(words[6])
+        return (f"{len(base64.b64decode(files[path]))}\n" if path in files else f"stat: {words[6]}: No such file\n").encode()
+    if words[2] == "mv":
+        files[absolute(words[6])] = files.pop(absolute(words[5]))
+        save_state(state)
+        return b""
+    if words[2] == "rm":
+        files.pop(absolute(words[5]), None)
+        save_state(state)
+        return b""
+    if words[2] == "kill":
+        state.setdefault("signals", []).append([pkg, words[3], int(words[4])])
+        save_state(state)
+        return b""
+    if words[2] == "tar":
+        import io
+        import tarfile
+        base = absolute(words[5])
+        buf, found = io.BytesIO(), False
+        with tarfile.open(fileobj=buf, mode="w", format=tarfile.USTAR_FORMAT) as tar:
+            for path in sorted(files):
+                if path == base or path.startswith(base + "/"):
+                    found = True
+                    data = base64.b64decode(files[path])
+                    info = tarfile.TarInfo(words[5].rstrip("/") + path[len(base):])
+                    info.size, info.mtime = len(data), MTIME
+                    tar.addfile(info, io.BytesIO(data))
+        if not found:  # nothing there: tar's own error instead of an archive
+            return f"tar: {words[5]}: No such file or directory\n".encode()
+        return buf.getvalue()
     if words[2:4] == ["sh", "-c"]:  # the client's folder listing, of a relative path
         inner = words[4]
         rel = shlex.split(inner[len("if [ -d "):inner.index(" ]")])[0]
@@ -419,8 +462,23 @@ def helper(cmd, state):
     return out + "PHONE_RELAY_HELPER_OK\n"
 
 
-def run(cmd, state):
-    """Output of one `adb shell`/`exec-out` command (bytes)."""
+def content_query(cmd, state):
+    """`content query --uri U [--projection a:b] ...`: the stored calendar's rows, as `content` prints them."""
+    words = shlex.split(cmd.removesuffix(" 2>&1"))
+    opt = {words[i]: words[i + 1] for i in range(2, len(words) - 1, 2)}
+    state["last_content"] = opt
+    save_state(state)
+    if opt["--uri"] != "content://com.android.calendar/events":
+        return f"Error while accessing provider:{opt['--uri']}\njava.lang.IllegalArgumentException: Unknown URL\n"
+    rows = state.get("calendar", [])
+    if not rows:
+        return "No result found.\n"
+    cols = opt["--projection"].split(":") if "--projection" in opt else None
+    return "".join(f"Row: {i} " + ", ".join(f"{k}={row[k]}" for k in (cols or row)) + "\n" for i, row in enumerate(rows))
+
+
+def run(cmd, state, stdin=None):
+    """Output of one `adb shell`/`exec-out` command (bytes); `stdin` is an `exec-in`'s input."""
     m = GUARD_RE.match(cmd)
     if m:
         if not guard_passes(m.group("guard"), state):
@@ -432,13 +490,30 @@ def run(cmd, state):
     if cmd.startswith(HELPER_PREFIX):
         return helper(cmd, state).encode()
     if cmd.startswith("run-as "):
-        return run_as(cmd, state)
+        return run_as(cmd, state, stdin)
+    if cmd.startswith("content query "):
+        return content_query(cmd, state).encode()
+    if cmd.startswith("pidof "):
+        pid = state.get("running", {}).get(cmd.split()[1].rstrip(";"))
+        return (f"{pid}\n" if pid else "").encode()
+    if cmd.startswith("cmd uimode night"):
+        words = cmd.split()
+        if len(words) > 3:
+            state["night_mode"] = words[3]
+            save_state(state)
+        return f"Night mode: {state.get('night_mode', 'no')}\n".encode()
+    if cmd.startswith("am force-stop "):
+        state.setdefault("stopped", []).append(cmd.split()[2])
+        save_state(state)
+        return b""
     if cmd.startswith("dumpsys package "):
         return package_dump(shlex.split(cmd)[2], state).encode()
     if cmd.startswith("pm install -r "):
         return install(shlex.split(cmd)[3], state).encode()
     if cmd.startswith("logcat -d"):
         return logcat(cmd, state).encode()
+    if cmd == "settings get secure enabled_accessibility_services":
+        return (":".join(state.get("a11y_enabled", [])) + "\n").encode()
     if cmd.startswith("settings get secure enabled_accessibility_services; "):
         return (":".join(state.get("a11y_enabled", [])) + "\n" + SPLIT_MARKER + "\n" + accessibility_dump(state)).encode()
     if cmd.startswith("settings get ") and SPLIT_MARKER in cmd:  # one setting, and dark mode
@@ -559,10 +634,11 @@ def main(argv):
         code, err = transfer(args, state)
         sys.stderr.write(err)
         return code
-    if args[0] not in ("shell", "exec-out") or len(args) < 2:
+    if args[0] not in ("shell", "exec-out", "exec-in") or len(args) < 2:
         sys.stderr.write("fake adb: unsupported\n")
         return 1
-    sys.stdout.buffer.write(run(" ".join(args[1:]), state))
+    stdin = sys.stdin.buffer.read() if args[0] == "exec-in" else None
+    sys.stdout.buffer.write(run(" ".join(args[1:]), state, stdin))
     return 0
 
 

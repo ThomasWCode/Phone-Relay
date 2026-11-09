@@ -14,6 +14,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import unittest
@@ -53,7 +54,7 @@ class InProcessAdb:
         self.calls = []
         self.executed = []
 
-    async def run(self, *args, timeout=None):
+    async def run(self, *args, timeout=None, stdin=None):
         self.calls.append(list(args))
         if self.state.get("hang"):
             await asyncio.sleep(self.state["hang"])
@@ -74,13 +75,16 @@ class InProcessAdb:
         elif fake_adb.guard_passes(m.group("guard"), self.state):
             self.executed.append(m.group("action"))
         # fake_adb.save_state is a no-op without FAKE_ADB_STATE, so state stays in memory
-        return fake_adb.run(cmd, self.state)
+        return fake_adb.run(cmd, self.state, stdin)
 
     async def shell(self, command, timeout=None):
         return (await self.run("shell", command)).decode()
 
     async def exec_out(self, command, timeout=None):
         return await self.run("exec-out", command)
+
+    async def exec_in(self, command, data, timeout=None):
+        return await self.run("exec-in", command, stdin=data)
 
     def inputs(self):
         return [c for c in self.executed if c.startswith("input ")]
@@ -962,6 +966,93 @@ class ReleaseCommandTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(pc.CommandError, msg=repr(bad)) as cm:
                 await ctl.handle("intent", bad)
             self.assertEqual(cm.exception.code, "invalid_args")
+
+
+class DecrastinationWorkflowTests(unittest.IsolatedAsyncioTestCase):
+    """What Decrastination's development.md does over adb, through the relay's commands."""
+
+    async def test_content_query(self):
+        ctl, adb = controller()
+        res = await ctl.handle("content", {"uri": "content://com.android.calendar/events", "projection": ["_id", "dtstart", "description"],
+                                           "where": "calendar_id=3 AND deleted=0", "sort": "dtstart"})
+        self.assertEqual(res["count"], 2)
+        self.assertEqual(res["rows"][0], {"_id": "1", "dtstart": "1700000000000", "description": "Made up, with a comma, and a\nsecond line"})
+        self.assertIsNone(res["rows"][1]["description"])
+        self.assertEqual(adb.state["last_content"]["--where"], "calendar_id=3 AND deleted=0")
+        without = await ctl.handle("content", {"uri": "content://com.android.calendar/events"})
+        self.assertEqual(without["rows"][1]["dtend"], "1700010800000")
+        adb.state["calendar"] = []
+        self.assertEqual((await ctl.handle("content", {"uri": "content://com.android.calendar/events"}))["rows"], [])
+        with self.assertRaises(pc.CommandError) as cm:
+            await ctl.handle("content", {"uri": "content://nowhere/x"})
+        self.assertEqual(cm.exception.code, "content_failed")
+        for bad in [{"uri": "https://x"}, {"uri": "content://a", "projection": ["a;b"]}, {"uri": "content://a", "sort": "a;b"}]:
+            with self.assertRaises(pc.CommandError, msg=repr(bad)):
+                await ctl.handle("content", bad)
+
+    async def test_run_as_archive_is_a_tar(self):
+        ctl, _ = controller()
+        relay = FakeRelay()
+        await ctl.handle("run_as_archive", {"package": "com.example.tiny", "path": "files"}, relay)
+        with tarfile.open(fileobj=io.BytesIO(relay.received())) as tar:
+            self.assertEqual(tar.getnames(), ["files/plan.json"])
+            self.assertEqual(tar.extractfile("files/plan.json").read(), b'{"plan": []}')
+        self.assertEqual(relay.start()["mime"], "application/x-tar")
+        with self.assertRaises(pc.CommandError) as cm:
+            await ctl.handle("run_as_archive", {"package": "com.example.tiny", "path": "nothing"}, FakeRelay())
+        self.assertEqual(cm.exception.code, "not_found")
+
+    async def test_run_as_push_then_delete(self):
+        ctl, adb = controller()
+        root = fake_adb.DATA_ROOT + "com.example.tiny/"
+        data = b'{"PowerPlannerUsername": "made-up"}'
+        res = await ctl.handle("run_as_push", {"package": "com.example.tiny", "path": "files/credentials.import"}, FakeRelay(upload(data, 7)))
+        self.assertEqual(res["bytes"], len(data))
+        self.assertEqual(base64.b64decode(adb.state["files"][root + "files/credentials.import"]), data)
+        self.assertNotIn(root + "files/.credentials.import.part", adb.state["files"])
+        await ctl.handle("run_as_delete", {"package": "com.example.tiny", "path": "files/credentials.import"})
+        self.assertNotIn(root + "files/credentials.import", adb.state["files"])
+        for cmd, args, code in [("run_as_delete", {"package": "com.example.tiny", "path": "files/credentials.import"}, "not_found"),
+                                ("run_as_delete", {"package": "com.example.tiny", "path": "files"}, "invalid_args"),
+                                ("run_as_delete", {"package": "com.android.chrome", "path": "files/x"}, "not_debuggable"),
+                                ("run_as_delete", {"package": "com.example.tiny", "path": "-rf"}, "invalid_args"),
+                                ("run_as_delete", {"package": "com.example.tiny", "path": "files/"}, "invalid_args")]:
+            with self.assertRaises(pc.CommandError, msg=repr(args)) as cm:
+                await ctl.handle(cmd, args)
+            self.assertEqual(cm.exception.code, code)
+        with self.assertRaises(pc.CommandError) as cm:
+            await ctl.handle("run_as_push", {"package": "com.android.chrome", "path": "files/x"}, FakeRelay(upload(b"x")))
+        self.assertEqual(cm.exception.code, "not_debuggable")
+
+    async def test_run_as_kill(self):
+        ctl, adb = controller()
+        res = await ctl.handle("run_as_kill", {"package": "com.example.tiny", "signal": "STOP"})
+        self.assertEqual(res, {"package": "com.example.tiny", "pid": 4321, "signal": "STOP"})
+        self.assertEqual(adb.state["signals"], [["com.example.tiny", "-STOP", 4321]])
+        adb.state["running"] = {}
+        with self.assertRaises(pc.CommandError) as cm:
+            await ctl.handle("run_as_kill", {"package": "com.example.tiny", "signal": "KILL"})
+        self.assertEqual(cm.exception.code, "not_found")
+        for bad in [{"package": "com.example.tiny", "signal": "TERM"}, {"package": "com.android.chrome", "signal": "STOP"}]:
+            with self.assertRaises(pc.CommandError, msg=repr(bad)):
+                await ctl.handle("run_as_kill", bad)
+
+    async def test_night_mode_and_force_stop(self):
+        ctl, adb = controller()
+        res = await ctl.handle("night_mode", {"mode": "no", "if_foreground": "com.android.chrome"})
+        self.assertEqual(res, {"night_mode": "no", "previous": "yes"})
+        await ctl.handle("night_mode", {"mode": "yes"})
+        self.assertEqual(adb.state["night_mode"], "yes")
+        await ctl.handle("force_stop", {"package": "com.android.chrome"})
+        self.assertEqual(adb.state["stopped"], ["com.android.chrome"])
+        for package in ["com.example.tiny", "com.b", "com.android.systemui", "com.thomaswcode.phonerelay"]:
+            with self.assertRaises(pc.CommandError, msg=package) as cm:
+                await ctl.handle("force_stop", {"package": package})
+            self.assertEqual(cm.exception.code, "stop_refused", package)
+        with self.assertRaises(pc.CommandError) as cm:
+            await ctl.handle("force_stop", {"package": "com.example.missing"})
+        self.assertEqual(cm.exception.code, "not_found")
+        self.assertEqual(adb.state["stopped"], ["com.android.chrome"])
 
 
 class NewParsingTests(unittest.TestCase):

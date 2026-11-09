@@ -93,7 +93,15 @@ LOG_BUFFERS = ("main", "system", "crash", "events", "radio", "kernel", "default"
 _LOG_TAG_RE = re.compile(r"^[\w.$-]{1,64}$")
 _LOG_TIME_RE = re.compile(r"^(\d{4}-)?\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d{1,9})?$")
 _COMPONENT_RE = re.compile(r"^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*/[A-Za-z0-9_.$]+$")
-_DATA_PATH_RE = re.compile(r"^[\w.@+ -]+(/[\w.@+ -]+)*/?$")
+# No part may start with "-", so none is read as an option of cat, rm or tar.
+_DATA_PATH_RE = re.compile(r"^[\w.@+ ][\w.@+ -]*(/[\w.@+ ][\w.@+ -]*)*/?$")
+_CONTENT_URI_RE = re.compile(r"^content://[\w.-]+(/[\w.%:@+-]*)*$")
+_COLUMN_RE = re.compile(r"^\w{1,64}$")
+_SORT_RE = re.compile(r"^[\w ,]{1,200}$")
+SIGNALS = ("STOP", "CONT", "KILL")
+NIGHT_MODES = ("yes", "no", "auto")
+# Never force-stopped: the system's own, and what runs this client or the app.
+STOP_REFUSED = ("android", "com.android.systemui", "com.android.phone", "com.termux", "com.thomaswcode.phonerelay")
 _SETTING_KEY_RE = re.compile(r"^[\w.:-]{1,100}$")
 SETTINGS_NAMESPACES = ("system", "secure", "global")
 # PackageManager's COMPONENT_ENABLED_STATE_* by number, as `dumpsys package` prints it (enabled=N).
@@ -112,12 +120,12 @@ BATCH_COMMANDS = ("state", "screenshot", "ui", "tap", "swipe", "type", "key", "l
                   "notifications", "statusbar", "rotation", "wait", "files", "record_start", "gesture",
                   "clipboard_get", "clipboard_set", "chrome_tabs", "chrome_eval", "chrome_cdp", "chrome_new",
                   "chrome_close", "chrome_activate", "install", "accessibility", "logcat", "package", "settings",
-                  "run_as_files", "sleep")
+                  "run_as_files", "content", "run_as_delete", "run_as_kill", "night_mode", "force_stop", "sleep")
 # Commands that run their action inside the if_foreground guard themselves (in the same shell command).
 # Any other command given if_foreground is checked against the foreground before it starts.
 SELF_GUARDED = ("screenshot", "ui", "tap", "swipe", "type", "key", "launch", "open", "intent", "statusbar",
                 "rotation", "record_start", "record", "batch", "gesture", "clipboard_get", "clipboard_set", "audio",
-                "install")
+                "install", "night_mode", "force_stop")
 # The app_process helper: built from helper/src by helper/build.py, pushed to the phone on first use.
 HELPER_JAR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "helper", "phone-relay-helper.jar")
 HELPER_REMOTE = "/data/local/tmp/phone-relay-helper.jar"
@@ -211,8 +219,9 @@ class Adb:
         self.adb_bin = adb_bin
         self.serial = serial
 
-    async def run(self, *args: str, timeout: float | None = None) -> bytes:
-        """One adb call. No timeout by default: the command's deadline (PhoneController.handle) cancels it."""
+    async def run(self, *args: str, timeout: float | None = None, stdin: bytes | None = None) -> bytes:
+        """One adb call. No timeout by default: the command's deadline (PhoneController.handle) cancels it.
+        `stdin` is given to the command's standard input (`adb exec-in`)."""
         # A .py "adb" (the tests' fake) runs with this Python: no shell wrapper, so it works on Windows too.
         cmd = [sys.executable, self.adb_bin] if self.adb_bin.endswith(".py") else [self.adb_bin]
         if self.serial:
@@ -220,12 +229,13 @@ class Adb:
         cmd += list(args)
         try:
             proc = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.PIPE if stdin is not None else None,
             )
         except FileNotFoundError as e:
             raise CommandError("adb_failed", f"adb not found: {self.adb_bin}") from e
         try:
-            out, err = await asyncio.wait_for(proc.communicate(), timeout)
+            out, err = await asyncio.wait_for(proc.communicate(stdin), timeout)
         except asyncio.TimeoutError as e:
             await _kill(proc)
             raise CommandError("timeout", " ".join(args[:2])) from e
@@ -241,6 +251,9 @@ class Adb:
 
     async def exec_out(self, command: str, timeout: float | None = None) -> bytes:
         return await self.run("exec-out", command, timeout=timeout)
+
+    async def exec_in(self, command: str, data: bytes, timeout: float | None = None) -> bytes:
+        return await self.run("exec-in", command, timeout=timeout, stdin=data)
 
 
 async def _kill(proc: asyncio.subprocess.Process) -> None:
@@ -576,14 +589,95 @@ def logcat_result(out: str, lines: int) -> dict:
     return {"count": len(got), "truncated": truncated, "lines": got}
 
 
-def data_path(args: dict, required: bool = True) -> str | None:
-    """A path inside an app's own data folder (run-as's working folder): relative, with no "..". """
+def data_path(args: dict, required: bool = True, file: bool = False) -> str | None:
+    """A path inside an app's own data folder (run-as's working folder): relative, with no "..";
+    with `file`, a file's (no trailing /)."""
     path = args.get("path")
     if path is None and not required:
         return None
     if not isinstance(path, str) or not _DATA_PATH_RE.match(path) or ".." in path.split("/"):
         raise CommandError("invalid_args", "path must be relative to the app's data folder, e.g. files/plan.json, with no ..")
+    if file and path.endswith("/"):
+        raise CommandError("invalid_args", "path must name a file, not a folder")
     return path
+
+
+def content_command(args: dict) -> tuple[str, list[str] | None]:
+    """`content query` for /content's arguments (read-only), and its projection's columns."""
+    uri = args.get("uri")
+    if not isinstance(uri, str) or not _CONTENT_URI_RE.match(uri):
+        raise CommandError("invalid_args", "uri must be a content:// URI, e.g. content://com.android.calendar/events")
+    parts = ["content", "query", "--uri", shlex.quote(uri)]
+    projection = args.get("projection")
+    if projection is not None:
+        if not isinstance(projection, list) or not projection or not all(isinstance(c, str) and _COLUMN_RE.match(c) for c in projection):
+            raise CommandError("invalid_args", "projection must be a list of column names")
+        parts += ["--projection", ":".join(projection)]
+    where = args.get("where")
+    if where is not None:
+        if not isinstance(where, str) or not where:
+            raise CommandError("invalid_args", "where must be a non-empty string")
+        parts += ["--where", shlex.quote(where)]
+    sort = args.get("sort")
+    if sort is not None:
+        if not isinstance(sort, str) or not _SORT_RE.match(sort):
+            raise CommandError("invalid_args", "sort must be columns, e.g. dtstart DESC")
+        parts += ["--sort", shlex.quote(sort)]
+    return " ".join(parts) + " 2>&1", projection
+
+
+def parse_content(out: str, projection: list[str] | None) -> list[dict]:
+    """`content query`'s rows ("Row: 0 a=1, b=x, y"), each as {column: value}; NULL is None.
+
+    A value may hold ", " and newlines: with a projection the columns are found in their order,
+    so only a value holding ", <next column>=" is cut short; without one, at each ", name=".
+    The provider's errors go to stderr while `content` still exits 0, so they are looked for here.
+    """
+    if re.search(r"^(Error while accessing provider|Exception|java\.|\[ERROR\])", out, re.MULTILINE):
+        raise CommandError("content_failed", out.strip()[-300:])
+    if out.strip() == "No result found." or not out.strip():
+        return []
+    records, current = [], None
+    for line in out.splitlines():
+        m = re.match(r"^Row: \d+ (.*)$", line)
+        if m:
+            current = m.group(1)
+            records.append(current)
+        elif records:
+            records[-1] += "\n" + line
+    rows = []
+    for text in records:
+        if projection:
+            row, rest = {}, text
+            for i, col in enumerate(projection):
+                if not rest.startswith(col + "="):
+                    raise CommandError("content_failed", f"unexpected row: {text[:200]}")
+                rest = rest[len(col) + 1:]
+                if i + 1 < len(projection):
+                    cut = rest.find(f", {projection[i + 1]}=")
+                    value, rest = (rest, "") if cut < 0 else (rest[:cut], rest[cut + 2:])
+                else:
+                    value = rest
+                row[col] = None if value == "NULL" else value
+        else:
+            row = {}
+            for pair in re.split(r", (?=\w+=)", text):
+                k, _, value = pair.partition("=")
+                row[k] = None if value == "NULL" else value
+        rows.append(row)
+    return rows
+
+
+def is_tar(data: bytes) -> bool:
+    """A tar archive's first header (ustar), not an error printed in its place."""
+    return len(data) >= 512 and data[257:262] == b"ustar"
+
+
+def part_path(path: str) -> tuple[str, str]:
+    """(the folder, the hidden .part file beside `path`) an upload is written to before it replaces the file."""
+    folder, _, name = path.rpartition("/")
+    folder = folder or "."
+    return folder, f"{folder}/.{name}.part"
 
 
 def _string_pool(data: bytes, off: int) -> list[str]:
@@ -996,7 +1090,7 @@ def default_timeout(cmd: str, args: dict) -> float:
         return 2 * DEFAULT_TIMEOUT_S + 2 * (args["seconds"] if _is_number(args.get("seconds")) else 10)
     if cmd == "gesture" and _is_number(args.get("ms")):
         return DEFAULT_TIMEOUT_S + max(args["ms"], 0) / 1000
-    if cmd in ("pull", "push", "record_stop", "package_apk", "run_as"):
+    if cmd in ("pull", "push", "record_stop", "package_apk", "run_as", "run_as_archive", "run_as_push"):
         return TRANSFER_TIMEOUT_S
     if cmd == "install":
         return INSTALL_TIMEOUT_S
@@ -1215,6 +1309,11 @@ class PhoneController:
             "package": self.cmd_package,
             "run_as_files": self.cmd_run_as_files,
             "settings": self.cmd_settings,
+            "content": self.cmd_content,
+            "run_as_delete": self.cmd_run_as_delete,
+            "run_as_kill": self.cmd_run_as_kill,
+            "night_mode": self.cmd_night_mode,
+            "force_stop": self.cmd_force_stop,
         }.get(cmd)
         # These stream bytes over the relay socket, so they need the command's channel.
         streaming = {
@@ -1225,6 +1324,8 @@ class PhoneController:
             "audio": self.cmd_audio,
             "package_apk": self.cmd_package_apk,
             "run_as": self.cmd_run_as,
+            "run_as_archive": self.cmd_run_as_archive,
+            "run_as_push": self.cmd_run_as_push,
         }.get(cmd)
         if handler is None and streaming is None:
             raise CommandError("invalid_args", f"unknown command: {cmd}")
@@ -1858,6 +1959,125 @@ class PhoneController:
         finally:
             _remove(local)
         return {"package": package, "path": path, "bytes": size}
+
+    async def cmd_run_as_archive(self, args: dict, channel: Channel) -> dict:
+        """A folder of a debuggable app's own storage as a tar (`run-as PACKAGE tar -cf - PATH`), read-only:
+        path=files gives the data.tar Decrastination's keep_data.sh makes."""
+        package = _package_arg(args)
+        if package is None:
+            raise CommandError("invalid_args", "package must be an Android package name")
+        path = data_path(args, required=False) or "."
+        await self._debuggable(package)
+        data = await self.adb.exec_out(f"run-as {package} tar -cf - {shlex.quote(path)}")
+        if not is_tar(data):  # exec-out passes run-as's or tar's error on as if it were the archive
+            raise CommandError("not_found", f"{path} could not be archived: {data[-200:].decode(errors='replace').strip()}")
+        local = _local_temp(".tar")
+        try:
+            with open(local, "wb") as f:
+                f.write(data)
+            size = await channel.send_file(local, "application/x-tar", {"X-Package": package, "X-File-Path": path})
+        finally:
+            _remove(local)
+        return {"package": package, "path": path, "bytes": size}
+
+    async def cmd_run_as_push(self, args: dict, channel: Channel) -> dict:
+        """Write a file into a debuggable app's own storage: to a hidden .part beside it, its size checked,
+        then moved over the file, so a failed upload leaves the old file as it was."""
+        package = _package_arg(args)
+        if package is None:
+            raise CommandError("invalid_args", "package must be an Android package name")
+        path = data_path(args, file=True)
+        await self._debuggable(package)
+        folder, part = part_path(path)
+        local = _local_temp(os.path.splitext(path)[1])
+        try:
+            size = await channel.recv_file(local)
+            with open(local, "rb") as f:
+                data = f.read()
+        finally:
+            _remove(local)
+        script = f"mkdir -p {shlex.quote(folder)} && cat > {shlex.quote(part)}"
+        await self.adb.exec_in(f"run-as {package} sh -c {shlex.quote(script)}", data)
+        written = (await self.adb.shell(f"run-as {package} stat -c %s -- {shlex.quote(part)} 2>&1")).strip()
+        if written != str(size):
+            await self.adb.shell(f"run-as {package} rm -f -- {shlex.quote(part)}")
+            raise CommandError("device_error", f"wrote {written[:100]!r} bytes of {size}")
+        out = await self.adb.shell(f"run-as {package} mv -f -- {shlex.quote(part)} {shlex.quote(path)} 2>&1")
+        if out.strip():
+            raise CommandError("device_error", out.strip()[-300:])
+        return {"package": package, "path": path, "bytes": size}
+
+    async def cmd_run_as_delete(self, args: dict) -> dict:
+        """Delete one file (never a folder) in a debuggable app's own storage."""
+        package = _package_arg(args)
+        if package is None:
+            raise CommandError("invalid_args", "package must be an Android package name")
+        path = data_path(args, file=True)
+        await self._debuggable(package)
+        out = await self.adb.shell(
+            f"run-as {package} stat -c '%F|%s|%Y|%n' -- {shlex.quote(path)} 2>/dev/null || echo {MISSING_MARKER}")
+        entry = next((e for e in map(parse_stat, out.splitlines()) if e), None)
+        if entry is None:
+            raise CommandError("not_found", f"{path} does not exist in {package}'s data, or cannot be read")
+        if entry["type"] != "file":
+            raise CommandError("invalid_args", f"{path} is a {entry['type']}; only a file is deleted")
+        out = await self.adb.shell(f"run-as {package} rm -f -- {shlex.quote(path)} 2>&1")
+        if out.strip():
+            raise CommandError("device_error", out.strip()[-300:])
+        return {"package": package, "path": path, "deleted": True}
+
+    async def cmd_run_as_kill(self, args: dict) -> dict:
+        """Send STOP, CONT or KILL to a debuggable app's main process, as the app's own user (run-as):
+        to pause it while a store is edited by hand, and end it after (an app with a bound accessibility
+        service is started again by Android, still enabled, unlike a force-stop)."""
+        package = _package_arg(args)
+        if package is None:
+            raise CommandError("invalid_args", "package must be an Android package name")
+        signal = args.get("signal")
+        if signal not in SIGNALS:
+            raise CommandError("invalid_args", f"signal must be one of {', '.join(SIGNALS)}")
+        await self._debuggable(package)
+        pids = (await self.adb.shell(f"pidof {package}; true")).split()
+        if not pids or not pids[0].isdigit():
+            raise CommandError("not_found", f"{package} is not running")
+        out = await self.adb.shell(f"run-as {package} kill -{signal} {pids[0]} 2>&1")
+        if out.strip():
+            raise CommandError("device_error", out.strip()[-300:])
+        return {"package": package, "pid": int(pids[0]), "signal": signal}
+
+    async def cmd_content(self, args: dict) -> dict:
+        """A provider's rows (`content query`, read-only): the calendar's events, say."""
+        command, projection = content_command(args)
+        rows = parse_content(await self.adb.shell(command), projection)
+        return {"count": len(rows), "rows": rows}
+
+    async def _night_mode(self) -> str | None:
+        m = re.search(r"Night mode:\s*(\S+)", await self.adb.shell("cmd uimode night"))
+        return m.group(1) if m else None
+
+    async def cmd_night_mode(self, args: dict) -> dict:
+        """Dark mode on (yes), off (no) or automatic; the reply's `previous` is the old setting, to put back."""
+        mode = args.get("mode")
+        if mode not in NIGHT_MODES:
+            raise CommandError("invalid_args", f"mode must be one of {', '.join(NIGHT_MODES)}")
+        previous = await self._night_mode()
+        await self._guarded(f"cmd uimode night {mode}", args)
+        return {"night_mode": await self._night_mode(), "previous": previous}
+
+    async def cmd_force_stop(self, args: dict) -> dict:
+        """Force-stop an app a task opened (`am force-stop`). Refused for an app with an enabled
+        accessibility service, which Android would drop from the enabled list, and for the system's own."""
+        package = _package_arg(args)
+        if package is None:
+            raise CommandError("invalid_args", "package must be an Android package name")
+        if package in STOP_REFUSED:
+            raise CommandError("stop_refused", f"{package} is never force-stopped")
+        enabled = parse_accessibility(await self.adb.shell("settings get secure enabled_accessibility_services"), "")["enabled"]
+        if any(c.split("/")[0] == package for c in enabled):
+            raise CommandError("stop_refused", f"{package} has an enabled accessibility service, which a force-stop would turn off")
+        await self._package(package)
+        await self._guarded(f"am force-stop {package}", args)
+        return {"package": package}
 
     # ---- Chrome DevTools ----
 
