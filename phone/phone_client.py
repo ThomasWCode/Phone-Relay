@@ -219,24 +219,31 @@ class Adb:
         self.adb_bin = adb_bin
         self.serial = serial
 
-    async def run(self, *args: str, timeout: float | None = None, stdin: str | None = None) -> bytes:
+    async def run(self, *args: str, timeout: float | None = None, stdin: str | None = None,
+                  stdout_path: str | None = None) -> bytes:
         """One adb call. No timeout by default: the command's deadline (PhoneController.handle) cancels it.
-        `stdin` is a local file read as the command's standard input (`adb exec-in`), never whole into memory."""
+        `stdin` is a local file read as the command's standard input (`adb exec-in`), never whole into memory;
+        with `stdout_path`, the output goes to that local file as it comes (and nothing is returned)."""
         # A .py "adb" (the tests' fake) runs with this Python: no shell wrapper, so it works on Windows too.
         cmd = [sys.executable, self.adb_bin] if self.adb_bin.endswith(".py") else [self.adb_bin]
         if self.serial:
             cmd += ["-s", self.serial]
         cmd += list(args)
         source = open(stdin, "rb") if stdin is not None else None
+        sink = open(stdout_path, "wb") if stdout_path is not None else None
         try:
             proc = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, stdin=source,
+                *cmd, stdout=sink if sink is not None else asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                stdin=source,
             )
         except FileNotFoundError as e:
             raise CommandError("adb_failed", f"adb not found: {self.adb_bin}") from e
         finally:
+            # the child has its own copies of the files' descriptors
             if source is not None:
-                source.close()  # the child has its own copy of the file's descriptor
+                source.close()
+            if sink is not None:
+                sink.close()
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout)
         except asyncio.TimeoutError as e:
@@ -247,13 +254,17 @@ class Adb:
             raise
         if proc.returncode != 0:
             raise CommandError("adb_failed", err.decode(errors="replace").strip()[:200])
-        return out
+        return out or b""
 
     async def shell(self, command: str, timeout: float | None = None) -> str:
         return (await self.run("shell", command, timeout=timeout)).decode(errors="replace")
 
     async def exec_out(self, command: str, timeout: float | None = None) -> bytes:
         return await self.run("exec-out", command, timeout=timeout)
+
+    async def exec_out_to_file(self, command: str, path: str, timeout: float | None = None) -> None:
+        """`adb exec-out` with its output written to the local file at `path` as it comes, never whole into memory."""
+        await self.run("exec-out", command, timeout=timeout, stdout_path=path)
 
     async def exec_in(self, command: str, path: str, timeout: float | None = None) -> bytes:
         """`adb exec-in`: the local file at `path` is the command's standard input."""
@@ -1088,6 +1099,13 @@ def _remove(*paths: str) -> None:
             os.remove(path)
         except OSError:
             pass
+
+
+def _file_tail(path: str, n: int = 200) -> str:
+    """A local file's last `n` bytes as text: the error a command printed in place of a file's bytes."""
+    with open(path, "rb") as f:
+        f.seek(max(0, os.path.getsize(path) - n))
+        return f.read().decode(errors="replace")
 
 
 def default_timeout(cmd: str, args: dict) -> float:
@@ -1965,13 +1983,13 @@ class PhoneController:
             raise CommandError("not_found", f"{path} does not exist in {package}'s data, or cannot be read")
         if entry["type"] != "file":
             raise CommandError("invalid_args", f"{path} is a {entry['type']}; list a folder with /run-as/files")
-        data = await self.adb.exec_out(f"run-as {package} cat {shlex.quote(path)}")
-        if len(data) != entry["size"]:  # exec-out passes run-as's own errors on as if they were the file
-            raise CommandError("device_error", f"read {len(data)} bytes of {entry['size']}: {data[-200:].decode(errors='replace')}")
         local = _local_temp(os.path.splitext(path)[1])
         try:
-            with open(local, "wb") as f:
-                f.write(data)
+            # To a local file as it comes, never whole into memory
+            await self.adb.exec_out_to_file(f"run-as {package} cat {shlex.quote(path)}", local)
+            got = os.path.getsize(local)
+            if got != entry["size"]:  # exec-out passes run-as's own errors on as if they were the file
+                raise CommandError("device_error", f"read {got} bytes of {entry['size']}: {_file_tail(local)}")
             mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
             size = await channel.send_file(local, mime, {"X-File-Path": path, "X-Package": package})
         finally:
@@ -1986,13 +2004,14 @@ class PhoneController:
             raise CommandError("invalid_args", "package must be an Android package name")
         path = data_path(args, required=False) or "."
         await self._debuggable(package)
-        data = await self.adb.exec_out(f"run-as {package} tar -cf - {shlex.quote(path)}")
-        if not is_tar(data):  # exec-out passes run-as's or tar's error on as if it were the archive
-            raise CommandError("not_found", f"{path} could not be archived: {data[-200:].decode(errors='replace').strip()}")
         local = _local_temp(".tar")
         try:
-            with open(local, "wb") as f:
-                f.write(data)
+            # To a local file as it comes, never whole into memory
+            await self.adb.exec_out_to_file(f"run-as {package} tar -cf - {shlex.quote(path)}", local)
+            with open(local, "rb") as f:
+                head = f.read(512)
+            if not is_tar(head):  # exec-out passes run-as's or tar's error on as if it were the archive
+                raise CommandError("not_found", f"{path} could not be archived: {_file_tail(local).strip()}")
             size = await channel.send_file(local, "application/x-tar", {"X-Package": package, "X-File-Path": path})
         finally:
             _remove(local)
@@ -2048,7 +2067,8 @@ class PhoneController:
             raise CommandError("not_found", f"{path} does not exist in {package}'s data, or cannot be read")
         if entry["type"] != "file":
             raise CommandError("invalid_args", f"{path} is a {entry['type']}; only a file is deleted")
-        out = await self.adb.shell(f"run-as {package} rm -f -- {shlex.quote(path)} 2>&1")
+        # With if_foreground, only if that app is still in front, checked in the same shell command
+        out = await self._guarded(f"run-as {package} rm -f -- {shlex.quote(path)} 2>&1", args)
         if out.strip():
             raise CommandError("device_error", out.strip()[-300:])
         return {"package": package, "path": path, "deleted": True}
@@ -2067,7 +2087,8 @@ class PhoneController:
         pids = (await self.adb.shell(f"pidof {package}; true")).split()
         if not pids or not pids[0].isdigit():
             raise CommandError("not_found", f"{package} is not running")
-        out = await self.adb.shell(f"run-as {package} kill -{signal} {pids[0]} 2>&1")
+        # With if_foreground, only if that app is still in front, checked in the same shell command
+        out = await self._guarded(f"run-as {package} kill -{signal} {pids[0]} 2>&1", args)
         if out.strip():
             raise CommandError("device_error", out.strip()[-300:])
         return {"package": package, "pid": int(pids[0]), "signal": signal}

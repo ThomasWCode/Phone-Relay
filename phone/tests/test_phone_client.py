@@ -89,6 +89,11 @@ class InProcessAdb:
     async def exec_in(self, command, path, timeout=None):
         return await self.run("exec-in", command, stdin=path)
 
+    async def exec_out_to_file(self, command, path, timeout=None):
+        data = await self.run("exec-out", command)
+        with open(path, "wb") as f:
+            f.write(data)
+
     def inputs(self):
         return [c for c in self.executed if c.startswith("input ")]
 
@@ -1068,6 +1073,27 @@ class DecrastinationWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adb.state["files"][root + "files/plan.json"], before)
         self.assertNotIn(root + "files/.plan.json.part", adb.state["files"])
 
+    async def test_run_as_delete_and_kill_recheck_the_foreground(self):
+        ctl, adb = controller()
+        root = fake_adb.DATA_ROOT + "com.example.tiny/"
+        real = adb.run
+
+        async def switching(*a, **kw):
+            out = await real(*a, **kw)
+            if a[-1].startswith(("run-as com.example.tiny stat", "pidof")):
+                adb.state["foreground"] = "com.android.settings"  # the owner switched apps after the lookup
+            return out
+
+        adb.run = switching
+        for cmd, args in [("run_as_delete", {"package": "com.example.tiny", "path": "files/plan.json"}),
+                          ("run_as_kill", {"package": "com.example.tiny", "signal": "STOP"})]:
+            adb.state["foreground"] = "com.android.chrome"
+            with self.assertRaises(pc.CommandError, msg=cmd) as cm:
+                await ctl.handle(cmd, {**args, "if_foreground": "com.android.chrome"})
+            self.assertEqual(cm.exception.code, "foreground_mismatch", cmd)
+        self.assertIn(root + "files/plan.json", adb.state["files"])
+        self.assertEqual(adb.state.get("signals", []), [])
+
     async def test_run_as_kill(self):
         ctl, adb = controller()
         res = await ctl.handle("run_as_kill", {"package": "com.example.tiny", "signal": "STOP"})
@@ -1887,6 +1913,19 @@ class SubprocessAdbTests(unittest.IsolatedAsyncioTestCase):
     def logged(self):
         with open(self.log) as f:
             return [json.loads(line) for line in f]
+
+    async def test_run_as_downloads_go_through_a_local_file(self):
+        # The real Adb writes exec-out's output to a file as it comes, never whole into memory
+        relay = FakeRelay()
+        res = await self.ctl.handle("run_as", {"package": "com.example.tiny", "path": "files/plan.json"}, relay)
+        self.assertEqual(relay.received(), b'{"plan": []}')
+        self.assertEqual(res["bytes"], len(b'{"plan": []}'))
+        relay = FakeRelay()
+        await self.ctl.handle("run_as_archive", {"package": "com.example.tiny", "path": "files"}, relay)
+        self.assertTrue(pc.is_tar(relay.received()[:512]))
+        with self.assertRaises(pc.CommandError) as cm:
+            await self.ctl.handle("run_as_archive", {"package": "com.example.tiny", "path": "nothing"}, FakeRelay())
+        self.assertEqual(cm.exception.code, "not_found")
 
     async def test_serial_and_argument_passing(self):
         await self.ctl.handle("type", {"text": "it's a test"})
