@@ -790,9 +790,14 @@ class Commands(
         try {
             val size = device.ownFileSize(out)
             val head = device.openRead(out).use { it.readNBytes(512) }
+            val tail = device.openRead(out).use { it.skip(maxOf(0L, size - 64)); it.readBytes() }
+            val failed = String(tail, Charsets.ISO_8859_1).trimEnd().endsWith(ShellCommands.TAR_FAILED_MARKER)
             if (!ShellCommands.isTar(head)) {
-                throw CommandError("not_found", "$p could not be archived: ${String(head).trim().takeLast(200)}")
+                val detail = if (failed) "it does not exist or cannot be read" else String(head).trim().takeLast(200)
+                throw CommandError("not_found", "$p could not be archived: $detail")
             }
+            // A whole archive's header, but tar left out something it could not read
+            if (failed) throw CommandError("device_error", "tar could not read all of $p: the archive would be incomplete")
             val sent = device.openRead(out).use { stream.sendFile(it, size, "application/x-tar", mapOf("X-Package" to pkg, "X-File-Path" to p)) }
             return buildJsonObject { put("package", pkg); put("path", p); put("bytes", sent) }
         } finally {

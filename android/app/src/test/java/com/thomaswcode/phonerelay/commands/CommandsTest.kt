@@ -652,11 +652,18 @@ class CommandsTest {
         val sent = mutableListOf<JsonObject>()
         commands.handle("run_as_archive", args("""{"package": "com.example.tiny", "path": "files"}"""), sink(sent))
         assertEquals("application/x-tar", sent.first().str("mime"))
-        assertEquals("run-as com.example.tiny tar -cf - files", device.shellCommands.last())
-        device.shellBytes = { "tar: nothing: No such file or directory\n".toByteArray() }
+        assertEquals("run-as com.example.tiny sh -c 'tar -cf - files 2>/dev/null || echo PHONE_RELAY_TAR_FAILED'", device.shellCommands.last())
+        device.shellBytes = { "PHONE_RELAY_TAR_FAILED\n".toByteArray() }
         assertEquals("not_found", assertFailsWith<CommandError> {
             commands.handle("run_as_archive", args("""{"package": "com.example.tiny", "path": "nothing"}"""), sink(mutableListOf()))
         }.code)
+        // tar left out a file it could not read: its header is whole, but the backup is not, so nothing is sent
+        device.shellBytes = { tar + "PHONE_RELAY_TAR_FAILED\n".toByteArray() }
+        val none = mutableListOf<JsonObject>()
+        assertEquals("device_error", assertFailsWith<CommandError> {
+            commands.handle("run_as_archive", args("""{"package": "com.example.tiny", "path": "files"}"""), sink(none))
+        }.code)
+        assertTrue(none.isEmpty())
 
         val data = """{"made": "up"}""".toByteArray()
         device.shellReply = { cmd -> if (cmd.startsWith("run-as com.example.tiny stat -c %s")) "${data.size}\n" else null }

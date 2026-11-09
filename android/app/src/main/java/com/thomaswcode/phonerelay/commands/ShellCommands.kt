@@ -17,6 +17,8 @@ object ShellCommands {
     const val SPLIT_MARKER = "PHONE_RELAY_SPLIT"
     /** Printed by a shell command when the path it was given does not exist or cannot be read. */
     const val MISSING_MARKER = "PHONE_RELAY_MISSING"
+    /** Printed after an archive when tar did not finish cleanly (a file it could not read was left out). */
+    const val TAR_FAILED_MARKER = "PHONE_RELAY_TAR_FAILED"
     const val DEFAULT_LOG_LINES = 500
     val LOG_LEVELS = listOf("V", "D", "I", "W", "E", "F")
     val LOG_BUFFERS = listOf("main", "system", "crash", "events", "radio", "kernel", "default", "all")
@@ -173,7 +175,12 @@ object ShellCommands {
         return p
     }
 
-    fun runAsTar(pkg: String, path: String) = "run-as $pkg tar -cf - ${quote(path)}"
+    /**
+     * A folder of the app's own data as a tar on stdout. tar's messages are kept out of the archive's
+     * bytes, and if it did not finish cleanly (a file it could not read was left out), TAR_FAILED_MARKER
+     * follows the archive: a whole archive ends in zero blocks, never in that text.
+     */
+    fun runAsTar(pkg: String, path: String) = "run-as $pkg sh -c ${quote("tar -cf - ${quote(path)} 2>/dev/null || echo $TAR_FAILED_MARKER")}"
 
     /** A tar archive's first header (ustar), not an error printed in its place. */
     fun isTar(head: ByteArray): Boolean = head.size >= 512 && String(head, 257, 5, Charsets.US_ASCII) == "ustar"
