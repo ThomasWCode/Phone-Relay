@@ -374,6 +374,61 @@ def main():
         check("pull a folder -> 400", request("GET", "/files/pull?path=/sdcard/Download")[0] == 400)
         check("relative path -> 400", request("GET", "/files?path=sdcard")[0] == 400)
 
+        # ---- a release: install, what is installed, accessibility, logs, settings, an app's own files ----
+        with open(os.path.join(PHONE, "tests", "data", "tiny.apk"), "rb") as f:
+            tiny = f.read()
+        tiny_sha = "db0a3e2dce9ae04bcdd279f2276bcf8300c153b356de6b4d9426264eecb69a6a"
+        request("POST", "/files/push?path=/sdcard/Download/tiny.apk", raw=tiny)
+        s, _, b = request("GET", "/package?name=com.example.tiny")
+        check("what is installed", s == 200 and j(b).get("version_code") == 41 and j(b).get("signing_sha256") == [tiny_sha]
+              and j(b).get("last_update_time") == "2026-11-09 06:58:42", f"{s} {b[:300]}")
+        s, _, b = request("POST", "/install", body={"path": "/sdcard/Download/tiny.apk", "package": "com.android.chrome"})
+        check("install of another package -> 400", s == 400 and j(b).get("error") == "package_mismatch", f"{s} {b[:200]}")
+        s, _, b = request("POST", "/install", body={"path": "/sdcard/Download/tiny.apk", "package": "com.example.tiny",
+                                                    "if_foreground": "com.android.chrome"})
+        check("install over the app", s == 200 and j(b).get("version_code") == 42 and j(b).get("version_name") == "1.2.3-test",
+              f"{s} {b[:200]}")
+        set_fake(state_path, install_error="INSTALL_FAILED_UPDATE_INCOMPATIBLE: signatures do not match")
+        s, _, b = request("POST", "/install", body={"path": "/sdcard/Download/tiny.apk", "package": "com.example.tiny"})
+        check("Android's install error -> 422", s == 422 and j(b).get("error") == "install_failed"
+              and j(b).get("detail", "").startswith("INSTALL_FAILED_UPDATE_INCOMPATIBLE"), f"{s} {b[:200]}")
+        set_fake(state_path, install_error=None)
+        s, h, b = request("GET", "/package/apk?name=com.example.tiny")
+        check("the installed APK", s == 200 and b == tiny and h.get("X-Version-Code") == "42"
+              and h.get("X-File-Size") == str(len(tiny)), f"{s} {h}")
+        s, _, b = request("GET", "/accessibility")
+        check("accessibility services", s == 200 and j(b).get("missing") == [] and len(j(b).get("bound", [])) == 2, f"{s} {b[:300]}")
+        s, _, b = request("GET", "/logcat?tag=Decrastination&level=W&since=60&lines=5")
+        st = json.load(open(state_path))
+        check("logcat", s == 200 and j(b).get("count") == 2 and "-s Decrastination:W" in st.get("last_logcat", ""), f"{s} {b[:300]}")
+        s, _, b = request("GET", "/settings?namespace=global&key=stay_on_while_plugged_in")
+        check("a setting and dark mode", s == 200 and j(b).get("value") == "0" and j(b).get("night_mode") == "yes", f"{s} {b[:200]}")
+        s, h, b = request("GET", "/run-as?package=com.example.tiny&path=files/plan.json")
+        check("a debuggable app's file", s == 200 and b == b'{"plan": []}' and h.get("Content-Type") == "application/json", f"{s} {b[:200]}")
+        s, _, b = request("GET", "/run-as/files?package=com.example.tiny&path=files")
+        check("its folder", s == 200 and [e["name"] for e in j(b).get("entries", [])] == ["plan.json"], f"{s} {b[:200]}")
+        s, _, b = request("GET", "/run-as?package=com.android.chrome&path=files/x")
+        check("not debuggable -> 403", s == 403 and j(b).get("error") == "not_debuggable", f"{s} {b[:200]}")
+        check("run-as outside the data folder -> 400", request("GET", "/run-as?package=com.example.tiny&path=../x")[0] == 400)
+        s, _, b = request("POST", "/intent", body={"component": "com.example.tiny/.debug.Command", "extras": {"cmd": "backup-now"},
+                                                   "flags": ["FLAG_ACTIVITY_NEW_TASK"], "as_shell": True})
+        st = json.load(open(state_path))
+        check("intent as the shell, flags by name", s == 200 and st["last_intent"][3:5] == ["-n", "com.example.tiny/.debug.Command"]
+              and "268435456" in st["last_intent"], f"{s} {b[:200]} {st.get('last_intent')}")
+        check("as_shell without a component -> 400", request("POST", "/intent", body={"action": "a", "as_shell": True})[0] == 400)
+        s, _, b = request("GET", "/check?package=com.example.tiny&services=com.example.tiny/.FocusService")
+        report = j(b)
+        check("check: a crash since the install fails it", s == 200 and report.get("ok") is False
+              and report.get("crashes", {}).get("count") == 1 and report.get("package", {}).get("version_code") == 42
+              and report.get("files", {}).get("entries") == [{"name": "plan.json", "size": 12, "was": None}], f"{s} {b[:600]}")
+        set_fake(state_path, logcat=[], a11y_enabled=["com.b/com.b.S"], a11y_bound=["com.b/com.b.S"])
+        s, _, b = request("GET", "/check?package=com.example.tiny")
+        check("check: a service gone since the last check", s == 200 and j(b).get("accessibility", {}).get("gone")
+              == ["com.example.tiny/com.example.tiny.FocusService"], f"{s} {b[:600]}")
+        request("GET", "/check?package=com.example.tiny&accept_gone=true")
+        s, _, b = request("GET", "/check?package=com.example.tiny")
+        check("check: all well once the loss is accepted", s == 200 and j(b).get("ok") is True, f"{s} {b[:600]}")
+
         # ---- screen recording ----
         s, h, b = request("GET", "/record?seconds=1")
         check("record one second", s == 200 and h.get("Content-Type") == "video/mp4" and b == b"fake mp4 segment 0",
@@ -387,7 +442,7 @@ def main():
         check("stop with no recording -> 404", s == 404, f"{s} {b[:200]}")
 
         # ---- log ----
-        s, _, b = request("GET", "/admin/log?n=100", token=ADMIN)
+        s, _, b = request("GET", "/admin/log?n=300", token=ADMIN)
         entries = j(b).get("entries", [])
         check("admin log readable", s == 200 and len(entries) > 10, f"{s}")
         check("typed text not logged", b"hello world" not in b and b"hunter2" not in b and b"batchsecret" not in b

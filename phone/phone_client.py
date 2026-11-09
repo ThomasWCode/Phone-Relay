@@ -40,6 +40,7 @@ import random
 import re
 import shlex
 import stat
+import struct
 import sys
 import tempfile
 import urllib.error
@@ -47,7 +48,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
 # ---- key names and defaults (the relay has its own copy of the key names) ----
 
@@ -81,6 +82,22 @@ STREAM_CHUNK = 256 * 1024
 STREAM_WINDOW = 8
 # Default deadline for moving a file, and for stopping a recording and fetching it.
 TRANSFER_TIMEOUT_S = 300
+# Default deadline for installing an APK: Android compiles it before it replies.
+INSTALL_TIMEOUT_S = 120
+APK_MIME = "application/vnd.android.package-archive"
+# Between two commands' output in one shell call.
+SPLIT_MARKER = "PHONE_RELAY_SPLIT"
+DEFAULT_LOG_LINES = 500
+LOG_LEVELS = ("V", "D", "I", "W", "E", "F")
+LOG_BUFFERS = ("main", "system", "crash", "events", "radio", "kernel", "default", "all")
+_LOG_TAG_RE = re.compile(r"^[\w.$-]{1,64}$")
+_LOG_TIME_RE = re.compile(r"^(\d{4}-)?\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d{1,9})?$")
+_COMPONENT_RE = re.compile(r"^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*/[A-Za-z0-9_.$]+$")
+_DATA_PATH_RE = re.compile(r"^[\w.@+ -]+(/[\w.@+ -]+)*/?$")
+_SETTING_KEY_RE = re.compile(r"^[\w.:-]{1,100}$")
+SETTINGS_NAMESPACES = ("system", "secure", "global")
+# PackageManager's COMPONENT_ENABLED_STATE_* by number, as `dumpsys package` prints it (enabled=N).
+ENABLED_STATES = {0: "default", 1: "enabled", 2: "disabled", 3: "disabled_user", 4: "disabled_until_used"}
 # screenrecord stops each file at 180 s; a longer recording is several files, sent back as a zip.
 RECORD_SEGMENT_S = 180
 RECORD_BIT_RATE = 2_000_000
@@ -94,11 +111,13 @@ WAIT_KINDS = ("change", "stable", "foreground", "text")
 BATCH_COMMANDS = ("state", "screenshot", "ui", "tap", "swipe", "type", "key", "launch", "open", "intent",
                   "notifications", "statusbar", "rotation", "wait", "files", "record_start", "gesture",
                   "clipboard_get", "clipboard_set", "chrome_tabs", "chrome_eval", "chrome_cdp", "chrome_new",
-                  "chrome_close", "chrome_activate", "sleep")
+                  "chrome_close", "chrome_activate", "install", "accessibility", "logcat", "package", "settings",
+                  "run_as_files", "sleep")
 # Commands that run their action inside the if_foreground guard themselves (in the same shell command).
 # Any other command given if_foreground is checked against the foreground before it starts.
 SELF_GUARDED = ("screenshot", "ui", "tap", "swipe", "type", "key", "launch", "open", "intent", "statusbar",
-                "rotation", "record_start", "record", "batch", "gesture", "clipboard_get", "clipboard_set", "audio")
+                "rotation", "record_start", "record", "batch", "gesture", "clipboard_get", "clipboard_set", "audio",
+                "install")
 # The app_process helper: built from helper/src by helper/build.py, pushed to the phone on first use.
 HELPER_JAR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "helper", "phone-relay-helper.jar")
 HELPER_REMOTE = "/data/local/tmp/phone-relay-helper.jar"
@@ -417,6 +436,285 @@ def parse_stat(line: str) -> dict | None:
     return {"name": name, "type": _STAT_TYPES.get(ftype, ftype), "size": int(size), "modified": int(mtime)}
 
 
+# ---- packages, accessibility, logcat and settings (pure, unit-tested) ----
+
+_PACKAGE_FIELD_RES = {
+    "version_code": re.compile(r"^\s*versionCode=(\d+)", re.MULTILINE),
+    "version_name": re.compile(r"^\s*versionName=(.*)$", re.MULTILINE),
+    "first_install_time": re.compile(r"^\s*firstInstallTime=(.+)$", re.MULTILINE),
+    "last_update_time": re.compile(r"^\s*lastUpdateTime=(.+)$", re.MULTILINE),
+    "code_path": re.compile(r"^\s*codePath=(\S+)", re.MULTILINE),
+}
+_PACKAGE_FLAGS_RE = re.compile(r"^\s*(?:pkg)?[Ff]lags=\[([^\]]*)\]", re.MULTILINE)
+_USER0_ENABLED_RE = re.compile(r"^\s*User 0:.*?\benabled=(\d+)", re.MULTILINE)
+
+
+def parse_package(dumpsys: str, name: str) -> dict | None:
+    """What `dumpsys package NAME` says of an installed package, or None if it is not installed.
+
+    Reads the first `Package [NAME]` block (an updated system app has a second, under "Hidden
+    system packages"). Times are the phone's local time as it prints them ("2026-11-09 06:58:42"),
+    which logcat's -t takes. The signing certificate is not in the dump (see apk_signers).
+    """
+    lines = dumpsys.splitlines()
+    start = next((i for i, ln in enumerate(lines) if ln.strip().startswith(f"Package [{name}]")), None)
+    if start is None:
+        return None
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    block = []
+    for ln in lines[start + 1:]:
+        if ln.strip() and len(ln) - len(ln.lstrip()) <= indent:
+            break
+        block.append(ln)
+    text = "\n".join(block)
+    found = {k: (m.group(1).strip() if (m := r.search(text)) else None) for k, r in _PACKAGE_FIELD_RES.items()}
+    flags = _PACKAGE_FLAGS_RE.search(text)
+    state = _USER0_ENABLED_RE.search(text)
+    code_path = found.pop("code_path")
+    return {
+        "name": name,
+        "version_name": found["version_name"],
+        "version_code": int(found["version_code"]) if found["version_code"] else None,
+        "first_install_time": found["first_install_time"],
+        "last_update_time": found["last_update_time"],
+        "debuggable": bool(flags) and "DEBUGGABLE" in flags.group(1).split(),
+        "enabled_state": ENABLED_STATES.get(int(state.group(1)), state.group(1)) if state else None,
+        "apk_path": f"{code_path}/base.apk" if code_path and not code_path.endswith(".apk") else code_path,
+    }
+
+
+def full_component(component: str) -> str:
+    """package/.Class as package/package.Class: Android's lists name a component either way."""
+    pkg, _, cls = component.partition("/")
+    return f"{pkg}/{pkg}{cls}" if cls.startswith(".") else component
+
+
+def parse_accessibility(enabled_setting: str, dumpsys: str) -> dict:
+    """The accessibility services enabled (`settings get secure enabled_accessibility_services`) and,
+    from `dumpsys accessibility`, those bound, as package/package.Class; `missing` is enabled but not bound.
+
+    The bound list runs over several lines, from "Bound services:" to "Enabled services:", each entry
+    Service[label=..., id=package/.Class, ...] (as Android 16 prints it). A dump that shows bound
+    services without naming them gives bound and missing as None, not every service as unbound.
+    """
+    setting = enabled_setting.strip()
+    enabled = [] if setting in ("", "null") else [full_component(c) for c in setting.split(":") if c]
+    section, inside = [], False
+    for line in dumpsys.splitlines():
+        if not inside and "Bound services:" in line:
+            inside = True
+        if inside and "Enabled services:" in line:
+            break
+        if inside:
+            section.append(line)
+    text = "\n".join(section)
+    bound = [full_component(c) for c in re.findall(r"\bid=([^,\s\]}]+)", text)]
+    if not bound and "Service[" in text:
+        return {"enabled": enabled, "bound": None, "missing": None}
+    return {"enabled": enabled, "bound": bound, "missing": [c for c in enabled if c not in bound]}
+
+
+def parse_install(out: str) -> str | None:
+    """`pm install`'s error ("INSTALL_FAILED_...: its reason"), or None when it says Success."""
+    if re.search(r"^Success\s*$", out, re.MULTILINE):
+        return None
+    m = re.search(r"Failure \[([A-Z_]+)(?::\s*(.*?))?\]\s*$", out, re.MULTILINE)
+    if m:
+        return m.group(1) + (f": {m.group(2)}" if m.group(2) else "")
+    return out.strip()[-300:] or "pm install printed nothing"
+
+
+def parse_settings(out: str) -> tuple[str | None, str | None]:
+    """(the setting's value, None when unset; dark mode: yes, no, auto, ...) from
+    `settings get NS KEY; echo SPLIT_MARKER; cmd uimode night`."""
+    value, _, night = out.partition(SPLIT_MARKER)
+    value = value.rstrip("\r\n")
+    m = re.search(r"Night mode:\s*(\S+)", night)
+    return (None if value == "null" else value), (m.group(1) if m else None)
+
+
+def logcat_command(args: dict) -> tuple[str, int]:
+    """The read-only `logcat -d` for /logcat's arguments, and its line cap. One line more than the cap
+    is read, to tell whether the cap cut the log."""
+    tags = args.get("tag")
+    if tags is not None:
+        tags = [tags] if isinstance(tags, str) else tags
+        if not isinstance(tags, list) or not tags or not all(isinstance(t, str) and _LOG_TAG_RE.match(t) for t in tags):
+            raise CommandError("invalid_args", "tag must be a log tag or a list of them")
+    level = args.get("level")
+    if level is not None and level not in LOG_LEVELS:
+        raise CommandError("invalid_args", f"level must be one of {', '.join(LOG_LEVELS)}")
+    buffer = args.get("buffer")
+    if buffer is not None and buffer not in LOG_BUFFERS:
+        raise CommandError("invalid_args", f"buffer must be one of {', '.join(LOG_BUFFERS)}")
+    lines = args.get("lines", DEFAULT_LOG_LINES)
+    if not isinstance(lines, int) or isinstance(lines, bool) or lines <= 0:
+        raise CommandError("invalid_args", "lines must be a whole number above 0")
+    parts = ["logcat", "-d"]
+    if buffer:
+        parts += ["-b", buffer]
+    since = args.get("since")
+    if since is not None:
+        if _is_number(since) and since > 0:
+            # Seconds ago by the phone's own clock, in logcat's seconds.milliseconds form
+            parts += ["-t", f"\"$(( $(date +%s) - {math.ceil(since)} )).000\""]
+        elif isinstance(since, str) and _LOG_TIME_RE.match(since):
+            parts += ["-t", shlex.quote(since if "." in since else since + ".000")]
+        else:
+            raise CommandError("invalid_args", 'since must be seconds ago or a time, e.g. "2026-11-09 06:58:42"')
+    if tags:
+        parts += ["-s"] + [f"{t}:{level or 'V'}" for t in tags]
+    elif level:
+        parts.append(f"'*:{level}'")
+    return " ".join(parts) + f" 2>&1 | tail -n {lines + 1}", lines
+
+
+def logcat_result(out: str, lines: int) -> dict:
+    got = [ln.rstrip("\r") for ln in out.splitlines()]
+    truncated = len(got) > lines
+    got = got[-lines:] if truncated else got
+    return {"count": len(got), "truncated": truncated, "lines": got}
+
+
+def data_path(args: dict, required: bool = True) -> str | None:
+    """A path inside an app's own data folder (run-as's working folder): relative, with no "..". """
+    path = args.get("path")
+    if path is None and not required:
+        return None
+    if not isinstance(path, str) or not _DATA_PATH_RE.match(path) or ".." in path.split("/"):
+        raise CommandError("invalid_args", "path must be relative to the app's data folder, e.g. files/plan.json, with no ..")
+    return path
+
+
+def _string_pool(data: bytes, off: int) -> list[str]:
+    """A binary XML string pool (ResStringPool): its strings, UTF-8 or UTF-16."""
+    header_size, count = struct.unpack_from("<H", data, off + 2)[0], struct.unpack_from("<I", data, off + 8)[0]
+    flags, strings_start = struct.unpack_from("<II", data, off + 16)
+    utf8 = bool(flags & 0x100)
+    out = []
+    for i in range(count):
+        pos = off + strings_start + struct.unpack_from("<I", data, off + header_size + 4 * i)[0]
+        if utf8:
+            for _ in range(2):  # the length in characters, then in bytes: each 1 or 2 bytes
+                n = data[pos]
+                pos += 1
+                if n & 0x80:
+                    n = ((n & 0x7F) << 8) | data[pos]
+                    pos += 1
+            out.append(data[pos:pos + n].decode("utf-8", errors="replace"))
+        else:
+            n = struct.unpack_from("<H", data, pos)[0]
+            pos += 2
+            if n & 0x8000:
+                n = ((n & 0x7FFF) << 16) | struct.unpack_from("<H", data, pos)[0]
+                pos += 2
+            out.append(data[pos:pos + 2 * n].decode("utf-16-le", errors="replace"))
+    return out
+
+
+# android:versionCode and android:versionName by their resource ids (attribute names can be stripped).
+_VERSION_CODE_ATTR, _VERSION_NAME_ATTR = 0x0101021B, 0x0101021C
+
+
+def parse_apk_manifest(axml: bytes) -> dict:
+    """package, version_code and version_name from an APK's AndroidManifest.xml (Android's binary XML):
+    the attributes of its first element, <manifest>."""
+    def u16(o):
+        return struct.unpack_from("<H", axml, o)[0]
+
+    def u32(o):
+        return struct.unpack_from("<I", axml, o)[0]
+
+    try:
+        if u16(0) != 0x0003:
+            raise ValueError("not binary XML")
+        strings: list[str] = []
+        res_ids: list[int] = []
+        off = u16(2)
+        while off + 8 <= len(axml):
+            kind, header_size, size = u16(off), u16(off + 2), u32(off + 4)
+            if size < 8:
+                break
+            if kind == 0x0001:
+                strings = _string_pool(axml, off)
+            elif kind == 0x0180:
+                res_ids = [u32(off + header_size + 4 * i) for i in range((size - header_size) // 4)]
+            elif kind == 0x0102:  # a start tag
+                ext = off + header_size
+                attr_start, attr_size, attr_count = u16(ext + 8), u16(ext + 10), u16(ext + 12)
+                out = {"package": None, "version_code": None, "version_name": None}
+                for i in range(attr_count):
+                    a = ext + attr_start + i * attr_size
+                    name_i, raw, kind_v, value = u32(a + 4), u32(a + 8), axml[a + 15], u32(a + 16)
+                    name = strings[name_i] if name_i < len(strings) else ""
+                    res = res_ids[name_i] if name_i < len(res_ids) else 0
+                    text = strings[raw] if raw < len(strings) else (strings[value] if kind_v == 0x03 and value < len(strings) else None)
+                    if name == "package" and not res:
+                        out["package"] = text
+                    elif res == _VERSION_CODE_ATTR or (not res and name == "versionCode"):
+                        out["version_code"] = value if kind_v in (0x10, 0x11) else (int(text) if text and text.isdigit() else None)
+                    elif res == _VERSION_NAME_ATTR or (not res and name == "versionName"):
+                        out["version_name"] = text
+                return out
+            off += size
+    except (struct.error, IndexError, ValueError) as e:
+        raise CommandError("invalid_args", f"not an APK: its manifest could not be read ({e})") from e
+    raise CommandError("invalid_args", "not an APK: its manifest has no <manifest>")
+
+
+def apk_manifest(apk_path: str) -> dict:
+    """parse_apk_manifest of a local APK file."""
+    try:
+        with zipfile.ZipFile(apk_path) as z:
+            axml = z.read("AndroidManifest.xml")
+    except (zipfile.BadZipFile, KeyError, OSError) as e:
+        raise CommandError("invalid_args", f"not an APK ({type(e).__name__}: {e})") from e
+    return parse_apk_manifest(axml)
+
+
+APK_SIG_MAGIC = b"APK Sig Block 42"
+# APK Signature Scheme v3.1, v3 and v2 blocks, in the order Android prefers them.
+_SIG_BLOCK_IDS = (0x1B93AD61, 0xF05368C0, 0x7109871A)
+
+
+def central_directory_offset(tail: bytes) -> int | None:
+    """Where a zip's central directory starts, from the end of the file (its end-of-central-directory record)."""
+    pos = tail.rfind(b"PK\x05\x06")
+    return None if pos < 0 or pos + 22 > len(tail) else struct.unpack_from("<I", tail, pos + 16)[0]
+
+
+def _length_prefixed(data: bytes) -> list[bytes]:
+    out, i = [], 0
+    while i + 4 <= len(data):
+        n = struct.unpack_from("<I", data, i)[0]
+        out.append(data[i + 4:i + 4 + n])
+        i += 4 + n
+    return out
+
+
+def apk_signers(block: bytes) -> list[str]:
+    """The SHA-256 of each signer's certificate (hex), from an APK Signing Block (the v3.1, v3 or v2
+    scheme's): what PackageManager reports as the app's signing certificate. [] for none."""
+    pairs, values, i = block[8:-24], {}, 0
+    while i + 12 <= len(pairs):
+        n, kind = struct.unpack_from("<QI", pairs, i)
+        values[kind] = pairs[i + 12:i + 8 + n]
+        i += 8 + n
+    scheme = next((values[k] for k in _SIG_BLOCK_IDS if k in values), None)
+    if scheme is None:
+        return []
+    digests = []
+    for signers in _length_prefixed(scheme)[:1]:
+        for signer in _length_prefixed(signers):
+            signed_data = _length_prefixed(signer)[0]
+            certificates = _length_prefixed(signed_data)[1]
+            first = _length_prefixed(certificates)[0]
+            digest = hashlib.sha256(first).hexdigest()
+            if digest not in digests:
+                digests.append(digest)
+    return digests
+
+
 def frame_signature(png: bytes):
     """A small greyscale copy of a screenshot for comparing frames; its hash if Pillow is missing."""
     try:
@@ -698,8 +996,10 @@ def default_timeout(cmd: str, args: dict) -> float:
         return 2 * DEFAULT_TIMEOUT_S + 2 * (args["seconds"] if _is_number(args.get("seconds")) else 10)
     if cmd == "gesture" and _is_number(args.get("ms")):
         return DEFAULT_TIMEOUT_S + max(args["ms"], 0) / 1000
-    if cmd in ("pull", "push", "record_stop"):
+    if cmd in ("pull", "push", "record_stop", "package_apk", "run_as"):
         return TRANSFER_TIMEOUT_S
+    if cmd == "install":
+        return INSTALL_TIMEOUT_S
     if cmd == "batch" and isinstance(args.get("steps"), list):
         total = DEFAULT_TIMEOUT_S
         for step in args["steps"]:
@@ -711,6 +1011,18 @@ def default_timeout(cmd: str, args: dict) -> float:
                 total += t if _is_number(t) and t > 0 else default_timeout(str(step.get("cmd")), step_args)
         return total
     return DEFAULT_TIMEOUT_S
+
+
+def _list_command(path: str) -> str:
+    """Shell command listing a directory's entries (or one file) as `stat -c '%F|%s|%Y|%n'` lines;
+    MISSING_MARKER if the path does not exist or cannot be read."""
+    q, fmt = shlex.quote(path), "'%F|%s|%Y|%n'"
+    return (
+        f"if [ -d {q} ]; then cd {q} 2>/dev/null || {{ echo {MISSING_MARKER}; exit 0; }}; "
+        f"for f in * .*; do case \"$f\" in .|..) continue;; esac; "
+        f"[ -e \"$f\" ] || [ -L \"$f\" ] || continue; stat -c {fmt} -- \"$f\"; done; "
+        f"else stat -c {fmt} -- {q} 2>/dev/null || echo {MISSING_MARKER}; fi"
+    )
 
 
 def _if_foreground(args: dict) -> tuple[str, ...] | None:
@@ -897,6 +1209,12 @@ class PhoneController:
             "chrome_new": self.cmd_chrome_new,
             "chrome_close": self.cmd_chrome_close,
             "chrome_activate": self.cmd_chrome_activate,
+            "install": self.cmd_install,
+            "accessibility": self.cmd_accessibility,
+            "logcat": self.cmd_logcat,
+            "package": self.cmd_package,
+            "run_as_files": self.cmd_run_as_files,
+            "settings": self.cmd_settings,
         }.get(cmd)
         # These stream bytes over the relay socket, so they need the command's channel.
         streaming = {
@@ -905,6 +1223,8 @@ class PhoneController:
             "record": self.cmd_record,
             "record_stop": self.cmd_record_stop,
             "audio": self.cmd_audio,
+            "package_apk": self.cmd_package_apk,
+            "run_as": self.cmd_run_as,
         }.get(cmd)
         if handler is None and streaming is None:
             raise CommandError("invalid_args", f"unknown command: {cmd}")
@@ -1121,10 +1441,18 @@ class PhoneController:
         return {"url": url, "package": package}
 
     async def cmd_intent(self, args: dict) -> dict:
-        """Start an activity (or send a broadcast) from an intent's parts, through `am`."""
+        """Start an activity (or send a broadcast) from an intent's parts, through `am`.
+
+        This client's `am` always runs as the shell user, so as_shell changes nothing here but is held
+        to the same rule as in the app: only to a named component."""
         broadcast = args.get("broadcast", False)
         if not isinstance(broadcast, bool):
             raise CommandError("invalid_args", "broadcast must be true or false")
+        as_shell = args.get("as_shell", False)
+        if not isinstance(as_shell, bool):
+            raise CommandError("invalid_args", "as_shell must be true or false")
+        if as_shell and not (isinstance(args.get("component"), str) and _COMPONENT_RE.match(args["component"])):
+            raise CommandError("invalid_args", "as_shell needs component, e.g. com.example.app/.debug.Command")
         parts = ["am", "broadcast"] if broadcast else ["am", "start", "-W"]
         given = False
         for field, flag in (("action", "-a"), ("data", "-d"), ("type", "-t"), ("component", "-n")):
@@ -1287,13 +1615,7 @@ class PhoneController:
     async def cmd_files(self, args: dict) -> dict:
         """A directory's entries (name, type, size, modified), or one file's."""
         path = _remote_path(args)
-        q, fmt = shlex.quote(path), "'%F|%s|%Y|%n'"
-        out = await self.adb.shell(
-            f"if [ -d {q} ]; then cd {q} 2>/dev/null || {{ echo {MISSING_MARKER}; exit 0; }}; "
-            f"for f in * .*; do case \"$f\" in .|..) continue;; esac; "
-            f"[ -e \"$f\" ] || [ -L \"$f\" ] || continue; stat -c {fmt} -- \"$f\"; done; "
-            f"else stat -c {fmt} -- {q} 2>/dev/null || echo {MISSING_MARKER}; fi"
-        )
+        out = await self.adb.shell(_list_command(path))
         if MISSING_MARKER in out:
             raise CommandError("not_found", f"{path} does not exist or cannot be read")
         entries = [e for e in map(parse_stat, out.splitlines()) if e]
@@ -1387,6 +1709,155 @@ class PhoneController:
         await asyncio.sleep(started["max_seconds"] + 1)
         return await self.cmd_record_stop(args, channel)
 
+
+    # ---- releases: installing, and what is installed; accessibility, logs, settings; an app's own files ----
+
+    async def _package(self, name: str) -> dict:
+        """parse_package of the installed package; not_found if it is not installed."""
+        info = parse_package(await self.adb.shell(f"dumpsys package {shlex.quote(name)}"), name)
+        if info is None:
+            raise CommandError("not_found", f"{name} is not installed")
+        return info
+
+    async def _read_range(self, path: str, offset: int, length: int) -> bytes:
+        """`length` bytes of a file on the phone from `offset`, without reading the rest."""
+        return await self.adb.exec_out(f"tail -c +{offset + 1} {shlex.quote(path)} | head -c {length}")
+
+    async def _signers(self, apk: str) -> list[str] | None:
+        """SHA-256 of the APK's signing certificates, read from its APK Signing Block (the end of the
+        file only); None when it has none (a v1-only signature) or it cannot be read."""
+        try:
+            size = int((await self.adb.shell(f"stat -c %s {shlex.quote(apk)}")).strip())
+            tail_len = min(size, 65557)  # the end-of-central-directory record, with the longest zip comment
+            cd = central_directory_offset(await self._read_range(apk, size - tail_len, tail_len))
+            if cd is None or cd < 32:
+                return None
+            footer = await self._read_range(apk, cd - 24, 24)
+            if len(footer) != 24 or footer[8:] != APK_SIG_MAGIC:
+                return None
+            block_size = struct.unpack_from("<Q", footer)[0]
+            block = await self._read_range(apk, cd - block_size - 8, block_size + 8)
+            return apk_signers(block) or None
+        except (ValueError, struct.error, IndexError) as e:
+            log.warning("could not read %s's signing block: %s", apk, e)
+            return None
+
+    async def cmd_package(self, args: dict) -> dict:
+        """What is installed of a package: its version, install and update times, signing certificate
+        (SHA-256), whether it is debuggable, its enabled state and the installed APK's path."""
+        name = _package_arg(args, "name")
+        if name is None:
+            raise CommandError("invalid_args", "name must be an Android package name")
+        info = await self._package(name)
+        info["signing_sha256"] = await self._signers(info["apk_path"]) if info["apk_path"] else None
+        return info
+
+    async def cmd_package_apk(self, args: dict, channel: Channel) -> dict:
+        """The installed APK (its base.apk), streamed as a pull is."""
+        name = _package_arg(args, "name")
+        if name is None:
+            raise CommandError("invalid_args", "name must be an Android package name")
+        info = await self._package(name)
+        local = _local_temp(".apk")
+        try:
+            await self.adb.run("pull", info["apk_path"], local)
+            size = await channel.send_file(local, APK_MIME, {"X-Version-Code": str(info["version_code"]),
+                                                             "X-File-Path": info["apk_path"]})
+        finally:
+            _remove(local)
+        return {"name": name, "path": info["apk_path"], "version_code": info["version_code"], "bytes": size}
+
+    async def cmd_install(self, args: dict) -> dict:
+        """Install an APK already on the phone over the app that is there (`pm install -r`): never with
+        -d (a downgrade), and nothing here uninstalls or clears data. The APK's own package must be the
+        one named, read from its manifest first. Android's refusal (INSTALL_FAILED_...) is the error."""
+        path = _remote_path(args)
+        package = _package_arg(args)
+        if package is None:
+            raise CommandError("invalid_args", "package must be the APK's Android package name")
+        if (await self._stat(path))["type"] != "file":
+            raise CommandError("invalid_args", f"{path} is not a file")
+        local = _local_temp(".apk")
+        try:
+            await self.adb.run("pull", path, local)
+            apk = apk_manifest(local)
+        finally:
+            _remove(local)
+        if apk["package"] != package:
+            raise CommandError("package_mismatch", f"{path} is {apk['package']}, not {package}")
+        error = parse_install(await self._guarded(f"pm install -r {shlex.quote(path)} 2>&1 || true", args))
+        if error:
+            raise CommandError("install_failed", error)
+        info = await self._package(package)
+        return {"package": package, "version_name": info["version_name"], "version_code": info["version_code"]}
+
+    async def cmd_accessibility(self, args: dict) -> dict:
+        """The accessibility services enabled, those bound, and those enabled but not bound (missing)."""
+        out = await self.adb.shell(
+            f"settings get secure enabled_accessibility_services; echo {SPLIT_MARKER}; dumpsys accessibility")
+        setting, _, dump = out.partition(SPLIT_MARKER)
+        return parse_accessibility(setting, dump)
+
+    async def cmd_logcat(self, args: dict) -> dict:
+        """The log so far (`logcat -d`), read-only: by tag, from a time, from a level, at most `lines` (the last ones)."""
+        command, lines = logcat_command(args)
+        return logcat_result(await self.adb.shell(command), lines)
+
+    async def cmd_settings(self, args: dict) -> dict:
+        """One setting's value (null when unset), read-only, and dark mode (`cmd uimode night`)."""
+        namespace, key = args.get("namespace"), args.get("key")
+        if namespace not in SETTINGS_NAMESPACES:
+            raise CommandError("invalid_args", f"namespace must be one of {', '.join(SETTINGS_NAMESPACES)}")
+        if not isinstance(key, str) or not _SETTING_KEY_RE.match(key):
+            raise CommandError("invalid_args", "key must be a setting's name, e.g. stay_on_while_plugged_in")
+        value, night = parse_settings(await self.adb.shell(
+            f"settings get {namespace} {key}; echo {SPLIT_MARKER}; cmd uimode night"))
+        return {"namespace": namespace, "key": key, "value": value, "night_mode": night}
+
+    async def _debuggable(self, package: str) -> None:
+        """run-as reads only a debuggable app's files: anything else is refused here first, as not_debuggable."""
+        if not (await self._package(package))["debuggable"]:
+            raise CommandError("not_debuggable", f"{package} is not debuggable: run-as cannot read its files")
+
+    async def cmd_run_as_files(self, args: dict) -> dict:
+        """A folder in a debuggable app's own storage (`run-as`), as /files lists one."""
+        package = _package_arg(args)
+        if package is None:
+            raise CommandError("invalid_args", "package must be an Android package name")
+        path = data_path(args, required=False) or "."
+        await self._debuggable(package)
+        out = await self.adb.shell(f"run-as {package} sh -c {shlex.quote(_list_command(path))} 2>&1")
+        if MISSING_MARKER in out:
+            raise CommandError("not_found", f"{path} does not exist in {package}'s data, or cannot be read")
+        entries = [e for e in map(parse_stat, out.splitlines()) if e]
+        return {"package": package, "path": path, "count": len(entries), "entries": entries}
+
+    async def cmd_run_as(self, args: dict, channel: Channel) -> dict:
+        """A file in a debuggable app's own storage (`run-as PACKAGE cat PATH`), read-only, streamed as a pull is."""
+        package = _package_arg(args)
+        if package is None:
+            raise CommandError("invalid_args", "package must be an Android package name")
+        path = data_path(args)
+        await self._debuggable(package)
+        out = await self.adb.shell(
+            f"run-as {package} stat -c '%F|%s|%Y|%n' -- {shlex.quote(path)} 2>/dev/null || echo {MISSING_MARKER}")
+        entry = next((e for e in map(parse_stat, out.splitlines()) if e), None)
+        if entry is None:
+            raise CommandError("not_found", f"{path} does not exist in {package}'s data, or cannot be read")
+        if entry["type"] != "file":
+            raise CommandError("invalid_args", f"{path} is a {entry['type']}; list a folder with /run-as/files")
+        data = await self.adb.exec_out(f"run-as {package} cat {shlex.quote(path)}")
+        if len(data) != entry["size"]:  # exec-out passes run-as's own errors on as if they were the file
+            raise CommandError("device_error", f"read {len(data)} bytes of {entry['size']}: {data[-200:].decode(errors='replace')}")
+        local = _local_temp(os.path.splitext(path)[1])
+        try:
+            with open(local, "wb") as f:
+                f.write(data)
+            mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+            size = await channel.send_file(local, mime, {"X-File-Path": path, "X-Package": package})
+        finally:
+            _remove(local)
+        return {"package": package, "path": path, "bytes": size}
 
     # ---- Chrome DevTools ----
 
