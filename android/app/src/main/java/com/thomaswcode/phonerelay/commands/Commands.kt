@@ -851,7 +851,8 @@ class Commands(
         val entry = device.shell(ShellCommands.runAsStat(pkg, p)).lines().firstNotNullOfOrNull(ShellCommands::parseStat)
             ?: throw CommandError("not_found", "$p does not exist in $pkg's data, or cannot be read")
         if (entry.type != "file") throw CommandError("invalid_args", "$p is a ${entry.type}; only a file is deleted")
-        device.shell(ShellCommands.runAsDelete(pkg, p)).trim().takeIf { it.isNotEmpty() }?.let { throw CommandError("device_error", it.takeLast(300)) }
+        // With if_foreground, only if that app is still in front, checked just before the delete
+        device.shell(ShellCommands.runAsDelete(pkg, p), guard(args)).trim().takeIf { it.isNotEmpty() }?.let { throw CommandError("device_error", it.takeLast(300)) }
         return buildJsonObject { put("package", pkg); put("path", p); put("deleted", true) }
     }
 
@@ -867,7 +868,8 @@ class Commands(
         debuggable(pkg)
         val pid = device.shell("pidof $pkg; true").trim().split(Regex("\\s+")).firstOrNull()?.toIntOrNull()
             ?: throw CommandError("not_found", "$pkg is not running")
-        device.shell("run-as $pkg kill -$signal $pid 2>&1").trim().takeIf { it.isNotEmpty() }?.let { throw CommandError("device_error", it.takeLast(300)) }
+        // With if_foreground, only if that app is still in front, checked just before the signal
+        device.shell("run-as $pkg kill -$signal $pid 2>&1", guard(args)).trim().takeIf { it.isNotEmpty() }?.let { throw CommandError("device_error", it.takeLast(300)) }
         return buildJsonObject { put("package", pkg); put("pid", pid); put("signal", signal) }
     }
 

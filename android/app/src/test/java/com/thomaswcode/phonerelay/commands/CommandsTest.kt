@@ -724,6 +724,29 @@ class CommandsTest {
     }
 
     @Test
+    fun runAsDeleteAndKillRecheckTheForeground() = runTest {
+        device.shellPaired = true
+        device.shellReply = { cmd ->
+            when {
+                cmd.startsWith("run-as com.example.tiny stat -c '") -> {
+                    device.fg = "com.android.settings" // the owner switched apps after the lookup
+                    "regular file|14|1700000000|files/plan.json\n"
+                }
+                cmd.startsWith("pidof") -> { device.fg = "com.android.settings"; "4321\n" }
+                else -> null
+            }
+        }
+        for ((cmd, json) in listOf(
+            "run_as_delete" to """{"package": "com.example.tiny", "path": "files/plan.json", "if_foreground": "com.android.chrome"}""",
+            "run_as_kill" to """{"package": "com.example.tiny", "signal": "STOP", "if_foreground": "com.android.chrome"}""",
+        )) {
+            device.fg = "com.android.chrome"
+            assertEquals("foreground_mismatch", error(cmd, json).code, cmd)
+        }
+        assertTrue(device.shellCommands.none { it.contains(" rm ") || it.contains(" kill ") })
+    }
+
+    @Test
     fun nightModeAndForceStop() = runTest {
         device.shellPaired = true
         var night = "yes"
