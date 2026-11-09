@@ -105,7 +105,11 @@ export function evaluateCheck(
         }
       });
       if (count > 0) problems.push(`${count} crash${count === 1 ? "" : "es"} in the crash log since the install`);
-      crashes = { count, since: installed?.last_update_time ?? null, first };
+      // Only the log's last lines came: a crash before them would not be seen, so this is no clean check
+      if (inputs.crashLog.result.truncated === true) {
+        problems.push(`the crash log since the install is longer than was read (its last ${lines.length} lines): read it with /logcat?buffer=crash`);
+      }
+      crashes = { count, since: installed?.last_update_time ?? null, first, truncated: inputs.crashLog.result.truncated === true };
     }
   }
 

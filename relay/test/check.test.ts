@@ -35,9 +35,16 @@ describe("evaluateCheck", () => {
     expect(report.problems).toEqual([]);
     expect(report.foreground).toBe("com.android.chrome");
     expect((report.accessibility as { services: unknown }).services).toEqual([{ component: FOCUS, enabled: true, bound: true }]);
-    expect(report.crashes).toEqual({ count: 0, since: "2026-11-09 06:58:42", first: [] });
+    expect(report.crashes).toEqual({ count: 0, since: "2026-11-09 06:58:42", first: [], truncated: false });
     expect(report.files).toEqual({ entries: [{ name: "plan.json", size: 120, was: null }], gone: [] });
     expect(record).toEqual({ enabled: [FOCUS, "com.b/com.b.S"], files: { "plan.json": 120 } });
+  });
+
+  it("a crash log longer than was read is no clean check", () => {
+    const { report } = evaluateCheck({ package: PKG }, inputs({ crashLog: ok({ lines: ["--------- beginning of crash"], truncated: true }) }), null);
+    expect(report.ok).toBe(false);
+    expect((report.crashes as { truncated: boolean }).truncated).toBe(true);
+    expect(report.problems).toEqual(["the crash log since the install is longer than was read (its last 1 lines): read it with /logcat?buffer=crash"]);
   });
 
   it("a crash of the package since the install, not another app's", () => {
