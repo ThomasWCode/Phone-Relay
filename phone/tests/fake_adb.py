@@ -391,22 +391,26 @@ def run_as(cmd, state, stdin=None):
         state.setdefault("signals", []).append([pkg, words[3], int(words[4])])
         save_state(state)
         return b""
-    if words[2] == "tar":
+    if words[2:4] == ["sh", "-c"] and words[4].startswith("tar -cf - "):
+        # `tar -cf - PATH 2>/dev/null || echo MARKER`: tar's messages dropped, the marker after a failed run.
+        # "tar_unreadable" leaves a file out as an unreadable one would be, so tar exits 1.
         import io
         import tarfile
-        base = absolute(words[5])
+        rel = shlex.split(words[4])[3]
+        base = absolute(rel)
         buf, found = io.BytesIO(), False
         with tarfile.open(fileobj=buf, mode="w", format=tarfile.USTAR_FORMAT) as tar:
             for path in sorted(files):
                 if path == base or path.startswith(base + "/"):
                     found = True
                     data = base64.b64decode(files[path])
-                    info = tarfile.TarInfo(words[5].rstrip("/") + path[len(base):])
+                    info = tarfile.TarInfo(rel.rstrip("/") + path[len(base):])
                     info.size, info.mtime = len(data), MTIME
                     tar.addfile(info, io.BytesIO(data))
-        if not found:  # nothing there: tar's own error instead of an archive
-            return f"tar: {words[5]}: No such file or directory\n".encode()
-        return buf.getvalue()
+        failed = b"PHONE_RELAY_TAR_FAILED" + bytes([10])
+        if not found:  # nothing there: no archive, and tar fails
+            return failed
+        return buf.getvalue() + (failed if state.get("tar_unreadable") else b"")
     if words[2:4] == ["sh", "-c"]:  # the client's folder listing, of a relative path
         inner = words[4]
         rel = shlex.split(inner[len("if [ -d "):inner.index(" ]")])[0]

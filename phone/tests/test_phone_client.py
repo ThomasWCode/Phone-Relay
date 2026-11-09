@@ -1028,6 +1028,19 @@ class DecrastinationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             await ctl.handle("run_as_archive", {"package": "com.example.tiny", "path": "nothing"}, FakeRelay())
         self.assertEqual(cm.exception.code, "not_found")
 
+    async def test_run_as_archive_refuses_an_incomplete_one(self):
+        # tar left out a file it could not read: its header is whole, but the backup is not, so nothing is sent
+        ctl, adb = controller()
+        adb.state["tar_unreadable"] = True
+        relay = FakeRelay()
+        with self.assertRaises(pc.CommandError) as cm:
+            await ctl.handle("run_as_archive", {"package": "com.example.tiny", "path": "files"}, relay)
+        self.assertEqual(cm.exception.code, "device_error")
+        self.assertIn("incomplete", cm.exception.detail)
+        self.assertEqual(relay.received(), b"")
+        self.assertEqual(pc.run_as_tar("com.example.tiny", "files"),
+                         "run-as com.example.tiny sh -c 'tar -cf - files 2>/dev/null || echo PHONE_RELAY_TAR_FAILED'")
+
     async def test_run_as_push_then_delete(self):
         ctl, adb = controller()
         root = fake_adb.DATA_ROOT + "com.example.tiny/"

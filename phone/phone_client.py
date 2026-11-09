@@ -77,6 +77,8 @@ UI_DUMP_PATH = "/data/local/tmp/phone_relay_ui.xml"
 REFUSED_MARKER = "PHONE_RELAY_REFUSED"
 # Printed by a shell command when the path it was given does not exist or cannot be read.
 MISSING_MARKER = "PHONE_RELAY_MISSING"
+# Printed after an archive when tar did not finish cleanly (a file it could not read was left out).
+TAR_FAILED_MARKER = "PHONE_RELAY_TAR_FAILED"
 # Files and recordings cross the relay socket in chunks of this size, at most STREAM_WINDOW unacknowledged.
 STREAM_CHUNK = 256 * 1024
 STREAM_WINDOW = 8
@@ -690,6 +692,14 @@ def parse_content(out: str, projection: list[str] | None) -> list[dict]:
                 row[k] = None if value == "NULL" else value
         rows.append(row)
     return rows
+
+
+def run_as_tar(package: str, path: str) -> str:
+    """A folder of the app's own data as a tar on stdout. tar's messages are kept out of the archive's
+    bytes, and if it did not finish cleanly (a file it could not read was left out), TAR_FAILED_MARKER
+    follows the archive: a whole archive ends in zero blocks, never in that text."""
+    script = f"tar -cf - {shlex.quote(path)} 2>/dev/null || echo {TAR_FAILED_MARKER}"
+    return f"run-as {package} sh -c {shlex.quote(script)}"
 
 
 def is_tar(data: bytes) -> bool:
@@ -2007,11 +2017,15 @@ class PhoneController:
         local = _local_temp(".tar")
         try:
             # To a local file as it comes, never whole into memory
-            await self.adb.exec_out_to_file(f"run-as {package} tar -cf - {shlex.quote(path)}", local)
+            await self.adb.exec_out_to_file(run_as_tar(package, path), local)
             with open(local, "rb") as f:
                 head = f.read(512)
-            if not is_tar(head):  # exec-out passes run-as's or tar's error on as if it were the archive
-                raise CommandError("not_found", f"{path} could not be archived: {_file_tail(local).strip()}")
+            failed = _file_tail(local, 64).rstrip().endswith(TAR_FAILED_MARKER)
+            if not is_tar(head):  # exec-out passes run-as's error on as if it were the archive
+                detail = "it does not exist or cannot be read" if failed else _file_tail(local).strip()
+                raise CommandError("not_found", f"{path} could not be archived: {detail}")
+            if failed:  # a whole archive's header, but tar left out something it could not read
+                raise CommandError("device_error", f"tar could not read all of {path}: the archive would be incomplete")
             size = await channel.send_file(local, "application/x-tar", {"X-Package": package, "X-File-Path": path})
         finally:
             _remove(local)
