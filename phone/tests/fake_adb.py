@@ -509,8 +509,18 @@ def run(cmd, state, stdin=None):
         return b""
     if cmd.startswith("dumpsys package "):
         return package_dump(shlex.split(cmd)[2], state).encode()
+    if cmd.startswith("pm path "):
+        p = state.get("packages", {}).get(shlex.split(cmd)[2])
+        return (f"package:{p['apk']}\n" if p else "").encode()
+    m = re.match(r"cat (\S+) \| pm install -r -S \$\(stat -c %s \1\) 2>&1", cmd)
+    if m:  # the APK streamed in by the shell, which can read shared storage
+        return install(shlex.split(m.group(1))[0], state).encode()
     if cmd.startswith("pm install -r "):
-        return install(shlex.split(cmd)[3], state).encode()
+        path = shlex.split(cmd)[3]
+        if path.startswith(("/sdcard/", "/storage/")):  # the system server opens the file itself, and SELinux refuses it
+            return (f"System server has no access to read file context u:object_r:fuse:s0 (from path {path}, context u:r:system_server:s0)\n"
+                    f"Error: Unable to open file: {path}\nConsider using a file under /data/local/tmp/\n").encode()
+        return install(path, state).encode()
     if cmd.startswith("logcat -d"):
         return logcat(cmd, state).encode()
     if cmd == "settings get secure enabled_accessibility_services":

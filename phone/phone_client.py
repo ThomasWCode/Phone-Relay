@@ -531,6 +531,13 @@ def parse_accessibility(enabled_setting: str, dumpsys: str) -> dict:
     return {"enabled": enabled, "bound": bound, "missing": [c for c in enabled if c not in bound]}
 
 
+def install_command(path: str) -> str:
+    """`pm install -r` (never -d) with the APK streamed in by the shell (-S its size): the system server
+    cannot open a file in shared storage itself (SELinux), so `pm install /sdcard/...` fails."""
+    q = shlex.quote(path)
+    return f"cat {q} | pm install -r -S $(stat -c %s {q}) 2>&1 || true"
+
+
 def parse_install(out: str) -> str | None:
     """`pm install`'s error ("INSTALL_FAILED_...: its reason"), or None when it says Success."""
     if re.search(r"^Success\s*$", out, re.MULTILINE):
@@ -538,7 +545,7 @@ def parse_install(out: str) -> str | None:
     m = re.search(r"Failure \[([A-Z_]+)(?::\s*(.*?))?\]\s*$", out, re.MULTILINE)
     if m:
         return m.group(1) + (f": {m.group(2)}" if m.group(2) else "")
-    return out.strip()[-300:] or "pm install printed nothing"
+    return out.strip()[:300] or "pm install printed nothing"
 
 
 def parse_settings(out: str) -> tuple[str | None, str | None]:
@@ -635,9 +642,11 @@ def parse_content(out: str, projection: list[str] | None) -> list[dict]:
 
     A value may hold ", " and newlines: with a projection the columns are found in their order,
     so only a value holding ", <next column>=" is cut short; without one, at each ", name=".
-    The provider's errors go to stderr while `content` still exits 0, so they are looked for here.
+    The provider's errors go to stderr while `content` still exits 0, so they are looked for here,
+    before the first row only: a value's later lines may start with anything ("Exception handling").
     """
-    if re.search(r"^(Error while accessing provider|Exception|java\.|\[ERROR\])", out, re.MULTILINE):
+    before_rows = "" if out.startswith("Row: ") else out.split("\nRow: ", 1)[0]
+    if re.search(r"^(Error while accessing provider|Exception|java\.|\[ERROR\])", before_rows, re.MULTILINE):
         raise CommandError("content_failed", out.strip()[:300])
     if out.strip() == "No result found." or not out.strip():
         return []
@@ -1822,6 +1831,11 @@ class PhoneController:
         info = parse_package(await self.adb.shell(f"dumpsys package {shlex.quote(name)}"), name)
         if info is None:
             raise CommandError("not_found", f"{name} is not installed")
+        # The base APK by its own name (listed first): a preinstalled app's folder may hold Settings.apk, not base.apk
+        out = await self.adb.shell(f"pm path {shlex.quote(name)} 2>/dev/null")
+        paths = [ln[len("package:"):].strip() for ln in out.splitlines() if ln.startswith("package:")]
+        if paths:
+            info["apk_path"] = paths[0]
         return info
 
     async def _read_range(self, path: str, offset: int, length: int) -> bytes:
@@ -1890,7 +1904,7 @@ class PhoneController:
             _remove(local)
         if apk["package"] != package:
             raise CommandError("package_mismatch", f"{path} is {apk['package']}, not {package}")
-        error = parse_install(await self._guarded(f"pm install -r {shlex.quote(path)} 2>&1 || true", args))
+        error = parse_install(await self._guarded(install_command(path), args))
         if error:
             raise CommandError("install_failed", error)
         info = await self._package(package)
@@ -2010,7 +2024,12 @@ class PhoneController:
         if written != str(size):
             await self.adb.shell(f"run-as {package} rm -f -- {shlex.quote(part)}")
             raise CommandError("device_error", f"wrote {written[:100]!r} bytes of {size}")
-        out = await self.adb.shell(f"run-as {package} mv -f -- {shlex.quote(part)} {shlex.quote(path)} 2>&1")
+        # With if_foreground, the file is replaced only if that app is still in front (the upload took a while)
+        try:
+            out = await self._guarded(f"run-as {package} mv -f -- {shlex.quote(part)} {shlex.quote(path)} 2>&1", args)
+        except CommandError:
+            await self.adb.shell(f"run-as {package} rm -f -- {shlex.quote(part)}")
+            raise
         if out.strip():
             raise CommandError("device_error", out.strip()[-300:])
         return {"package": package, "path": path, "bytes": size}

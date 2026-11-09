@@ -871,7 +871,9 @@ class ReleaseCommandTests(unittest.IsolatedAsyncioTestCase):
         await self.push_tiny(ctl)
         res = await ctl.handle("install", {"path": "/sdcard/Download/tiny.apk", "package": "com.example.tiny"})
         self.assertEqual(res, {"package": "com.example.tiny", "version_name": "1.2.3-test", "version_code": 42})
-        self.assertIn("pm install -r /sdcard/Download/tiny.apk 2>&1 || true", adb.executed)
+        # Streamed in by the shell: the system server cannot open a file in shared storage itself
+        self.assertIn("cat /sdcard/Download/tiny.apk | pm install -r -S $(stat -c %s /sdcard/Download/tiny.apk) 2>&1 || true",
+                      adb.executed)
         self.assertFalse(any(" -d" in c for c in adb.executed if c.startswith("pm ")))
 
     async def test_install_refuses_another_package_and_reports_androids_error(self):
@@ -917,6 +919,17 @@ class ReleaseCommandTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(pc.CommandError) as cm:
             await ctl.handle("package", {"name": "com.example.missing"})
         self.assertEqual(cm.exception.code, "not_found")
+
+    async def test_package_of_a_preinstalled_app_names_its_own_apk(self):
+        # A preinstalled app's code folder holds Settings.apk, not base.apk: pm path names it
+        ctl, adb = controller()
+        apk = "/system/priv-app/Settings/Settings.apk"
+        adb.state["files"][apk] = adb.state["files"][fake_adb.TINY_INSTALLED]
+        adb.state["packages"]["com.android.settings"] = {"version_code": 36, "version_name": "16", "debuggable": False,
+                                                         "enabled": 0, "apk": apk}
+        res = await ctl.handle("package", {"name": "com.android.settings"})
+        self.assertEqual(res["apk_path"], apk)
+        self.assertEqual(res["signing_sha256"], [fake_adb.TINY_SHA256])
 
     async def test_package_apk_streams_the_installed_apk(self):
         ctl, _ = controller()
@@ -991,6 +1004,9 @@ class DecrastinationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             await ctl.handle("content", {"uri": "content://nowhere/x"})
         self.assertEqual(cm.exception.code, "content_failed")
         self.assertTrue(cm.exception.detail.startswith("Error while accessing provider:content://nowhere/x"))
+        # A value's later line that starts like an error is still the value
+        self.assertEqual(pc.parse_content("Row: 0 description=Notes\nException handling workshop\n", ["description"]),
+                         [{"description": "Notes\nException handling workshop"}])
         for bad in [{"uri": "https://x"}, {"uri": "content://a", "projection": ["a;b"]}, {"uri": "content://a", "sort": "a;b"}]:
             with self.assertRaises(pc.CommandError, msg=repr(bad)):
                 await ctl.handle("content", bad)
@@ -1033,6 +1049,24 @@ class DecrastinationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             await ctl.handle("run_as_push", {"package": "com.example.tiny", "path": "files"}, FakeRelay(upload(b"x")))
         self.assertEqual(cm.exception.code, "invalid_args")
         self.assertNotIn(root + "files/.files.part", adb.state["files"])
+
+    async def test_run_as_push_rechecks_the_foreground_before_replacing(self):
+        ctl, adb = controller()
+        root = fake_adb.DATA_ROOT + "com.example.tiny/"
+        before = adb.state["files"][root + "files/plan.json"]
+
+        class Switching(FakeRelay):
+            async def recv_file(self, path):
+                n = await super().recv_file(path)
+                adb.state["foreground"] = "com.android.settings"  # the owner switched apps during the upload
+                return n
+
+        with self.assertRaises(pc.CommandError) as cm:
+            await ctl.handle("run_as_push", {"package": "com.example.tiny", "path": "files/plan.json",
+                                             "if_foreground": "com.android.chrome"}, Switching(upload(b"new")))
+        self.assertEqual(cm.exception.code, "foreground_mismatch")
+        self.assertEqual(adb.state["files"][root + "files/plan.json"], before)
+        self.assertNotIn(root + "files/.plan.json.part", adb.state["files"])
 
     async def test_run_as_kill(self):
         ctl, adb = controller()
