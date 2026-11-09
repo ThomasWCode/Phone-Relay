@@ -24,7 +24,10 @@ import kotlinx.serialization.json.put
  * keyboard); keys are what an app can do (Keys), any key reaching a focused field; recording and
  * audio go through MediaProjection, whose consent prompt the accessibility service answers. What
  * only the shell user can do (Chrome DevTools, other keys, typing with no field focused) goes
- * through the shell bridge: the app's own adb connection to this phone (AdbShell), once paired.
+ * through the shell bridge: the app's own adb connection to this phone (AdbShell), once paired. So
+ * do the release checks that read the shell's view of the phone (installs, accessibility, logcat,
+ * settings, run-as, intents as the shell user); what is installed of a package and its APK come
+ * from PackageManager, so they work off Wi-Fi too.
  */
 class Commands(
     private val device: Device,
@@ -68,6 +71,14 @@ class Commands(
         "files" to { a, _ -> files(a) },
         "pull" to { a, s -> pull(a, s ?: noStream("pull")) },
         "push" to { a, s -> push(a, s ?: noStream("push")) },
+        "install" to { a, _ -> install(a) },
+        "accessibility" to { _, _ -> accessibility() },
+        "logcat" to { a, _ -> logcat(a) },
+        "package" to { a, _ -> packageDetails(a) },
+        "package_apk" to { a, s -> packageApk(a, s ?: noStream("package_apk")) },
+        "run_as" to { a, s -> runAs(a, s ?: noStream("run_as")) },
+        "run_as_files" to { a, _ -> runAsFiles(a) },
+        "settings" to { a, _ -> settings(a) },
     )
 
     /** The commands this client runs, announced to the relay in hello and in /state. */
@@ -330,7 +341,7 @@ class Commands(
         return buildJsonObject { put("url", url); put("package", pkg) }
     }
 
-    private fun intent(args: JsonObject): JsonObject {
+    private suspend fun intent(args: JsonObject): JsonObject {
         val categories = when (val c = args["categories"]) {
             null, is JsonNull -> emptyList()
             is JsonArray -> c.map { (it as? JsonPrimitive)?.takeIf { p -> p.isString && p.content.isNotEmpty() }?.content
@@ -360,8 +371,27 @@ class Commands(
         if (listOf(spec.action, spec.data, spec.component, spec.pkg).all { it == null }) {
             throw CommandError("invalid_args", "give at least one of action, data, component or package")
         }
+        if (args.boolArg("as_shell", false)) return shellIntent(spec, args)
         return buildJsonObject { put("output", device.startIntent(spec)) }
     }
+
+    /**
+     * The intent sent by the shell user (`am`, through the shell bridge), whose permissions (DUMP, ...)
+     * the app lacks: only to a named component, so it is never a way to run anything else.
+     */
+    private suspend fun shellIntent(spec: IntentSpec, args: JsonObject): JsonObject {
+        if (spec.component == null || !ShellCommands.COMPONENT_RE.matches(spec.component)) {
+            throw CommandError("invalid_args", "as_shell needs component, e.g. com.example.app/.debug.Command")
+        }
+        val out = device.shell(ShellCommands.am(spec), guard(args))
+        if (!spec.broadcast && Regex("^(Error|Exception|java\\.)", RegexOption.MULTILINE).containsMatchIn(out)) {
+            throw CommandError("launch_failed", out.trim().takeLast(300))
+        }
+        return buildJsonObject { put("output", out.trim().takeLast(500)) }
+    }
+
+    /** The foreground check for a shell command, run once the bridge is up, just before it (null without if_foreground). */
+    private fun guard(args: JsonObject): (() -> Unit)? = args.ifForeground()?.let { packages -> { requireForeground(packages) } }
 
     // ---- system ----
 
@@ -627,15 +657,122 @@ class Commands(
         return buildJsonObject { put("path", p); put("bytes", size) }
     }
 
+    // ---- releases: installing, and what is installed; accessibility, logs, settings; an app's own files ----
+
+    private fun packageName(args: JsonObject, name: String, what: String): String =
+        args.packageArg(name) ?: throw CommandError("invalid_args", "$name must be $what")
+
+    /**
+     * Installs an APK already on the phone over the app that is there (`pm install -r`, through the
+     * shell bridge): never with -d (a downgrade), and nothing here uninstalls or clears data. The
+     * APK's own package must be the one named. Android's refusal (INSTALL_FAILED_...) is the error.
+     * Installing Phone Relay itself ends the app before it can reply.
+     */
+    private suspend fun install(args: JsonObject): JsonObject {
+        val p = path(args)
+        val pkg = packageName(args, "package", "the APK's Android package name")
+        val apk = device.apkInfo(p)
+        if (apk.pkg != pkg) throw CommandError("package_mismatch", "$p is ${apk.pkg}, not $pkg")
+        ShellCommands.parseInstall(device.shell(ShellCommands.install(p), guard(args)))?.let { throw CommandError("install_failed", it) }
+        val installed = device.packageDetails(pkg)
+        return buildJsonObject {
+            put("package", pkg); put("version_name", installed.versionName); put("version_code", installed.versionCode)
+        }
+    }
+
+    private fun strings(list: List<String>?) = list?.let { l -> JsonArray(l.map { JsonPrimitive(it) }) } ?: JsonNull
+
+    private suspend fun accessibility(): JsonObject {
+        val a = ShellCommands.parseAccessibility(device.shell(ShellCommands.ACCESSIBILITY))
+        return buildJsonObject { put("enabled", strings(a.enabled)); put("bound", strings(a.bound)); put("missing", strings(a.missing)) }
+    }
+
+    private suspend fun logcat(args: JsonObject): JsonObject {
+        val (command, lines) = ShellCommands.logcatCommand(args)
+        val got = ShellCommands.logcatResult(device.shell(command), lines)
+        return buildJsonObject { put("count", got.lines.size); put("truncated", got.truncated); put("lines", strings(got.lines)) }
+    }
+
+    private suspend fun settings(args: JsonObject): JsonObject {
+        val (namespace, key) = ShellCommands.settingsCommand(args)
+        val (value, night) = ShellCommands.parseSettings(device.shell(ShellCommands.settings(namespace, key)))
+        return buildJsonObject { put("namespace", namespace); put("key", key); put("value", value); put("night_mode", night) }
+    }
+
+    private fun packageDetails(args: JsonObject): JsonObject {
+        val d = device.packageDetails(packageName(args, "name", "an Android package name"))
+        return buildJsonObject {
+            put("name", d.name)
+            put("version_name", d.versionName)
+            put("version_code", d.versionCode)
+            put("first_install_time", d.firstInstallTime)
+            put("last_update_time", d.lastUpdateTime)
+            put("debuggable", d.debuggable)
+            put("enabled_state", d.enabledState)
+            put("apk_path", d.apkPath)
+            put("signing_sha256", strings(d.signingSha256.ifEmpty { null }))
+        }
+    }
+
+    /** The installed APK (its base.apk), streamed as a pull is: Android lets any app read an installed APK. */
+    private suspend fun packageApk(args: JsonObject, stream: Stream): JsonObject {
+        val name = packageName(args, "name", "an Android package name")
+        val d = device.packageDetails(name)
+        val size = device.openRead(d.apkPath).use {
+            stream.sendFile(it, device.stat(d.apkPath).size, APK_MIME, mapOf("X-Version-Code" to d.versionCode.toString(), "X-File-Path" to d.apkPath))
+        }
+        return buildJsonObject { put("name", name); put("path", d.apkPath); put("version_code", d.versionCode); put("bytes", size) }
+    }
+
+    /** run-as reads only a debuggable app's files: anything else is refused here first. */
+    private fun debuggable(pkg: String) {
+        if (!device.packageDetails(pkg).debuggable) throw CommandError("not_debuggable", "$pkg is not debuggable: run-as cannot read its files")
+    }
+
+    private suspend fun runAsFiles(args: JsonObject): JsonObject {
+        val pkg = packageName(args, "package", "an Android package name")
+        val p = ShellCommands.dataPath(args, required = false) ?: "."
+        debuggable(pkg)
+        val out = device.shell(ShellCommands.runAsList(pkg, p))
+        if (ShellCommands.MISSING_MARKER in out) throw CommandError("not_found", "$p does not exist in $pkg's data, or cannot be read")
+        val entries = out.lines().mapNotNull(ShellCommands::parseStat)
+        return buildJsonObject {
+            put("package", pkg); put("path", p); put("count", entries.size); put("entries", JsonArray(entries.map(::entryJson)))
+        }
+    }
+
+    /** A file in a debuggable app's own storage (`run-as PACKAGE cat PATH`), read-only, streamed as a pull is. */
+    private suspend fun runAs(args: JsonObject, stream: Stream): JsonObject {
+        val pkg = packageName(args, "package", "an Android package name")
+        val p = ShellCommands.dataPath(args)!!
+        debuggable(pkg)
+        val entry = device.shell(ShellCommands.runAsStat(pkg, p)).lines().firstNotNullOfOrNull(ShellCommands::parseStat)
+            ?: throw CommandError("not_found", "$p does not exist in $pkg's data, or cannot be read")
+        if (entry.type != "file") throw CommandError("invalid_args", "$p is a ${entry.type}; list a folder with /run-as/files")
+        val out = device.shellToFile(ShellCommands.runAsCat(pkg, p))
+        try {
+            // run-as's own errors arrive as if they were the file: a size other than stat's is one
+            val got = device.ownFileSize(out)
+            if (got != entry.size) throw CommandError("device_error", "read $got bytes of ${entry.size}")
+            val mime = URLConnection.guessContentTypeFromName(p) ?: "application/octet-stream"
+            val size = device.openRead(out).use { stream.sendFile(it, got, mime, mapOf("X-File-Path" to p, "X-Package" to pkg)) }
+            return buildJsonObject { put("package", pkg); put("path", p); put("bytes", size) }
+        } finally {
+            runCatching { device.deleteFile(out) }
+        }
+    }
+
     companion object {
         const val TAP_MS = 50L
+        const val APK_MIME = "application/vnd.android.package-archive"
         const val RECORD_BIT_RATE = 2_000_000
         val AUDIO_SOURCES = listOf("output", "mic")
         val WAIT_KINDS = listOf("change", "stable", "foreground", "text")
         val BATCH_COMMANDS = listOf(
             "state", "screenshot", "ui", "tap", "swipe", "type", "key", "launch", "open", "intent", "notifications",
             "statusbar", "rotation", "wait", "files", "gesture", "clipboard_set", "clipboard_get", "record_start",
-            "chrome_tabs", "chrome_eval", "chrome_cdp", "chrome_new", "chrome_close", "chrome_activate", "sleep",
+            "chrome_tabs", "chrome_eval", "chrome_cdp", "chrome_new", "chrome_close", "chrome_activate", "install",
+            "accessibility", "logcat", "package", "settings", "run_as_files", "sleep",
         )
         /** A key the shell may be given: a KEYCODE_* name or a number. */
         private val SHELL_KEY = Regex("^(KEYCODE_[A-Z0-9_]{1,40}|\\d{1,4})$")

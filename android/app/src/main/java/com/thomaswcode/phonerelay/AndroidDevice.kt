@@ -8,6 +8,8 @@ import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Path
@@ -25,6 +27,7 @@ import android.view.Display
 import android.view.KeyEvent
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityNodeInfo
+import com.thomaswcode.phonerelay.commands.ApkInfo
 import com.thomaswcode.phonerelay.commands.CommandError
 import com.thomaswcode.phonerelay.commands.Device
 import com.thomaswcode.phonerelay.commands.DevToolsLink
@@ -33,6 +36,7 @@ import com.thomaswcode.phonerelay.commands.FileEntry
 import com.thomaswcode.phonerelay.commands.Frame
 import com.thomaswcode.phonerelay.commands.GlobalAction
 import com.thomaswcode.phonerelay.commands.IntentSpec
+import com.thomaswcode.phonerelay.commands.PackageDetails
 import com.thomaswcode.phonerelay.commands.Paths
 import com.thomaswcode.phonerelay.commands.Point
 import com.thomaswcode.phonerelay.commands.Rotation
@@ -48,6 +52,10 @@ import java.io.FileOutputStream
 import java.io.InputStream
 import java.io.OutputStream
 import java.nio.file.Files
+import java.security.MessageDigest
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.CompletableDeferred
@@ -392,6 +400,17 @@ class AndroidDevice(
 
     override suspend fun shell(command: String, guard: (() -> Unit)?): String = adb.run(command, guard)
 
+    override suspend fun shellToFile(command: String, guard: (() -> Unit)?): String {
+        val file = File.createTempFile("shell", ".out", context.cacheDir)
+        try {
+            adb.runToFile(command, file, guard)
+        } catch (e: Throwable) { // a cancellation too
+            file.delete()
+            throw e
+        }
+        return file.path
+    }
+
     override suspend fun <T> devtools(socket: String, work: suspend (DevToolsLink) -> T): T {
         val bridge = DevToolsBridge(adb, socket, version)
         try {
@@ -475,6 +494,48 @@ class AndroidDevice(
                 is Boolean -> intent.putExtra(key, v)
             }
         }
+    }
+
+    // ---- packages ----
+
+    override fun apkInfo(path: String): ApkInfo {
+        if (!File(path).canRead()) unreadable(path)
+        val info = context.packageManager.getPackageArchiveInfo(path, PackageManager.PackageInfoFlags.of(0))
+            ?: throw CommandError("invalid_args", "$path is not an APK Android can read")
+        return ApkInfo(info.packageName, info.versionName, info.longVersionCode)
+    }
+
+    override fun packageDetails(name: String): PackageDetails {
+        val pm = context.packageManager
+        val info = try {
+            pm.getPackageInfo(name, PackageManager.PackageInfoFlags.of(PackageManager.GET_SIGNING_CERTIFICATES.toLong()))
+        } catch (e: PackageManager.NameNotFoundException) {
+            throw CommandError("not_found", "$name is not installed")
+        }
+        val app = info.applicationInfo ?: throw CommandError("not_found", "$name has no application")
+        // As `dumpsys package` prints its times, which logcat's -t takes.
+        val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+        val sha256 = MessageDigest.getInstance("SHA-256")
+        return PackageDetails(
+            name = name,
+            versionName = info.versionName,
+            versionCode = info.longVersionCode,
+            firstInstallTime = time.format(Date(info.firstInstallTime)),
+            lastUpdateTime = time.format(Date(info.lastUpdateTime)),
+            signingSha256 = info.signingInfo?.apkContentsSigners.orEmpty().map { sig ->
+                sha256.digest(sig.toByteArray()).joinToString("") { "%02x".format(it) }
+            }.distinct(),
+            debuggable = app.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0,
+            enabledState = when (pm.getApplicationEnabledSetting(name)) {
+                PackageManager.COMPONENT_ENABLED_STATE_DEFAULT -> "default"
+                PackageManager.COMPONENT_ENABLED_STATE_ENABLED -> "enabled"
+                PackageManager.COMPONENT_ENABLED_STATE_DISABLED -> "disabled"
+                PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER -> "disabled_user"
+                PackageManager.COMPONENT_ENABLED_STATE_DISABLED_UNTIL_USED -> "disabled_until_used"
+                else -> "unknown"
+            },
+            apkPath = app.sourceDir,
+        )
     }
 
     override fun notifications(): List<JsonObject> =

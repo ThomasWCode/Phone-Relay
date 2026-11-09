@@ -50,6 +50,25 @@ data class IntentSpec(
 
 data class FileEntry(val name: String, val type: String, val size: Long, val modified: Long)
 
+/** An APK file's own package and version, read from the file. */
+data class ApkInfo(val pkg: String, val versionName: String?, val versionCode: Long)
+
+/** What is installed of a package, as /package reports it (times in the phone's local time, as `dumpsys package` prints them). */
+data class PackageDetails(
+    val name: String,
+    val versionName: String?,
+    val versionCode: Long,
+    val firstInstallTime: String,
+    val lastUpdateTime: String,
+    /** Each current signer's certificate, its SHA-256 in hex. */
+    val signingSha256: List<String>,
+    val debuggable: Boolean,
+    /** default, enabled, disabled, disabled_user or disabled_until_used (PackageManager's COMPONENT_ENABLED_STATE_*). */
+    val enabledState: String,
+    /** The installed APK (base.apk). */
+    val apkPath: String,
+)
+
 /** The owner's answer to a request: true to accept, false to deny, null when it expired unanswered; and what they typed. */
 data class Answer(val accepted: Boolean?, val message: String?)
 
@@ -130,6 +149,16 @@ interface Device {
      * throws to refuse it (the foreground check: setting the bridge up can take seconds).
      */
     suspend fun shell(command: String, guard: (() -> Unit)? = null): String
+    /**
+     * Runs a command as shell() does and writes its output, byte for byte, to a file of the app's own
+     * (for a file's bytes, which the shell's text would not keep); its path. ownFileSize, openRead and
+     * deleteFile take it.
+     */
+    suspend fun shellToFile(command: String, guard: (() -> Unit)? = null): String
+    /** An APK file's package and version; not_found when the app cannot read it, invalid_args when it is not an APK. */
+    fun apkInfo(path: String): ApkInfo
+    /** What is installed of a package; not_found when it is not installed. */
+    fun packageDetails(name: String): PackageDetails
     /** Runs `work` on a DevTools socket (chrome_devtools_remote, or a debuggable WebView's) through the shell bridge. */
     suspend fun <T> devtools(socket: String, work: suspend (DevToolsLink) -> T): T
     /** AudioManager.ADJUST_RAISE (1), ADJUST_LOWER (-1), ADJUST_TOGGLE_MUTE (101). */

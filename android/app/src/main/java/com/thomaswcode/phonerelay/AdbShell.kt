@@ -187,6 +187,19 @@ class AdbShell(private val context: Context) {
         }
     }
 
+    /** Runs a command as run() does, writing its output byte for byte to `file` (a file's bytes, which text would not keep). */
+    suspend fun runToFile(command: String, file: File, guard: (() -> Unit)? = null) {
+        val stream = open("exec:$command", guard)
+        try {
+            runInterruptible(Dispatchers.IO) {
+                file.outputStream().use { out -> EndAwareInput(stream).copyTo(out) }
+            }
+            Log.i(TAG, "shell: a ${command.length}-character command gave ${file.length()} bytes to a file")
+        } finally {
+            runCatching { stream.close() }
+        }
+    }
+
     /** Everything the stream gives until the command ends. */
     private fun readAll(stream: AdbStream): ByteArray {
         val input = EndAwareInput(stream)

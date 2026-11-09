@@ -16,6 +16,8 @@ private val PACKAGE_RE = Regex("^[A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)*$")
 /** A command's deadline when the relay sends none (seconds), as the adb client's DEFAULT_TIMEOUT_S. */
 const val DEFAULT_TIMEOUT_S = 30.0
 const val TRANSFER_TIMEOUT_S = 300.0
+/** Installing an APK: Android compiles it before it replies (as the relay's INSTALL_TIMEOUT_S). */
+const val INSTALL_TIMEOUT_S = 120.0
 /** How long a request waits for the owner's answer when the agent gives no `seconds`, as the relay's DEFAULT_REQUEST_S. */
 const val DEFAULT_REQUEST_S = 300.0
 
@@ -88,7 +90,8 @@ fun defaultTimeout(cmd: String, args: JsonObject): Double = when (cmd) {
     "type" -> DEFAULT_TIMEOUT_S + ((args["text"] as? JsonPrimitive)?.content?.length ?: 0) / 10.0
     "swipe", "gesture" -> DEFAULT_TIMEOUT_S + maxOf(args.number("ms") ?: 0.0, 0.0) / 1000
     "wait" -> DEFAULT_TIMEOUT_S + (args.number("seconds") ?: 10.0)
-    "pull", "push", "record_stop" -> TRANSFER_TIMEOUT_S
+    "pull", "push", "record_stop", "package_apk", "run_as" -> TRANSFER_TIMEOUT_S
+    "install" -> INSTALL_TIMEOUT_S
     // As the adb client: twice the recording's length, a minute on top (the consent prompt, the transfer).
     "record", "audio" -> 2 * DEFAULT_TIMEOUT_S + 2 * (args.number("seconds") ?: 10.0)
     "batch" -> DEFAULT_TIMEOUT_S + ((args["steps"] as? JsonArray) ?: JsonArray(emptyList())).sumOf { step ->
