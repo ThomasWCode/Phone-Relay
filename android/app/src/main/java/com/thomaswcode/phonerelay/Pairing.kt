@@ -78,6 +78,8 @@ class PairingReceiver : BroadcastReceiver() {
             try {
                 app.shell.pair(code)
                 Pairing.done(context, context.getString(R.string.pairing_done))
+                // The relay and "On mobile data too" were on before the pairing: the port is opened now, while still on Wi-Fi.
+                app.scope.launch { app.shell.prepare() }
             } catch (e: CommandError) {
                 Pairing.ask(context, e.detail)
             } catch (e: Exception) {
