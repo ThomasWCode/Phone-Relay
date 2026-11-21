@@ -372,6 +372,12 @@ def main():
         check("pull an empty file", s == 200 and b == b"" and h.get("Content-Type") == "text/plain", f"{s} {h}")
         s, _, b = request("GET", "/files/pull?path=/sdcard/Download/missing.pdf")
         check("pull a missing file -> 404", s == 404 and j(b).get("error") == "not_found", f"{s} {b[:200]}")
+        s, _, b = request("POST", "/files/delete", body={"path": "/sdcard/Download/empty.txt"})
+        check("delete a file", s == 200 and j(b).get("deleted") is True, f"{s} {b[:200]}")
+        check("it is gone -> 404", request("POST", "/files/delete", body={"path": "/sdcard/Download/empty.txt"})[0] == 404)
+        check("delete a folder -> 400", request("POST", "/files/delete", body={"path": "/sdcard/Download"})[0] == 400)
+        s, _, b = request("POST", "/awake", body={"seconds": 60})
+        check("holding the screen on is the app's -> 501", s == 501 and j(b).get("error") == "unsupported", f"{s} {b[:200]}")
         check("pull a folder -> 400", request("GET", "/files/pull?path=/sdcard/Download")[0] == 400)
         check("relative path -> 400", request("GET", "/files?path=sdcard")[0] == 400)
 
