@@ -240,6 +240,7 @@ All endpoints need `Authorization: Bearer <AGENT_TOKEN>`, which the network secr
 | `POST /wait` `{for,seconds?,...}` | Until the screen changes, settles, or an app comes to the front |
 | `POST /batch` `{steps,stop_on_error?}` | Several commands, with sleeps, in one request |
 | `GET /files?path=`, `GET /files/pull?path=`, `POST /files/push?path=` | List, download and upload files of any size, streamed in acknowledged 256 KiB chunks |
+| `POST /files/delete` `{path}` | Delete one file (never a folder) where push can write |
 | `GET /record?seconds=`, `POST /record/start`, `POST /record/stop` | Screen recording (MP4; with the adb client, a zip of segments past 180 s) |
 | `POST /gesture` `{pointers,ms?,scale?}` | Multi-touch: up to 10 fingers, each along a path |
 | `GET /clipboard`, `POST /clipboard` `{text}` | Read or set the clipboard |
@@ -255,6 +256,7 @@ All endpoints need `Authorization: Bearer <AGENT_TOKEN>`, which the network secr
 | `GET /run-as/archive`, `POST /run-as/push`, `POST /run-as/delete`, `POST /run-as/kill` | A debuggable app's folder as a tar; a file written (atomically) or deleted in its storage; its process paused, resumed or ended |
 | `GET /content?uri=&projection=&where=&sort=` | A provider's rows (`content query`, read-only) |
 | `POST /night-mode` `{mode}`, `POST /force-stop` `{package}` | Dark mode; force-stop an app without an enabled accessibility service |
+| `POST /awake` `{seconds}` | The app only: hold the screen on for a task, up to 1800 s an asking, 0 to let it sleep again (it does not turn the screen on; it ends with the connection) |
 
 Every endpoint also takes `if_foreground` (run only while that app, or one of a list, has focus, checked in the same shell command as the action) and `timeout` (seconds, no upper limit; default 30). Unknown fields are dropped and named in `ignored_fields`.
 
