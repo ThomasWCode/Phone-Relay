@@ -179,7 +179,8 @@ private fun Screen(@Suppress("UNUSED_PARAMETER") tick: Int) {
                                 "once after a reboot, and closed when the relay is turned off. adb restarts each time: a " +
                                 "computer's adb connection drops for a moment." +
                                 when (mobilePort) {
-                                    true -> " The port is open."
+                                    true -> if (mobile && enabled) " The port is open."
+                                    else " The port is still open: the app could not close it. Turn USB debugging off and on (Developer options)."
                                     false -> if (mobile && enabled) " The port is not open yet." else " The port is closed."
                                     null -> ""
                                 },

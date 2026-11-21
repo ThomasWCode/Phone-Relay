@@ -244,6 +244,7 @@ class AdbShell(private val context: Context, private val relayOn: () -> Boolean)
         if (mobile && relayOn()) return true // on again meanwhile
         val open = withContext(Dispatchers.IO) { tcpListening() }
         if (open) {
+            _mobilePort.value = null // being closed: neither open nor closed on the app's screen meanwhile
             val m = withContext(Dispatchers.IO) { manager() }
             if (!m.isConnected && !connectTcp(m)) runCatching { connect(m) }
             if (m.isConnected) {
