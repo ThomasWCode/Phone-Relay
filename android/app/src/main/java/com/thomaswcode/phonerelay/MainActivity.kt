@@ -38,12 +38,16 @@ import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.launch
 
 /** The owner's screen: the relay's switch and state, and each grant the app needs, with a way to give it. */
 class MainActivity : ComponentActivity() {
@@ -113,6 +117,8 @@ private fun Screen(@Suppress("UNUSED_PARAMETER") tick: Int) {
     // Shared state: the tile, the widget and the notification switch it too, while this screen is open.
     val enabled by app.enabled.collectAsStateWithLifecycle()
     val askNotifications = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    var mobile by remember { mutableStateOf(app.shell.mobile) }
+    val mobilePort by app.shell.mobilePort.collectAsStateWithLifecycle()
 
     Column(
         Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(20.dp),
@@ -165,6 +171,28 @@ private fun Screen(@Suppress("UNUSED_PARAMETER") tick: Int) {
                         "${context.packageName} android.permission.WRITE_SECURE_SETTINGS",
                     style = MaterialTheme.typography.bodySmall,
                 )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("On mobile data too", style = MaterialTheme.typography.titleSmall)
+                        Text(
+                            "While the relay is on, adb listens on one more port (the app's key still needed), opened on Wi-Fi, " +
+                                "once after a reboot, and closed when the relay is turned off. adb restarts each time: a " +
+                                "computer's adb connection drops for a moment." +
+                                when (mobilePort) {
+                                    true -> if (mobile && enabled) " The port is open."
+                                    else " The port is still open: the app could not close it. Turn USB debugging off and on (Developer options)."
+                                    false -> if (mobile && enabled) " The port is not open yet." else " The port is closed."
+                                    null -> ""
+                                },
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    Switch(checked = mobile, onCheckedChange = { on ->
+                        mobile = on
+                        app.scope.launch { app.shell.setMobile(on) }
+                    })
+                }
                 OutlinedButton(onClick = {
                     Pairing.ask(context)
                     runCatching { context.startActivity(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS)) }

@@ -16,6 +16,8 @@ import android.graphics.Path
 import android.graphics.Rect
 import android.media.AudioManager
 import android.media.MediaScannerConnection
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.BatteryManager
 import android.os.Bundle
@@ -40,6 +42,7 @@ import com.thomaswcode.phonerelay.commands.PackageDetails
 import com.thomaswcode.phonerelay.commands.Paths
 import com.thomaswcode.phonerelay.commands.Point
 import com.thomaswcode.phonerelay.commands.Rotation
+import com.thomaswcode.phonerelay.commands.ShellState
 import com.thomaswcode.phonerelay.commands.Shot
 import com.thomaswcode.phonerelay.commands.Size
 import com.thomaswcode.phonerelay.commands.UiNode
@@ -85,6 +88,19 @@ class AndroidDevice(
 
     override fun battery(): Int? = context.getSystemService(BatteryManager::class.java)
         .getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY).takeIf { it in 0..100 }
+
+    override fun network(): String? {
+        val connectivity = context.getSystemService(ConnectivityManager::class.java)
+        // Under a VPN the capabilities carry the transport underneath as well.
+        val caps = connectivity.activeNetwork?.let { connectivity.getNetworkCapabilities(it) } ?: return null
+        return when {
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "mobile"
+            else -> "other"
+        }
+    }
+
+    override suspend fun shellState(): ShellState = adb.state()
 
     override fun screenSize(): com.thomaswcode.phonerelay.commands.Size {
         val b = context.getSystemService(WindowManager::class.java).maximumWindowMetrics.bounds

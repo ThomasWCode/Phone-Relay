@@ -123,15 +123,19 @@ class Commands(
 
     // ---- see ----
 
-    private fun state(@Suppress("UNUSED_PARAMETER") args: JsonObject): JsonObject {
+    private suspend fun state(@Suppress("UNUSED_PARAMETER") args: JsonObject): JsonObject {
         val size = device.screenSize()
         val rotation = device.rotation()
+        val shell = device.shellState()
         return buildJsonObject {
             put("foreground", device.foreground())
             put("awake", device.awake())
             put("battery", device.battery())
             put("screen", buildJsonObject { put("width", size.width); put("height", size.height) })
             put("rotation", rotationJson(rotation))
+            put("network", device.network())
+            // What the shell bridge's commands (capabilities lists them all the same) would meet now.
+            put("shell", buildJsonObject { put("paired", shell.paired); put("reachable", shell.reachable); put("via", shell.via) })
             put("client", "android-app")
             put("client_version", version)
             put("capabilities", JsonArray(capabilities.map { JsonPrimitive(it) }))
@@ -304,7 +308,7 @@ class Commands(
             return buildJsonObject { put("key", raw) }
         }
         try {
-            keyAction(action)
+            keyAction(action, args)
         } catch (e: CommandError) {
             // What the app cannot press (or has no field for) goes to the shell, as `input keyevent`.
             if (e.code != "unsupported" && e.code != "no_text_field") throw e
@@ -314,7 +318,29 @@ class Commands(
         return buildJsonObject { put("key", raw) }
     }
 
-    private fun keyAction(action: KeyAction) {
+    /**
+     * Turns the screen on, and answers only once it is on: the app's wake lock is a request Android
+     * may not honour (an agent was answered "ok" with the screen still off). When the lock did
+     * nothing the key goes to the shell bridge, and when that cannot run either, or the screen is
+     * still off, the answer is an error, not "ok".
+     */
+    private suspend fun wake(args: JsonObject) {
+        device.wake()
+        if (awakeWithin(WAKE_MS)) return
+        val asleep = CommandError("device_error", "the screen did not turn on")
+        shell("input keyevent KEYCODE_WAKEUP", asleep, args)
+        if (!awakeWithin(WAKE_MS)) throw asleep
+    }
+
+    private suspend fun awakeWithin(ms: Long): Boolean {
+        repeat((ms / 100).toInt()) {
+            if (device.awake()) return true
+            delay(100)
+        }
+        return device.awake()
+    }
+
+    private suspend fun keyAction(action: KeyAction, args: JsonObject) {
         when (action) {
             is KeyAction.Global -> device.globalAction(action.action)
             KeyAction.ImeEnter -> device.imeEnter()
@@ -328,7 +354,7 @@ class Commands(
             is KeyAction.Scroll -> device.scroll(action.forward)
             is KeyAction.Volume -> device.adjustVolume(action.direction)
             is KeyAction.Media -> device.mediaKey(action.keyName)
-            KeyAction.Wake -> device.wake()
+            KeyAction.Wake -> wake(args)
             is KeyAction.Unsupported -> throw CommandError("unsupported", action.reason)
         }
     }
@@ -906,6 +932,8 @@ class Commands(
 
     companion object {
         const val TAP_MS = 50L
+        /** How long the screen is given to come on after a wake. */
+        const val WAKE_MS = 1000L
         /** How often, and how far apart, a write into an app's storage is checked for its whole size. */
         const val WRITE_CHECKS = 25
         const val WRITE_CHECK_MS = 200L

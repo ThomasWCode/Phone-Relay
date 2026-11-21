@@ -10,6 +10,10 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.os.IBinder
 import android.util.Log
 import kotlinx.coroutines.Job
@@ -28,6 +32,13 @@ class RelayService : Service() {
     private val screen = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) = RelayApp.of(context).connection.nudge()
     }
+    /** Wi-Fi joined (or there as the relay starts): the shell bridge's port for mobile data can only be opened there. */
+    private val wifi = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            val app = RelayApp.of(this@RelayService)
+            app.scope.launch { app.shell.prepare() }
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -38,6 +49,9 @@ class RelayService : Service() {
         channel()
         startForeground(NOTIFICATION_ID, notification(app.connection.status.value.label), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         registerReceiver(screen, IntentFilter(Intent.ACTION_SCREEN_ON).apply { addAction(Intent.ACTION_USER_PRESENT) })
+        getSystemService(ConnectivityManager::class.java).registerNetworkCallback(
+            NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build(), wifi,
+        )
         app.connection.start()
         statusJob = app.scope.launch {
             app.connection.status.collectLatest { status ->
@@ -64,6 +78,7 @@ class RelayService : Service() {
         instance = null
         statusJob?.cancel()
         runCatching { unregisterReceiver(screen) }
+        runCatching { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(wifi) }
         RelayApp.of(this).connection.stop()
         super.onDestroy()
     }

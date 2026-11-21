@@ -42,6 +42,9 @@ class FakeDevice : Device {
     override fun foreground() = fg
     override fun awake() = isAwake
     override fun battery() = 87
+    var networkNow: String? = "wifi"
+    override fun network() = networkNow
+    override suspend fun shellState() = ShellState(shellPaired, shellPaired, if (shellPaired) "wireless_debugging" else null)
     override fun screenSize() = Size(1080, 2340)
     override fun rotation() = rotationNow
     override fun setRotation(rotation: Int?) {
@@ -157,6 +160,7 @@ class FakeDevice : Device {
         duringShellSetup?.invoke()
         guard?.invoke()
         shellCommands += command
+        if (command == "input keyevent KEYCODE_WAKEUP" && shellWakes) isAwake = true
         return shellReply(command) ?: if (command == "cat /proc/net/unix") UNIX_SOCKETS else ""
     }
 
@@ -211,8 +215,12 @@ class FakeDevice : Device {
     }
 
     var woken = 0
+    /** Whether the app's wake lock turns the screen on (Android may not honour it), and whether the shell's key does. */
+    var lockWakes = true
+    var shellWakes = true
     override fun wake() {
         woken++
+        if (lockWakes) isAwake = true
     }
 
     override fun launch(pkg: String) {
