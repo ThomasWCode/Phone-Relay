@@ -319,17 +319,15 @@ class Commands(
     }
 
     /**
-     * Turns the screen on, and answers only once it is on. Android ignores an app's wake lock unless
-     * the owner has allowed Turn screen on for it, so when the lock did nothing the key goes to the
-     * shell bridge, and when that cannot run either, the answer is an error, not "ok".
+     * Turns the screen on, and answers only once it is on: the app's wake lock is a request Android
+     * may not honour (an agent was answered "ok" with the screen still off). When the lock did
+     * nothing the key goes to the shell bridge, and when that cannot run either, or the screen is
+     * still off, the answer is an error, not "ok".
      */
     private suspend fun wake(args: JsonObject) {
         device.wake()
         if (awakeWithin(WAKE_MS)) return
-        val asleep = CommandError(
-            "device_error",
-            "the screen did not turn on: allow Turn screen on for Phone Relay (Settings > Apps > Special access > Turn screen on)",
-        )
+        val asleep = CommandError("device_error", "the screen did not turn on")
         shell("input keyevent KEYCODE_WAKEUP", asleep, args)
         if (!awakeWithin(WAKE_MS)) throw asleep
     }

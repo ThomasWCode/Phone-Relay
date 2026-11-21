@@ -215,7 +215,7 @@ class FakeDevice : Device {
     }
 
     var woken = 0
-    /** Whether the app's wake lock turns the screen on (Android ignores it without Turn screen on), and whether the shell's key does. */
+    /** Whether the app's wake lock turns the screen on (Android may not honour it), and whether the shell's key does. */
     var lockWakes = true
     var shellWakes = true
     override fun wake() {

@@ -66,7 +66,7 @@ class CommandsTest {
         device.shellWakes = false
         val asleep = error("key", """{"key": "KEYCODE_WAKEUP"}""")
         assertEquals("device_error", asleep.code)
-        assertTrue("Turn screen on" in asleep.detail, asleep.detail)
+        assertEquals("the screen did not turn on", asleep.detail)
         // No shell bridge: the error says what would have done it.
         device.shellPaired = false
         val noBridge = error("key", """{"key": "KEYCODE_WAKEUP"}""")

@@ -23,12 +23,8 @@
     <uses-permission
         android:name="android.permission.WRITE_SETTINGS"
         tools:ignore="ProtectedPermissions" />
-    <!-- KEYCODE_WAKEUP: turning the screen on. Android 14+ ignores an app's waking lock unless the
-         owner allows Turn screen on for it (Special access). -->
+    <!-- KEYCODE_WAKEUP: turning the screen on. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <uses-permission
-        android:name="android.permission.TURN_SCREEN_ON"
-        tools:ignore="ProtectedPermissions" />
     <!-- /record and /audio: a projection (Android asks before each one; the accessibility service
          answers) and the microphone, each in the relay's service while it runs. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
