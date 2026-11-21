@@ -1,6 +1,7 @@
 package com.thomaswcode.phonerelay
 
 import android.Manifest
+import android.app.AppOpsManager
 import android.app.NotificationManager
 import android.content.ComponentName
 import android.content.Context
@@ -10,6 +11,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
 import android.os.PowerManager
+import android.os.Process
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -102,6 +104,15 @@ private fun grants(context: Context): List<Grant> {
         },
         Grant("Modify system settings", "/rotation", Settings.System.canWrite(context)) {
             Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS, pkg)
+        },
+        Grant("Turn screen on", "the wake key, without the shell bridge",
+            runCatching {
+                context.getSystemService(AppOpsManager::class.java)
+                    .unsafeCheckOpNoThrow("android:turn_screen_on", Process.myUid(), context.packageName) == AppOpsManager.MODE_ALLOWED
+            }.getOrDefault(false)) {
+            // Android's own page for it where there is one, else the app's page (Special access is under Apps).
+            Intent("android.settings.TURN_SCREEN_ON_SETTINGS", pkg).takeIf { it.resolveActivity(context.packageManager) != null }
+                ?: Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, pkg)
         },
         Grant("Microphone", "/audio (both sources: Android needs it for the phone's sound too)",
             context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED,

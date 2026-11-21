@@ -38,6 +38,40 @@ class CommandsTest {
         assertEquals(87, st["battery"]!!.jsonPrimitive.int)
         assertTrue(st["capabilities"]!!.jsonArray.map { it.jsonPrimitive.content }.containsAll(listOf("tap", "type", "pull")))
         assertTrue("chrome_eval" in st["capabilities"]!!.jsonArray.map { it.jsonPrimitive.content }) // through the shell bridge
+        assertEquals("wifi", st.str("network"))
+        assertEquals("""{"paired":false,"reachable":false,"via":null}""", st["shell"].toString())
+        device.shellPaired = true
+        device.networkNow = null
+        val later = run("state")
+        assertEquals(JsonNull, later["network"])
+        assertEquals("""{"paired":true,"reachable":true,"via":"wireless_debugging"}""", later["shell"].toString())
+    }
+
+    @Test
+    fun wakeAnswersOnlyOnceTheScreenIsOn() = runTest {
+        // The app's wake lock turns the screen on: nothing goes to the shell.
+        device.isAwake = false
+        device.shellPaired = true
+        run("key", """{"key": "KEYCODE_WAKEUP"}""")
+        assertEquals(1, device.woken)
+        assertEquals(emptyList(), device.shellCommands)
+        // Android ignores the lock: the key goes to the shell bridge.
+        device.isAwake = false
+        device.lockWakes = false
+        run("key", """{"key": "KEYCODE_WAKEUP"}""")
+        assertEquals(listOf("input keyevent KEYCODE_WAKEUP"), device.shellCommands)
+        assertTrue(device.isAwake)
+        // Neither turns it on: an error, not "ok".
+        device.isAwake = false
+        device.shellWakes = false
+        val asleep = error("key", """{"key": "KEYCODE_WAKEUP"}""")
+        assertEquals("device_error", asleep.code)
+        assertTrue("Turn screen on" in asleep.detail, asleep.detail)
+        // No shell bridge: the error says what would have done it.
+        device.shellPaired = false
+        val noBridge = error("key", """{"key": "KEYCODE_WAKEUP"}""")
+        assertEquals("device_error", noBridge.code)
+        assertTrue("the shell bridge would do it" in noBridge.detail, noBridge.detail)
     }
 
     @Test

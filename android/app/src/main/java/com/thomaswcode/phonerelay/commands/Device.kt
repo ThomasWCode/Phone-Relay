@@ -11,6 +11,13 @@ data class Size(val width: Int, val height: Int)
 
 data class Rotation(val auto: Boolean?, val userRotation: Int?)
 
+/**
+ * How the app's shell bridge stands, read without running a command: whether the owner has paired
+ * it, whether a command would reach adbd now, and over what ("port": its port for mobile data;
+ * "wireless_debugging").
+ */
+data class ShellState(val paired: Boolean, val reachable: Boolean, val via: String?)
+
 /** A screenshot as the relay sends it: JPEG bytes, the image's size, the screen's size, the scale used. */
 class Shot(val jpeg: ByteArray, val width: Int, val height: Int, val realWidth: Int, val realHeight: Int, val scale: Double)
 
@@ -101,6 +108,9 @@ interface Device {
     fun foreground(): String?
     fun awake(): Boolean
     fun battery(): Int?
+    /** What the phone reaches the internet over: "wifi", "mobile", "other", or null with no network. */
+    fun network(): String?
+    suspend fun shellState(): ShellState
     fun screenSize(): Size
     fun rotation(): Rotation
     /** A quarter-turn lock (0-3), or null for automatic rotation. */

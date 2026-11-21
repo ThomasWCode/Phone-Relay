@@ -2,10 +2,13 @@ package com.thomaswcode.phonerelay
 
 import android.content.Context
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.provider.Settings
 import android.util.Log
 import com.thomaswcode.phonerelay.commands.CommandError
+import com.thomaswcode.phonerelay.commands.ShellState
 import io.github.muntashirakon.adb.AbsAdbConnectionManager
 import io.github.muntashirakon.adb.AdbPairingRequiredException
 import io.github.muntashirakon.adb.AdbStream
@@ -258,6 +261,29 @@ class AdbShell(private val context: Context, private val relayOn: () -> Boolean)
         }
         _mobilePort.value = open
         !open
+    }
+
+    /** Whether the phone is joined to a Wi-Fi network, where wireless debugging can answer. */
+    @Suppress("DEPRECATION")
+    private fun onWifi(): Boolean {
+        val connectivity = context.getSystemService(ConnectivityManager::class.java)
+        return connectivity.allNetworks.any {
+            val caps = connectivity.getNetworkCapabilities(it)
+            caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) && !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+        }
+    }
+
+    /**
+     * How the bridge stands, for /state, read without connecting (connecting may switch wireless
+     * debugging on and restart adbd): a command can still find adbd not answering.
+     */
+    suspend fun state(): ShellState = withContext(Dispatchers.IO) {
+        when {
+            !paired -> ShellState(paired = false, reachable = false, via = null)
+            mobile && tcpListening() -> ShellState(paired = true, reachable = true, via = "port")
+            onWifi() && (wirelessDebuggingOn() || canEnable()) -> ShellState(paired = true, reachable = true, via = "wireless_debugging")
+            else -> ShellState(paired = true, reachable = false, via = null)
+        }
     }
 
     /** The owner's switch: on, the port is opened now if the phone is on Wi-Fi; off, it is closed. */
