@@ -49,6 +49,8 @@ const COLUMN_RE = /^\w{1,64}$/;
 const SORT_RE = /^[\w ,]{1,200}$/;
 const SIGNALS = ["STOP", "CONT", "KILL"];
 const NIGHT_MODES = ["yes", "no", "auto"];
+// /awake: the longest the screen is held on for one asking (asked again before then to go on).
+export const MAX_AWAKE_S = 1800;
 // No part may start with "-", so none is read as an option of cat, rm or tar.
 const DATA_PATH_RE = /^[\w.@+ ][\w.@+ -]*(\/[\w.@+ ][\w.@+ -]*)*\/?$/;
 // Intent flags by name, as Android's Intent.FLAG_* (checked against android.jar of API 36).
@@ -99,7 +101,7 @@ export const BATCH_COMMANDS = [
   "notifications", "statusbar", "rotation", "wait", "files", "record_start", "gesture",
   "clipboard_get", "clipboard_set", "chrome_tabs", "chrome_eval", "chrome_cdp", "chrome_new",
   "chrome_close", "chrome_activate", "install", "accessibility", "logcat", "package", "settings", "run_as_files", "content", "run_as_delete", "run_as_kill",
-  "night_mode", "force_stop", "sleep",
+  "night_mode", "force_stop", "delete", "awake", "sleep",
 ];
 
 export type CommandName =
@@ -110,7 +112,8 @@ export type CommandName =
   | "chrome_sockets" | "chrome_tabs" | "chrome_eval" | "chrome_cdp" | "chrome_new" | "chrome_close" | "chrome_activate"
   | "request" | "request_status"
   | "install" | "accessibility" | "logcat" | "package" | "package_apk" | "run_as" | "run_as_files" | "settings" | "check"
-  | "content" | "run_as_archive" | "run_as_push" | "run_as_delete" | "run_as_kill" | "night_mode" | "force_stop";
+  | "content" | "run_as_archive" | "run_as_push" | "run_as_delete" | "run_as_kill" | "night_mode" | "force_stop"
+  | "delete" | "awake";
 // Commands whose reply is a file streamed from the phone, and those that stream a file to it.
 export const DOWNLOAD_COMMANDS: readonly CommandName[] = ["pull", "record", "record_stop", "audio", "package_apk", "run_as", "run_as_archive"];
 export const UPLOAD_COMMANDS: readonly CommandName[] = ["push", "run_as_push"];
@@ -151,6 +154,7 @@ export const AGENT_ROUTES: Record<string, Route | Route[]> = {
   "/files": { method: "GET", cmd: "files" },
   "/files/pull": { method: "GET", cmd: "pull" },
   "/files/push": { method: "POST", cmd: "push", raw: true },
+  "/files/delete": { method: "POST", cmd: "delete" },
   "/record": { method: "GET", cmd: "record" },
   "/record/start": { method: "POST", cmd: "record_start" },
   "/record/stop": { method: "POST", cmd: "record_stop" },
@@ -182,6 +186,8 @@ export const AGENT_ROUTES: Record<string, Route | Route[]> = {
   "/content": { method: "GET", cmd: "content" },
   "/night-mode": { method: "POST", cmd: "night_mode" },
   "/force-stop": { method: "POST", cmd: "force_stop" },
+  // The screen held on for a task (it is not turned on: /key KEYCODE_WAKEUP does that).
+  "/awake": { method: "POST", cmd: "awake" },
   "/settings": { method: "GET", cmd: "settings" },
   // Several of the above at once, run by the relay itself (see check.ts).
   "/check": { method: "GET", cmd: "check" },
@@ -214,6 +220,8 @@ const FIELDS: Record<CommandName, string[]> = {
   files: ["path"],
   pull: ["path"],
   push: ["path"],
+  delete: ["path"],
+  awake: ["seconds"],
   record: ["seconds", "size", "bit_rate"],
   record_start: ["seconds", "size", "bit_rate"],
   record_stop: [],
@@ -832,6 +840,17 @@ function commandArgs(cmd: CommandName, src: Fields, ignored: string[]): Fields |
     case "pull":
     case "push":
       return absolutePath(src);
+
+    case "delete": {
+      // A file is deleted, never a folder.
+      if (typeof src.path === "string" && src.path.endsWith("/")) return "path must name a file, not a folder";
+      return absolutePath(src);
+    }
+
+    case "awake": {
+      if (!isNumber(src.seconds) || src.seconds < 0 || src.seconds > MAX_AWAKE_S) return `seconds must be a number from 0 (let the screen sleep again) to ${MAX_AWAKE_S}`;
+      return { seconds: src.seconds };
+    }
 
     case "record":
     case "record_start":
