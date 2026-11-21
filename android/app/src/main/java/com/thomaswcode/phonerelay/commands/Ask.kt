@@ -73,6 +73,8 @@ object Ask {
                 else -> "Turn dark mode on"
             }
             "force_stop" -> "Force-stop ${s("package") ?: "an app"}"
+            "delete" -> "Delete ${s("path") ?: "a file"}"
+            "awake" -> if ((n("seconds") ?: "0") == "0") "Let the screen sleep again" else "Keep the screen on for ${n("seconds")} s"
             else -> cmd
         }
         val guard = a.ifForegroundOrNull()

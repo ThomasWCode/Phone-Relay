@@ -23,6 +23,7 @@ import android.os.BatteryManager
 import android.os.Bundle
 import android.os.Environment
 import android.os.PowerManager
+import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
 import android.view.Display
@@ -461,6 +462,26 @@ class AndroidDevice(
         // The one way an app turns the screen on; it does not unlock the phone.
         power.newWakeLock(PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP, "PhoneRelay:wake").acquire(3000)
     }
+
+    private var awakeLock: PowerManager.WakeLock? = null
+    private var awakeUntil = 0L
+
+    @Suppress("DEPRECATION")
+    @Synchronized
+    override fun keepAwake(ms: Long) {
+        awakeLock?.let { if (it.isHeld) it.release() }
+        awakeLock = null
+        awakeUntil = 0
+        if (ms <= 0) return
+        val power = context.getSystemService(PowerManager::class.java)
+        // A screen lock without ACQUIRE_CAUSES_WAKEUP: the screen does not time out while it is on,
+        // and is not turned on. Android releases it by itself after `ms`.
+        awakeLock = power.newWakeLock(PowerManager.SCREEN_BRIGHT_WAKE_LOCK, "PhoneRelay:awake").apply { acquire(ms) }
+        awakeUntil = SystemClock.elapsedRealtime() + ms
+    }
+
+    @Synchronized
+    override fun keepAwakeLeft(): Long = (awakeUntil - SystemClock.elapsedRealtime()).coerceAtLeast(0)
 
     // ---- apps ----
 
