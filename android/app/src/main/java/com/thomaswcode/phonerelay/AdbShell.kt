@@ -12,6 +12,8 @@ import io.github.muntashirakon.adb.AdbStream
 import io.github.muntashirakon.adb.android.AdbMdns
 import java.io.File
 import java.math.BigInteger
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.security.KeyFactory
 import java.security.KeyPairGenerator
 import java.security.PrivateKey
@@ -25,10 +27,13 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.bouncycastle.asn1.x500.X500Name
 import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter
 import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder
@@ -44,19 +49,36 @@ import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
  * It needs wireless debugging on: Android 17 keeps that to networks the owner allowed, and the
  * app turns it back on (when it holds WRITE_SECURE_SETTINGS, granted once over adb) when Android
  * has turned it off, for instance after a reboot.
+ *
+ * Off Wi-Fi (the owner's switch, `mobile`): wireless debugging is Wi-Fi only, so while the relay is
+ * on the bridge has adbd listen on its classic TCP port as well (the `tcpip:` service, what
+ * `adb tcpip` asks for), which answers on this phone's loopback on any network, and connects there.
+ * The port can only be opened over wireless debugging, so on Wi-Fi, once after a reboot; it asks for
+ * the same key. adbd listens on every interface (the shell user may not narrow it to loopback), so
+ * the port is one drawn at random for this install, not adb's usual 5555, and it is closed again
+ * (the `usb:` service) when the relay is turned off. adbd restarts to open it and to close it, which
+ * ends every adb connection to the phone, a computer's too.
  */
-class AdbShell(private val context: Context) {
+class AdbShell(private val context: Context, private val relayOn: () -> Boolean) {
     private val keyFile = File(context.filesDir, "adb_key.sealed")
     private val certFile = File(context.filesDir, "adb_cert.sealed")
     private val prefs = context.getSharedPreferences("shell", Context.MODE_PRIVATE)
     private val cipher = KeystoreCipher("phone-relay-adb")
     private val lock = Mutex()
     private var manager: Manager? = null
+    /** The classic port did not take the app's key: not asked for again (each asking restarts adbd). */
+    @Volatile private var tcpFailed = false
+    private val _mobilePort = MutableStateFlow<Boolean?>(null)
+    /** Whether the port for mobile data is open, as last seen (null: not looked at yet). */
+    val mobilePort: StateFlow<Boolean?> get() = _mobilePort
 
     private class Manager(private val key: PrivateKey, private val cert: Certificate) : AbsAdbConnectionManager() {
         init {
             setApi(Build.VERSION.SDK_INT)
             setTimeout(10, TimeUnit.SECONDS)
+            // On the classic port, a key adbd does not know is refused, never offered: offering it
+            // would put Android's "Allow USB debugging?" prompt on the screen.
+            setThrowOnUnauthorised(true)
         }
 
         override fun getPrivateKey() = key
@@ -72,6 +94,23 @@ class AdbShell(private val context: Context) {
         context.checkSelfPermission("android.permission.WRITE_SECURE_SETTINGS") == PackageManager.PERMISSION_GRANTED
 
     private fun wirelessDebuggingOn(): Boolean = Settings.Global.getInt(context.contentResolver, ADB_WIFI_ENABLED, 0) == 1
+
+    /** Whether the owner wants the bridge off Wi-Fi too (the app's own screen, Shell access). */
+    val mobile: Boolean get() = prefs.getBoolean("mobile", false)
+
+    /** The classic port: drawn once for this install and kept, below the range adbd and Android pick their own from. */
+    private fun tcpPort(): Int {
+        val kept = prefs.getInt("tcp", 0)
+        if (kept > 0) return kept
+        return (TCP_PORT_FIRST + SecureRandom().nextInt(TCP_PORT_COUNT)).also { prefs.edit().putInt("tcp", it).apply() }
+    }
+
+    /** Whether the classic port answers on this phone: a bare TCP connection, which shows adbd no key. */
+    private fun tcpListening(): Boolean {
+        val port = prefs.getInt("tcp", 0)
+        if (port <= 0) return false
+        return runCatching { Socket().use { it.connect(InetSocketAddress(LOCALHOST, port), 500) } }.isSuccess
+    }
 
     /** The key and certificate, made on first use and kept sealed. */
     private fun manager(): Manager {
@@ -118,6 +157,7 @@ class AdbShell(private val context: Context) {
         if (!paired) throw CommandError("shell_unavailable", "pair the app with wireless debugging first: the app's own screen, Shell access")
         val m = withContext(Dispatchers.IO) { manager() }
         if (m.isConnected) return m
+        if (mobile && connectTcp(m)) return m
         if (!wirelessDebuggingOn()) {
             if (!canEnable()) throw CommandError("shell_unavailable", "wireless debugging is off (Settings > Developer options), and the app may not switch it on")
             Settings.Global.putInt(context.contentResolver, ADB_WIFI_ENABLED, 1)
@@ -125,7 +165,112 @@ class AdbShell(private val context: Context) {
             delay(1500) // adbd takes a moment to listen and announce itself
         }
         connect(m)
+        if (mobile && relayOn() && !tcpFailed) openTcp(m)
         m
+    }
+
+    /** Connects to adbd's classic port, if it is open: the route that works off Wi-Fi. */
+    private suspend fun connectTcp(m: Manager): Boolean = withContext(Dispatchers.IO) {
+        val port = prefs.getInt("tcp", 0)
+        (port > 0 && runCatching { m.connect(LOCALHOST, port) }.getOrDefault(false)).also { if (it) _mobilePort.value = true }
+    }
+
+    /**
+     * Asks adbd for a service it restarts for ("tcpip:<port>", "usb:"): it answers, then restarts,
+     * which ends the connection the request went over.
+     */
+    private suspend fun restartAdbd(m: Manager, service: String) {
+        withTimeoutOrNull(RESTART_MS) {
+            runInterruptible(Dispatchers.IO) {
+                runCatching {
+                    val stream = m.openStream(service)
+                    try {
+                        readAll(stream)
+                    } finally {
+                        runCatching { stream.close() }
+                    }
+                }
+            }
+        }
+        withContext(Dispatchers.IO) { runCatching { m.disconnect() } }
+    }
+
+    /**
+     * Has adbd listen on the classic port too, and moves the connection onto it. If the port then
+     * does not take the app's key, it is closed again and the bridge stays on wireless debugging.
+     */
+    private suspend fun openTcp(m: Manager) {
+        restartAdbd(m, "tcpip:${tcpPort()}")
+        repeat(TCP_TRIES) {
+            delay(TCP_WAIT_MS) // adbd is back within a second or two
+            if (connectTcp(m)) {
+                Log.i(TAG, "opened adbd's port for mobile data")
+                return
+            }
+        }
+        tcpFailed = true
+        Log.w(TAG, "adbd's port for mobile data did not take the app's key: closing it, staying on wireless debugging")
+        connect(m)
+        restartAdbd(m, "usb:")
+        delay(TCP_TRIES * TCP_WAIT_MS)
+        _mobilePort.value = withContext(Dispatchers.IO) { tcpListening() }
+        connect(m)
+    }
+
+    /**
+     * Opens the port for mobile data ahead of need (Wi-Fi just joined, the owner's switch just set):
+     * it can only be opened over wireless debugging, so once the phone has left Wi-Fi it is too late.
+     */
+    suspend fun prepare() {
+        if (!mobile || !paired || !relayOn()) return
+        try {
+            connected()
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.i(TAG, "the port for mobile data is not open yet: ${e.message}")
+        }
+    }
+
+    /**
+     * Closes the port for mobile data: the relay was turned off, or the owner no longer wants the
+     * bridge off Wi-Fi. adbd goes back to USB and wireless debugging alone. False if the port still
+     * answers afterwards (adbd could not be reached with the app's key to be told).
+     */
+    suspend fun closeTcp(): Boolean = lock.withLock {
+        if (mobile && relayOn()) return true // on again meanwhile
+        val open = withContext(Dispatchers.IO) { tcpListening() }
+        if (open) {
+            val m = withContext(Dispatchers.IO) { manager() }
+            if (!m.isConnected && !connectTcp(m)) runCatching { connect(m) }
+            if (m.isConnected) {
+                restartAdbd(m, "usb:")
+                repeat(TCP_TRIES) {
+                    delay(TCP_WAIT_MS)
+                    if (!withContext(Dispatchers.IO) { tcpListening() }) {
+                        Log.i(TAG, "closed adbd's port for mobile data")
+                        _mobilePort.value = false
+                        return true
+                    }
+                }
+            }
+            Log.w(TAG, "adbd's port for mobile data is still open: it could not be closed")
+        }
+        _mobilePort.value = open
+        !open
+    }
+
+    /** The owner's switch: on, the port is opened now if the phone is on Wi-Fi; off, it is closed. */
+    suspend fun setMobile(on: Boolean) {
+        prefs.edit().putBoolean("mobile", on).apply()
+        if (!on) {
+            closeTcp()
+            return
+        }
+        tcpFailed = false
+        // A connection over wireless debugging would be kept as it is: a fresh one opens the port.
+        lock.withLock { withContext(Dispatchers.IO) { runCatching { manager?.disconnect() } } }
+        prepare()
     }
 
     /** Connects to this phone's adbd: the port it used last, else the one it announces over mDNS. */
@@ -134,7 +279,11 @@ class AdbShell(private val context: Context) {
         val ok = (last > 0 && runCatching { m.connect(LOCALHOST, last) }.getOrDefault(false)) || run {
             val port = discover(AdbMdns.SERVICE_TYPE_TLS_CONNECT, DISCOVER_MS)
             if (port <= 0) {
-                throw CommandError("shell_unavailable", "wireless debugging is not answering on this phone (not on Wi-Fi, or a network not allowed for it)")
+                throw CommandError(
+                    "shell_unavailable",
+                    "wireless debugging is not answering on this phone (not on Wi-Fi, or a network not allowed for it)" +
+                        if (mobile) "; its port for mobile data is opened on Wi-Fi, once after a reboot or after the relay is turned on" else "",
+                )
             }
             prefs.edit().putInt("port", port).apply()
             try {
@@ -290,5 +439,10 @@ class AdbShell(private val context: Context) {
         const val ADB_WIFI_ENABLED = "adb_wifi_enabled"
         const val LOCALHOST = "127.0.0.1"
         const val DISCOVER_MS = 6_000L
+        const val TCP_PORT_FIRST = 20_000
+        const val TCP_PORT_COUNT = 12_000
+        const val TCP_TRIES = 16
+        const val TCP_WAIT_MS = 250L
+        const val RESTART_MS = 3_000L
     }
 }

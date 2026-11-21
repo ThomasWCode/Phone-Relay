@@ -9,6 +9,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
 
 /** The app's one relay connection, its settings, and the owner's on/off switch. */
 class RelayApp : Application() {
@@ -33,11 +34,13 @@ class RelayApp : Application() {
         _enabled = MutableStateFlow(prefs.enabled)
         prefs.importPending()
         capture = Capture(this, scope)
-        shell = AdbShell(this)
+        shell = AdbShell(this) { prefs.enabled }
         val commands = Commands(AndroidDevice(this, capture, shell, BuildConfig.VERSION_NAME), BuildConfig.VERSION_NAME) { code ->
             KeyEvent.keyCodeToString(code).takeIf { it.startsWith("KEYCODE_") }
         }
         connection = RelayConnection(prefs, commands, BuildConfig.VERSION_NAME, scope)
+        // The relay was turned off and the app ended before the shell bridge's port for mobile data was closed.
+        if (!prefs.enabled) scope.launch { shell.closeTcp() }
     }
 
     /** The owner's switch (the app's screen, the Quick Settings tile, the home screen widget, the notification): kept across reboots. */
@@ -45,6 +48,8 @@ class RelayApp : Application() {
         prefs.enabled = on
         _enabled.value = on
         if (on) RelayService.start(this) else RelayService.stop(this)
+        // Off: the shell bridge's port for mobile data does not stay open.
+        if (!on) scope.launch { shell.closeTcp() }
         TileService.requestListeningState(this, ComponentName(this, ToggleTile::class.java))
         ToggleWidget.refresh(this)
     }
