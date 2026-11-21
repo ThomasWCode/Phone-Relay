@@ -360,6 +360,18 @@ describe("what Decrastination's workflow does over adb", () => {
     for (const signal of ["TERM", "stop", 9, undefined]) expect(v("run_as_kill", { package: "com.a", signal }).ok, String(signal)).toBe(false);
   });
 
+  it("deleting a file and holding the screen on", () => {
+    expect(AGENT_ROUTES["/files/delete"]).toEqual({ method: "POST", cmd: "delete" });
+    expect(args(v("delete", { path: "/sdcard/Download/a.pdf" }))).toEqual({ path: "/sdcard/Download/a.pdf", timeout: 30 });
+    for (const path of ["Download/a.pdf", "/sdcard/Download/", "", 5]) expect(v("delete", { path }).ok, String(path)).toBe(false);
+    expect(v("delete").ok).toBe(false);
+    expect(AGENT_ROUTES["/awake"]).toEqual({ method: "POST", cmd: "awake" });
+    expect(args(v("awake", { seconds: 120 }))).toEqual({ seconds: 120, timeout: 30 });
+    for (const seconds of [0, 0.5, 1800]) expect(v("awake", { seconds }).ok, String(seconds)).toBe(true);
+    for (const seconds of [-1, 1801, "60", null]) expect(v("awake", { seconds }).ok, String(seconds)).toBe(false);
+    expect(v("awake").ok).toBe(false);
+  });
+
   it("night mode and force-stop", () => {
     for (const mode of ["yes", "no", "auto"]) expect(v("night_mode", { mode }).ok).toBe(true);
     expect(v("night_mode", { mode: "dark" }).ok).toBe(false);

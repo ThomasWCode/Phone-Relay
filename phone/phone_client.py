@@ -48,7 +48,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 
 # ---- key names and defaults (the relay has its own copy of the key names) ----
 
@@ -122,7 +122,8 @@ BATCH_COMMANDS = ("state", "screenshot", "ui", "tap", "swipe", "type", "key", "l
                   "notifications", "statusbar", "rotation", "wait", "files", "record_start", "gesture",
                   "clipboard_get", "clipboard_set", "chrome_tabs", "chrome_eval", "chrome_cdp", "chrome_new",
                   "chrome_close", "chrome_activate", "install", "accessibility", "logcat", "package", "settings",
-                  "run_as_files", "content", "run_as_delete", "run_as_kill", "night_mode", "force_stop", "sleep")
+                  "run_as_files", "content", "run_as_delete", "run_as_kill", "night_mode", "force_stop", "delete",
+                  "awake", "sleep")
 # Commands that run their action inside the if_foreground guard themselves (in the same shell command).
 # Any other command given if_foreground is checked against the foreground before it starts.
 SELF_GUARDED = ("screenshot", "ui", "tap", "swipe", "type", "key", "launch", "open", "intent", "statusbar",
@@ -1355,6 +1356,8 @@ class PhoneController:
             "run_as_kill": self.cmd_run_as_kill,
             "night_mode": self.cmd_night_mode,
             "force_stop": self.cmd_force_stop,
+            "delete": self.cmd_delete,
+            "awake": self.cmd_awake,
         }.get(cmd)
         # These stream bytes over the relay socket, so they need the command's channel.
         streaming = {
@@ -1785,6 +1788,21 @@ class PhoneController:
         finally:
             _remove(local)
         return {"path": path, "bytes": size}
+
+    async def cmd_delete(self, args: dict) -> dict:
+        """Delete one file (never a folder) anywhere the shell can write."""
+        path = _remote_path(args)
+        entry = await self._stat(path)
+        if entry["type"] != "file":
+            raise CommandError("invalid_args", f"{path} is a {entry['type']}; only a file is deleted")
+        out = await self.adb.shell(f"rm -f -- {shlex.quote(path)} 2>&1")
+        if out.strip():
+            raise CommandError("device_error", out.strip()[-300:])
+        return {"path": path, "deleted": True}
+
+    async def cmd_awake(self, args: dict) -> dict:
+        raise CommandError("unsupported", "only the Android app holds the screen on: over adb it takes the owner's "
+                                          "stay-awake setting, which is theirs")
 
     async def _end_recording(self) -> list[str]:
         """Stop the recording loop (if it runs) and return its segment files on the phone, in order."""

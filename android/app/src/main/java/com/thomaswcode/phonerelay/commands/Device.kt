@@ -182,6 +182,10 @@ interface Device {
     fun adjustVolume(direction: Int)
     fun mediaKey(keyName: String)
     fun wake()
+    /** Holds the screen on for `ms` from now (it is not turned on); 0 lets it sleep again. */
+    fun keepAwake(ms: Long)
+    /** How long keepAwake still holds the screen on for, in ms (0: it is not held). */
+    fun keepAwakeLeft(): Long
     fun launch(pkg: String)
     fun startIntent(spec: IntentSpec): String
     fun notifications(): List<JsonObject>

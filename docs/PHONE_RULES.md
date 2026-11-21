@@ -10,6 +10,8 @@ These come from the owner's own instructions for working on this phone, cut down
 - Don't change apps the task doesn't involve, or system settings. If a task needs a setting changed (rotation, volume, Do Not Disturb, brightness), note its value first and put it back when you're done.
 - Keep dark mode on: for a light screenshot, `/night-mode` `no`, then `yes` again straight after. Don't change Developer options (wireless debugging least of all: the app's shell bridge and the owner's computer use it), accessibility settings or app permissions.
 - Don't press power or sleep unless the owner asked: it locks the phone, and you cannot unlock it again.
+- Delete (`/files/delete`) only files you pushed yourself, never the owner's own.
+- If you held the screen on (`/awake`), let it sleep again (`seconds` 0) when the task is done.
 - After a task that opened another app (a video app, say), close it and check that no picture-in-picture window is left on the screen.
 - A task's leftovers include whatever you asked the owner to do for it: at the end, undo it (or ask them to), keeping their real settings and data.
 

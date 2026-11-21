@@ -1487,6 +1487,24 @@ class FileAndRecordTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res["bytes"], len(data))
         self.assertEqual(base64.b64decode(adb.state["files"]["/sdcard/Download/new file.bin"]), data)
 
+    async def test_delete_removes_one_file_never_a_folder(self):
+        ctl, adb = controller()
+        res = await ctl.handle("delete", {"path": "/sdcard/Download/a.txt"})
+        self.assertEqual(res, {"path": "/sdcard/Download/a.txt", "deleted": True})
+        self.assertNotIn("/sdcard/Download/a.txt", adb.state["files"])
+        for path, code in [("/sdcard/Download/a.txt", "not_found"), ("/sdcard/Download", "invalid_args"),
+                           ("Download/a.txt", "invalid_args")]:
+            with self.assertRaises(pc.CommandError, msg=path) as cm:
+                await ctl.handle("delete", {"path": path})
+            self.assertEqual(cm.exception.code, code)
+
+    async def test_awake_is_unsupported(self):
+        ctl, adb = controller()
+        with self.assertRaises(pc.CommandError) as cm:
+            await ctl.handle("awake", {"seconds": 60})
+        self.assertEqual(cm.exception.code, "unsupported")
+        self.assertEqual(adb.inputs(), [])
+
     async def test_push_empty_file(self):
         ctl, adb = controller()
         await ctl.handle("push", {"path": "/sdcard/Download/empty"}, FakeRelay(upload(b"")))

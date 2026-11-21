@@ -48,6 +48,36 @@ class CommandsTest {
     }
 
     @Test
+    fun deleteRemovesOneFileNeverAFolder() = runTest {
+        val gone = run("delete", """{"path": "/sdcard/Download/a.txt"}""")
+        assertEquals(true, gone["deleted"]!!.jsonPrimitive.content.toBoolean())
+        assertTrue("/sdcard/Download/a.txt" !in device.files)
+        assertEquals(listOf("/sdcard/Download/a.txt"), device.scanned) // the media library is told
+        assertEquals("not_found", error("delete", """{"path": "/sdcard/Download/a.txt"}""").code)
+        assertEquals("invalid_args", error("delete", """{"path": "/sdcard/Download"}""").code) // a folder
+        assertEquals("invalid_args", error("delete", """{"path": "Download/a.txt"}""").code)
+        device.files["/sdcard/Download/kept.txt"] = "x".toByteArray()
+        device.undeletable = setOf("/sdcard/Download/kept.txt")
+        assertEquals("device_error", error("delete", """{"path": "/sdcard/Download/kept.txt"}""").code)
+    }
+
+    @Test
+    fun awakeHoldsTheScreenOnUntilAskedOrTheConnectionEnds() = runTest {
+        val held = run("awake", """{"seconds": 90}""")
+        assertEquals(listOf(90_000L), device.keptAwake)
+        assertEquals(true, held["awake"]!!.jsonPrimitive.content.toBoolean())
+        assertEquals(90, run("state")["keep_awake"]!!.jsonPrimitive.int)
+        run("awake", """{"seconds": 0}""")
+        assertEquals(0, run("state")["keep_awake"]!!.jsonPrimitive.int)
+        for (bad in listOf("""{"seconds": -1}""", """{"seconds": 1801}""", """{}""")) {
+            assertEquals("invalid_args", error("awake", bad).code, bad)
+        }
+        run("awake", """{"seconds": 30}""")
+        commands.closed()
+        assertEquals(listOf(90_000L, 0L, 30_000L, 0L), device.keptAwake)
+    }
+
+    @Test
     fun wakeAnswersOnlyOnceTheScreenIsOn() = runTest {
         // The app's wake lock turns the screen on: nothing goes to the shell.
         device.isAwake = false

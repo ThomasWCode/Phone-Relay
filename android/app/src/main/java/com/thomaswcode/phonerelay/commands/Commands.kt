@@ -86,6 +86,8 @@ class Commands(
         "run_as_kill" to { a, _ -> runAsKill(a) },
         "night_mode" to { a, _ -> nightMode(a) },
         "force_stop" to { a, _ -> forceStop(a) },
+        "delete" to { a, _ -> delete(a) },
+        "awake" to { a, _ -> keepAwake(a) },
     )
 
     /** The commands this client runs, announced to the relay in hello and in /state. */
@@ -103,7 +105,10 @@ class Commands(
     }
 
     /** The connection closed (the owner's switch, a disable, a drop): capture ends with it, as in the adb client. */
-    fun closed() = device.endCapture()
+    fun closed() {
+        device.endCapture()
+        device.keepAwake(0)
+    }
 
     private fun noStream(cmd: String): Nothing = throw CommandError("invalid_args", "$cmd streams over the relay; it cannot run here")
 
@@ -133,6 +138,8 @@ class Commands(
             put("battery", device.battery())
             put("screen", buildJsonObject { put("width", size.width); put("height", size.height) })
             put("rotation", rotationJson(rotation))
+            // Seconds /awake still holds the screen on for (0: it is not held).
+            put("keep_awake", Math.ceil(device.keepAwakeLeft() / 1000.0).toLong())
             put("network", device.network())
             // What the shell bridge's commands (capabilities lists them all the same) would meet now.
             put("shell", buildJsonObject { put("paired", shell.paired); put("reachable", shell.reachable); put("via", shell.via) })
@@ -658,6 +665,34 @@ class Commands(
         return buildJsonObject { put("path", p); put("count", entries.size); put("entries", JsonArray(entries.map(::entryJson))) }
     }
 
+    /** Deletes one file (never a folder) where /files/push can write: shared storage and the app's own folders. */
+    private fun delete(args: JsonObject): JsonObject {
+        val p = path(args)
+        val entry = device.stat(p)
+        if (entry.type != "file") throw CommandError("invalid_args", "$p is a ${entry.type}; only a file is deleted")
+        device.deleteFile(p)
+        try {
+            device.stat(p)
+        } catch (e: CommandError) {
+            if (e.code != "not_found") throw e
+            // The media library drops its row for a file that is gone.
+            device.scanFile(p)
+            return buildJsonObject { put("path", p); put("deleted", true) }
+        }
+        throw CommandError("device_error", "$p could not be deleted")
+    }
+
+    /**
+     * Holds the screen on for a task: for `seconds` from now (asked again, the time starts again), 0
+     * to let it sleep. It does not turn the screen on, and ends with the connection.
+     */
+    private fun keepAwake(args: JsonObject): JsonObject {
+        val seconds = args.requiredNumber("seconds")
+        if (seconds < 0 || seconds > MAX_AWAKE_S) throw CommandError("invalid_args", "seconds must be from 0 to $MAX_AWAKE_S")
+        device.keepAwake((seconds * 1000).toLong())
+        return buildJsonObject { put("seconds", seconds); put("awake", device.awake()) }
+    }
+
     private suspend fun pull(args: JsonObject, stream: Stream): JsonObject {
         val p = path(args)
         val entry = device.stat(p)
@@ -934,6 +969,8 @@ class Commands(
         const val TAP_MS = 50L
         /** How long the screen is given to come on after a wake. */
         const val WAKE_MS = 1000L
+        /** The longest /awake holds the screen on for one asking: the relay's MAX_AWAKE_S. */
+        const val MAX_AWAKE_S = 1800
         /** How often, and how far apart, a write into an app's storage is checked for its whole size. */
         const val WRITE_CHECKS = 25
         const val WRITE_CHECK_MS = 200L
@@ -946,7 +983,7 @@ class Commands(
             "statusbar", "rotation", "wait", "files", "gesture", "clipboard_set", "clipboard_get", "record_start",
             "chrome_tabs", "chrome_eval", "chrome_cdp", "chrome_new", "chrome_close", "chrome_activate", "install",
             "accessibility", "logcat", "package", "settings", "run_as_files", "content", "run_as_delete", "run_as_kill",
-            "night_mode", "force_stop", "sleep",
+            "night_mode", "force_stop", "delete", "awake", "sleep",
         )
         /** A key the shell may be given: a KEYCODE_* name or a number. */
         private val SHELL_KEY = Regex("^(KEYCODE_[A-Z0-9_]{1,40}|\\d{1,4})$")

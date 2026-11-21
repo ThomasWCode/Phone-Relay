@@ -47,7 +47,7 @@ curl -sS -X POST $R/intent -H 'Content-Type: application/json' -d '{"component":
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /state` | Foreground app, awake, battery, screen size; with the app, `network` (`wifi`, `mobile`, `other`, `null`) and `shell` (`paired`, `reachable`, `via`): whether its shell bridge would answer now |
+| `GET /state` | Foreground app, awake, battery, screen size; with the app, `network` (`wifi`, `mobile`, `other`, `null`), `shell` (`paired`, `reachable`, `via`): whether its shell bridge would answer now, and `keep_awake`: the seconds `/awake` still holds the screen on |
 | `GET /screenshot?scale=0.5` | JPEG of the screen (default scale 0.5; above 1 gives full size). Headers: `X-Image-Width/Height`, `X-Screen-Width/Height`, `X-Scale`, `X-Foreground` |
 | `GET /ui?engine=` | Every element on the screen, from every app (text, ids, flags, `bounds` and `center` in real screen pixels). With the adb client, `engine=uiautomator` only if the helper fails: it briefly unbinds the phone's accessibility services. The app has one tree, and both engines give it |
 | `POST /tap {x,y,scale?}` | Tap |
@@ -65,6 +65,7 @@ curl -sS -X POST $R/intent -H 'Content-Type: application/json' -d '{"component":
 | `GET /files?path=` | A folder's entries (`name`, `type`, `size`, `modified`), or one file's |
 | `GET /files/pull?path=` | The file's bytes. Headers: `X-File-Size`, `X-File-Path` |
 | `POST /files/push?path=` | The request body (any bytes, any size) is written to `path` |
+| `POST /files/delete {path}` | Deletes one file, never a folder (400 for one, 404 if it is not there). For what you pushed: the owner's own files are not yours to delete |
 | `GET /record?seconds=` | Record the screen for that long and return the MP4 (with the adb client, a zip of MP4 segments past 180 s). Also `size=720x1560`, `bit_rate=` (default 2000000). It holds the queue: nothing else runs meanwhile |
 | `POST /record/start {seconds?,size?,bit_rate?}`, `POST /record/stop` | Record around other commands: start, act, then stop returns the video. `seconds` (default 10) is the most it records |
 | `POST /gesture {pointers,ms?,scale?}` | Several fingers at once: `pointers` is a list of paths, each a list of `[x, y]` points; every finger goes down at its first point, follows its path over `ms` (default 300) and lifts |
@@ -92,6 +93,7 @@ curl -sS -X POST $R/intent -H 'Content-Type: application/json' -d '{"component":
 | `GET /content?uri=&projection=&where=&sort=` | A provider's rows (`content query`, read-only): `projection` columns comma-separated, `where` a selection, `sort` an order. The reply's `rows` are objects (`NULL` as `null`); a value holding commas or newlines comes back whole when you give `projection` |
 | `POST /night-mode {mode}` | Dark mode `yes`, `no` or `auto`; the reply's `previous` is the old setting, to put back |
 | `POST /force-stop {package}` | Force-stop an app (`am force-stop`), such as one a test opened. 409 `stop_refused` for an app with an enabled accessibility service (Android would drop it) and for the system's own |
+| `POST /awake {seconds}` | Holds the screen on for `seconds` from now (up to 1800; ask again before then to go on), so it does not time out during a task; `0` lets it sleep again, which you do when the task is done. It does not turn the screen on (`/key` `KEYCODE_WAKEUP` does) or stop the owner switching it off, and it ends when the phone's connection does. `/state`'s `keep_awake` is the seconds left. The app only: 501 `unsupported` from the adb client |
 | `GET /audio?seconds=&source=` | Record `seconds` (default 10) of the phone's sound output (`source=output`, the default; with the adb client it is silent on the phone meanwhile; with the app, sound already playing when the capture starts can stay out of it: have the playback start after it begins) or its microphone (`source=mic`), as WAV |
 
 Every endpoint also takes:

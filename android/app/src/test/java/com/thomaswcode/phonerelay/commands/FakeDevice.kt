@@ -223,6 +223,14 @@ class FakeDevice : Device {
         if (lockWakes) isAwake = true
     }
 
+    /** Each keepAwake asked for, and what the last one left held. */
+    val keptAwake = mutableListOf<Long>()
+    override fun keepAwake(ms: Long) {
+        keptAwake += ms
+    }
+
+    override fun keepAwakeLeft(): Long = keptAwake.lastOrNull() ?: 0
+
     override fun launch(pkg: String) {
         if (pkg == "com.example.missing") throw CommandError("launch_failed", "no launcher activity")
         launched += pkg
@@ -263,9 +271,11 @@ class FakeDevice : Device {
         written[to] = written.remove(from) ?: throw CommandError("not_found", from)
     }
 
+    /** Files Android will not delete (a delete that changes nothing). */
+    var undeletable = setOf<String>()
     override fun deleteFile(path: String) {
         written.remove(path)
-        if (path == RECORDING || path == AUDIO || path == SHELL_OUT) files.remove(path)
+        if (path !in undeletable) files.remove(path)
     }
 
     override fun scanFile(path: String) {
