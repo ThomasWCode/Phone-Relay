@@ -136,8 +136,18 @@ class CommandsTest {
         device.shellPaired = false
         assertEquals("gesture", run("tap", """{"x": 5, "y": 6}""").str("via"))
         assertEquals(listOf(listOf(Point(5f, 6f))), device.gestures.last().first)
-        // if_foreground is still checked, just before the shell command
+        // A bridge that turns out unreachable while the app in front changes: the fallback gesture is refused
+        val before = device.gestures.size
+        device.fg = "com.android.chrome"
+        device.duringShellSetup = { device.fg = "com.android.settings" }
         device.shellPaired = true
+        device.shellSetupFails = true
+        assertEquals("foreground_mismatch", error("tap", """{"x": 1, "y": 1, "if_foreground": "com.android.chrome"}""").code)
+        assertEquals(before, device.gestures.size)
+        device.shellSetupFails = false
+        device.duringShellSetup = null
+        device.fg = "com.android.chrome"
+        // if_foreground is still checked, just before the shell command
         assertEquals("foreground_mismatch", error("tap", """{"x": 1, "y": 1, "if_foreground": "com.android.settings"}""").code)
     }
 

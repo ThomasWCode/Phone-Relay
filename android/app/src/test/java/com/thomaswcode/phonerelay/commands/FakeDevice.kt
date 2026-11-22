@@ -158,9 +158,12 @@ class FakeDevice : Device {
     /** What the shell prints for a command (null: nothing), and the bytes shellToFile gets. */
     var shellReply: (String) -> String? = { null }
     var shellBytes: (String) -> ByteArray = { ByteArray(0) }
+    /** Paired, but the bridge isn't reached: setup fails after duringShellSetup, before the guard (as AdbShell does). */
+    var shellSetupFails = false
     override suspend fun shell(command: String, guard: (() -> Unit)?): String {
         if (!shellPaired) throw CommandError("shell_unavailable", "pair the app with wireless debugging first")
         duringShellSetup?.invoke()
+        if (shellSetupFails) throw CommandError("shell_unavailable", "wireless debugging is not reachable")
         guard?.invoke()
         shellCommands += command
         if (command == "input keyevent KEYCODE_WAKEUP" && shellWakes) isAwake = true

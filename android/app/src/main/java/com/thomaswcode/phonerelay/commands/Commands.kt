@@ -210,6 +210,8 @@ class Commands(
                 }
                 return "shell"
             }
+            // Finding the bridge unreachable can take seconds: the app in front is checked again before the gesture
+            guard(args)?.invoke()
         }
         device.gesture(paths, ms)
         return "gesture"
