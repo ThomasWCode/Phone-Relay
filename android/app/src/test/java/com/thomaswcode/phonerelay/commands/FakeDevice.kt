@@ -23,6 +23,7 @@ class FakeDevice : Device {
     var gestureDelayMs = 0L
     var notificationAccess = true
     val gestures = mutableListOf<Pair<List<List<Point>>, Long>>()
+    var screenLocked = false
     val globals = mutableListOf<GlobalAction>()
     val imeEnters = mutableListOf<String>()
     val pasted = mutableListOf<String>()
@@ -65,6 +66,8 @@ class FakeDevice : Device {
         if (gestureDelayMs > 0) delay(gestureDelayMs)
         gestures += paths to ms
     }
+
+    override suspend fun screenLockLocked() = screenLocked
 
     override fun globalAction(action: GlobalAction) {
         globals += action

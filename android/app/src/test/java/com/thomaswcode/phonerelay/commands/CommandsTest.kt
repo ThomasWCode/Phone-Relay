@@ -117,6 +117,31 @@ class CommandsTest {
     }
 
     @Test
+    fun withScreenLockLockedOneFingerTouchGoesThroughTheShell() = runTest {
+        device.screenLocked = true
+        device.shellPaired = true
+        val tap = run("tap", """{"x": 270, "y": 585, "scale": 0.5}""")
+        assertEquals("shell", tap.str("via"))
+        assertEquals("input swipe 540 1170 540 1170 ${Commands.TAP_MS}", device.shellCommands.last())
+        run("swipe", """{"x1": 1, "y1": 2, "x2": 3, "y2": 4, "ms": 0}""")
+        assertEquals("input swipe 1 2 3 4 1", device.shellCommands.last())
+        run("gesture", """{"pointers": [[[10, 20], [30, 40]]], "ms": 400}""")
+        assertEquals("input swipe 10 20 30 40 400", device.shellCommands.last())
+        assertTrue(device.gestures.isEmpty())
+        // Two fingers, or a path of more than two points, stay accessibility gestures
+        assertEquals("gesture", run("gesture", """{"pointers": [[[500, 1000], [300, 800]], [[580, 1080], [780, 1280]]], "ms": 400}""").str("via"))
+        assertEquals("gesture", run("gesture", """{"pointers": [[[1, 1], [2, 2], [3, 3]]]}""").str("via"))
+        assertEquals(2, device.gestures.size)
+        // No shell bridge: the accessibility gesture (which pauses ScreenLock)
+        device.shellPaired = false
+        assertEquals("gesture", run("tap", """{"x": 5, "y": 6}""").str("via"))
+        assertEquals(listOf(listOf(Point(5f, 6f))), device.gestures.last().first)
+        // if_foreground is still checked, just before the shell command
+        device.shellPaired = true
+        assertEquals("foreground_mismatch", error("tap", """{"x": 1, "y": 1, "if_foreground": "com.android.settings"}""").code)
+    }
+
+    @Test
     fun tapsSwipesAndGestures() = runTest {
         run("tap", """{"x": 270, "y": 585, "scale": 0.5}""")
         assertEquals(listOf(listOf(Point(540f, 1170f))), device.gestures.last().first)

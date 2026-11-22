@@ -259,6 +259,8 @@ class AndroidDevice(
         }
     }
 
+    override suspend fun screenLockLocked(): Boolean = ScreenLockPause(context).locked()
+
     private suspend fun dispatch(s: AccessibilityService, gesture: GestureDescription) {
         suspendCancellableCoroutine { cont ->
             val dispatched = s.dispatchGesture(gesture, object : AccessibilityService.GestureResultCallback() {

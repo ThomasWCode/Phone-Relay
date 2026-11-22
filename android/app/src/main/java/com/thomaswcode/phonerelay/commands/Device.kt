@@ -121,6 +121,8 @@ interface Device {
     fun uiRoots(): List<UiNode>
     /** Every pointer down at its path's first point, along its path over ms, then up. */
     suspend fun gesture(paths: List<List<Point>>, ms: Long)
+    /** Whether ScreenLock (the owner's touch lock) is installed and locked. */
+    suspend fun screenLockLocked(): Boolean
     fun globalAction(action: GlobalAction)
     fun focusedField(): Field?
     /**

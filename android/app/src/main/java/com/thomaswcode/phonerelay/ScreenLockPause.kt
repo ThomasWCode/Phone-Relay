@@ -24,13 +24,18 @@ class ScreenLockPause(private val context: Context) {
 
     suspend fun resume() = call("resume", null)
 
-    private suspend fun call(method: String, ms: Long?) = withContext(Dispatchers.IO) {
+    // Whether ScreenLock is installed and locked: false too for one without this call
+    suspend fun locked(): Boolean = call("state", null)?.getBoolean("locked") == true
+
+    private suspend fun call(method: String, ms: Long?): Bundle? = withContext(Dispatchers.IO) {
         try {
             context.contentResolver.call(URI, method, null, Bundle().apply { if (ms != null) putLong("ms", ms) })
         } catch (_: IllegalArgumentException) {
-            // ScreenLock is not installed (an unknown authority)
+            // ScreenLock is not installed (an unknown authority), or is too old for the call
+            null
         } catch (e: SecurityException) {
-            Log.w("PhoneRelay", "ScreenLock refused to pause: ${e.message}")
+            Log.w("PhoneRelay", "ScreenLock refused $method: ${e.message}")
+            null
         }
     }
 }

@@ -186,17 +186,43 @@ class Commands(
         val scale = args.scaleArg()
         val x = args.requiredNumber("x") / scale
         val y = args.requiredNumber("y") / scale
-        device.gesture(listOf(listOf(Point(x.toFloat(), y.toFloat()))), TAP_MS)
-        return buildJsonObject { put("x", Math.round(x)); put("y", Math.round(y)) }
+        val via = touch(listOf(listOf(Point(x.toFloat(), y.toFloat()))), TAP_MS, args)
+        return buildJsonObject { put("x", Math.round(x)); put("y", Math.round(y)); put("via", via) }
+    }
+
+    /**
+     * A gesture: with ScreenLock locked and the shell bridge answering, one finger in a straight line goes through the
+     * shell as `input` (ShellTouch), which passes the lock without pausing it. Otherwise an accessibility gesture, which
+     * pauses ScreenLock for its own time. The route taken: "shell" or "gesture".
+     */
+    private suspend fun touch(paths: List<List<Point>>, ms: Long, args: JsonObject): String {
+        val command = ShellTouch.command(paths, ms)
+        if (command != null && device.screenLockLocked()) {
+            val out = try {
+                device.shell(command, guard(args))
+            } catch (e: CommandError) {
+                if (e.code != "shell_unavailable") throw e
+                null
+            }
+            if (out != null) {
+                if (Regex("^(Error|Exception|java\\.)", RegexOption.MULTILINE).containsMatchIn(out)) {
+                    throw CommandError("device_error", out.trim().takeLast(300))
+                }
+                return "shell"
+            }
+        }
+        device.gesture(paths, ms)
+        return "gesture"
     }
 
     private suspend fun swipe(args: JsonObject): JsonObject {
         val scale = args.scaleArg()
         val (x1, y1, x2, y2) = listOf("x1", "y1", "x2", "y2").map { args.requiredNumber(it) / scale }
         val ms = Math.round(args.numberArg("ms", 300.0))
-        device.gesture(listOf(listOf(Point(x1.toFloat(), y1.toFloat()), Point(x2.toFloat(), y2.toFloat()))), maxOf(ms, 1))
+        val via = touch(listOf(listOf(Point(x1.toFloat(), y1.toFloat()), Point(x2.toFloat(), y2.toFloat()))), maxOf(ms, 1), args)
         return buildJsonObject {
             put("x1", Math.round(x1)); put("y1", Math.round(y1)); put("x2", Math.round(x2)); put("y2", Math.round(y2)); put("ms", ms)
+            put("via", via)
         }
     }
 
@@ -214,8 +240,8 @@ class Commands(
             points.filterNotNull()
         }
         val ms = Math.round(args.numberArg("ms", 300.0))
-        device.gesture(paths, maxOf(ms, 1))
-        return buildJsonObject { put("pointers", paths.size); put("ms", ms) }
+        val via = touch(paths, maxOf(ms, 1), args)
+        return buildJsonObject { put("pointers", paths.size); put("ms", ms); put("via", via) }
     }
 
     // ---- type and keys ----
