@@ -63,8 +63,10 @@ import java.util.Locale
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.JsonObject
 
@@ -225,28 +227,35 @@ class AndroidDevice(
         // Android takes a minute at most in one gesture: a longer one goes as slices, each stroke continuing the last, the fingers staying down.
         val slices = Paths.slices(ms, GestureDescription.getMaxGestureDuration())
         var strokes: List<GestureDescription.StrokeDescription>? = null
-        for (i in 0 until slices) {
-            val t0 = i.toDouble() / slices
-            val t1 = (i + 1).toDouble() / slices
-            val sliceMs = ms * (i + 1) / slices - ms * i / slices
-            val more = i < slices - 1
-            val previous = strokes
-            strokes = paths.mapIndexed { k, points ->
-                val part = Paths.slice(points, t0, t1)
-                val path = Path().apply {
-                    moveTo(part[0].x, part[0].y)
-                    for (p in part.drop(1)) lineTo(p.x, p.y)
+        // ScreenLock, if it is locked, lets the gesture through: paused for each slice, resumed once it is done
+        val screenLock = ScreenLockPause(s)
+        try {
+            for (i in 0 until slices) {
+                val t0 = i.toDouble() / slices
+                val t1 = (i + 1).toDouble() / slices
+                val sliceMs = ms * (i + 1) / slices - ms * i / slices
+                val more = i < slices - 1
+                val previous = strokes
+                strokes = paths.mapIndexed { k, points ->
+                    val part = Paths.slice(points, t0, t1)
+                    val path = Path().apply {
+                        moveTo(part[0].x, part[0].y)
+                        for (p in part.drop(1)) lineTo(p.x, p.y)
+                    }
+                    previous?.get(k)?.continueStroke(path, 0, sliceMs, more) ?: GestureDescription.StrokeDescription(path, 0, sliceMs, more)
                 }
-                previous?.get(k)?.continueStroke(path, 0, sliceMs, more) ?: GestureDescription.StrokeDescription(path, 0, sliceMs, more)
+                val builder = GestureDescription.Builder()
+                strokes.forEach(builder::addStroke)
+                screenLock.pause(sliceMs)
+                val started = android.os.SystemClock.uptimeMillis()
+                dispatch(s, builder.build())
+                // A finger held still sends nothing after its first touch, so Android calls a slice that continues done at
+                // once (found on the phone): wait out the slice's time, the finger still down, before the next.
+                if (more) delay(sliceMs - (android.os.SystemClock.uptimeMillis() - started))
+                if (slices > 1) Log.i("PhoneRelay", "gesture slice ${i + 1}/$slices of $sliceMs ms took ${android.os.SystemClock.uptimeMillis() - started} ms")
             }
-            val builder = GestureDescription.Builder()
-            strokes.forEach(builder::addStroke)
-            val started = android.os.SystemClock.uptimeMillis()
-            dispatch(s, builder.build())
-            // A finger held still sends nothing after its first touch, so Android calls a slice that continues done at
-            // once (found on the phone): wait out the slice's time, the finger still down, before the next.
-            if (more) delay(sliceMs - (android.os.SystemClock.uptimeMillis() - started))
-            if (slices > 1) Log.i("PhoneRelay", "gesture slice ${i + 1}/$slices of $sliceMs ms took ${android.os.SystemClock.uptimeMillis() - started} ms")
+        } finally {
+            withContext(NonCancellable) { screenLock.resume() }
         }
     }
 
