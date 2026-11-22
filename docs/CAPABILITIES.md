@@ -42,7 +42,10 @@ The phone side is either the **Android app** (always on; it drives the phone thr
 - **Long press**: a swipe with the same start and end point and `ms` of 500 or more.
 - **Multi-touch** (`/gesture`): up to 10 fingers at once, each along its own path of points, all over the same duration: pinch to zoom, rotate, two-finger swipes.
 - Taps on the on-screen keyboard, password fields included.
-- With [ScreenLock](https://github.com/ThomasWCode/ScreenLock) locked (the owner's fingers blocked), the app's gestures still work: it pauses the lock for each gesture's own time, so a finger can get through only during one. A finger touching the screen during a gesture still cancels it (409 `gesture_cancelled`), locked or not.
+- With [ScreenLock](https://github.com/ThomasWCode/ScreenLock) locked (the owner's fingers blocked), touch still works:
+  - One finger in a straight line (`/tap`, `/swipe`, a one-finger `/gesture` of one or two points) goes through the shell bridge as `input swipe` when the bridge answers. That passes the lock without pausing it, so a finger on the screen (in a pocket, say) neither gets through nor cancels it.
+  - Anything else, or with the bridge unreachable, is an accessibility gesture with the lock paused for its own time, so a new touch can get through during it.
+  - The reply's `via` says which: `shell` or `gesture`.
 
 ### Type
 - Any text of any length. ASCII is typed as keys (`input text`; `%` and `%s` included, newlines and tabs as Enter and Tab). Anything else (accented letters, other scripts, emoji) is pasted through the clipboard, and the clipboard's earlier text is put back afterwards. `method` forces either way. With the app and no field focused, only ASCII can be typed (through the shell bridge).
