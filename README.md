@@ -224,7 +224,7 @@ All endpoints need `Authorization: Bearer <AGENT_TOKEN>`, which the network secr
 
 | Endpoint | Notes |
 |---|---|
-| `GET /state` | foreground, awake, battery, screen, client version; with the app, the network (`wifi`, `mobile`, `other`) and the shell bridge's state (`shell`: `paired`, `reachable`, `via`) |
+| `GET /state` | foreground, awake, battery, screen, client version; with the app, the network (`wifi`, `mobile`, `other`) and the shell bridge's state (`shell`: `paired`, `reachable`, `via`, `can_switch_on`; `reachable` only when adb answers) |
 | `GET /screenshot?scale=0.5` | JPEG (PNG if Pillow is missing on the phone). Headers `X-Image-*`, `X-Screen-*`, `X-Scale`, `X-Foreground` |
 | `GET /ui?engine=` | Every element on the screen, every package, through the helper (accessibility services stay bound). `engine=uiautomator` runs `uiautomator dump`, which unbinds every accessibility service on the phone for a moment (in the app, both engines are its accessibility tree) |
 | `POST /tap` `{x,y,scale?}` | Any coordinates |
