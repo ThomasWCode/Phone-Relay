@@ -14,9 +14,36 @@ data class Rotation(val auto: Boolean?, val userRotation: Int?)
 /**
  * How the app's shell bridge stands, read without running a command: whether the owner has paired
  * it, whether a command would reach adbd now, and over what ("port": its port for mobile data;
- * "wireless_debugging").
+ * "wireless_debugging"); and, when it would not, whether a command would switch wireless debugging
+ * on to try ([canSwitchOn]).
  */
-data class ShellState(val paired: Boolean, val reachable: Boolean, val via: String?)
+data class ShellState(val paired: Boolean, val reachable: Boolean, val via: String?, val canSwitchOn: Boolean = false) {
+    companion object {
+        /**
+         * The bridge's state from what the app can see. Android runs wireless debugging only on a
+         * network the owner has allowed, and keeps that list to itself, so this network counts as
+         * allowed only once wireless debugging is on and [answering]. Off, that can't be told without
+         * switching it on, which on a network not allowed puts Android's "Allow wireless debugging on
+         * this network?" prompt on the owner's screen: not reachable, and [canSwitchOn] when a command
+         * would try. [portOpen] and [answering] connect, so each is asked only when needed.
+         */
+        fun of(
+            paired: Boolean,
+            portOpen: () -> Boolean,
+            onWifi: Boolean,
+            wirelessDebuggingOn: Boolean,
+            answering: () -> Boolean,
+            canEnable: Boolean,
+        ): ShellState = when {
+            !paired -> ShellState(paired = false, reachable = false, via = null)
+            portOpen() -> ShellState(paired = true, reachable = true, via = "port")
+            !onWifi -> ShellState(paired = true, reachable = false, via = null)
+            wirelessDebuggingOn && answering() -> ShellState(paired = true, reachable = true, via = "wireless_debugging")
+            !wirelessDebuggingOn && canEnable -> ShellState(paired = true, reachable = false, via = null, canSwitchOn = true)
+            else -> ShellState(paired = true, reachable = false, via = null)
+        }
+    }
+}
 
 /** A screenshot as the relay sends it: JPEG bytes, the image's size, the screen's size, the scale used. */
 class Shot(val jpeg: ByteArray, val width: Int, val height: Int, val realWidth: Int, val realHeight: Int, val scale: Double)
