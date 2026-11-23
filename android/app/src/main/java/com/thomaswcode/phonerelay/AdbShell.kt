@@ -275,16 +275,33 @@ class AdbShell(private val context: Context, private val relayOn: () -> Boolean)
     }
 
     /**
-     * How the bridge stands, for /state, read without connecting (connecting may switch wireless
-     * debugging on and restart adbd): a command can still find adbd not answering.
+     * How the bridge stands, for /state: adbd's ports tried with bare TCP connections, which show it
+     * no key, never a connection of the bridge's own (that may switch wireless debugging on and
+     * restart adbd). Wireless debugging counts only if it answers, as Android runs it only on a
+     * network the owner allowed (ShellState.of).
      */
     suspend fun state(): ShellState = withContext(Dispatchers.IO) {
-        when {
-            !paired -> ShellState(paired = false, reachable = false, via = null)
-            mobile && tcpListening() -> ShellState(paired = true, reachable = true, via = "port")
-            onWifi() && (wirelessDebuggingOn() || canEnable()) -> ShellState(paired = true, reachable = true, via = "wireless_debugging")
-            else -> ShellState(paired = true, reachable = false, via = null)
-        }
+        ShellState.of(
+            paired = paired,
+            portOpen = { mobile && tcpListening() },
+            onWifi = onWifi(),
+            wirelessDebuggingOn = wirelessDebuggingOn(),
+            answering = ::wirelessDebuggingAnswering,
+            canEnable = canEnable(),
+        )
+    }
+
+    /**
+     * Whether wireless debugging answers on this phone: the port it used last takes a bare TCP
+     * connection, or it is announced over mDNS, its port then kept for the next connection.
+     */
+    private fun wirelessDebuggingAnswering(): Boolean {
+        val last = prefs.getInt("port", -1)
+        if (last > 0 && runCatching { Socket().use { it.connect(InetSocketAddress(LOCALHOST, last), 500) } }.isSuccess) return true
+        val port = discover(AdbMdns.SERVICE_TYPE_TLS_CONNECT, STATE_DISCOVER_MS)
+        if (port <= 0) return false
+        prefs.edit().putInt("port", port).apply()
+        return true
     }
 
     /** The owner's switch: on, the port is opened now if the phone is on Wi-Fi; off, it is closed. */
@@ -466,6 +483,8 @@ class AdbShell(private val context: Context, private val relayOn: () -> Boolean)
         const val ADB_WIFI_ENABLED = "adb_wifi_enabled"
         const val LOCALHOST = "127.0.0.1"
         const val DISCOVER_MS = 6_000L
+        /** /state's look for wireless debugging's announcement: short, as /state is asked often. */
+        const val STATE_DISCOVER_MS = 1_500L
         const val TCP_PORT_FIRST = 20_000
         const val TCP_PORT_COUNT = 12_000
         const val TCP_TRIES = 16

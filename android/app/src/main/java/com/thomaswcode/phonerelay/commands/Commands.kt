@@ -142,7 +142,9 @@ class Commands(
             put("keep_awake", Math.ceil(device.keepAwakeLeft() / 1000.0).toLong())
             put("network", device.network())
             // What the shell bridge's commands (capabilities lists them all the same) would meet now.
-            put("shell", buildJsonObject { put("paired", shell.paired); put("reachable", shell.reachable); put("via", shell.via) })
+            put("shell", buildJsonObject {
+                put("paired", shell.paired); put("reachable", shell.reachable); put("via", shell.via); put("can_switch_on", shell.canSwitchOn)
+            })
             put("client", "android-app")
             put("client_version", version)
             put("capabilities", JsonArray(capabilities.map { JsonPrimitive(it) }))

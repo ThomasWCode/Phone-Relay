@@ -39,12 +39,12 @@ class CommandsTest {
         assertTrue(st["capabilities"]!!.jsonArray.map { it.jsonPrimitive.content }.containsAll(listOf("tap", "type", "pull")))
         assertTrue("chrome_eval" in st["capabilities"]!!.jsonArray.map { it.jsonPrimitive.content }) // through the shell bridge
         assertEquals("wifi", st.str("network"))
-        assertEquals("""{"paired":false,"reachable":false,"via":null}""", st["shell"].toString())
+        assertEquals("""{"paired":false,"reachable":false,"via":null,"can_switch_on":false}""", st["shell"].toString())
         device.shellPaired = true
         device.networkNow = null
         val later = run("state")
         assertEquals(JsonNull, later["network"])
-        assertEquals("""{"paired":true,"reachable":true,"via":"wireless_debugging"}""", later["shell"].toString())
+        assertEquals("""{"paired":true,"reachable":true,"via":"wireless_debugging","can_switch_on":false}""", later["shell"].toString())
     }
 
     @Test
