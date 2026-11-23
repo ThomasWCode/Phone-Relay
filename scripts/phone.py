@@ -133,6 +133,15 @@ def run(args: argparse.Namespace, env: dict, out, err) -> int:
     return 0 if 200 <= status < 300 else 1
 
 
+def utf8(stream):
+    """The stream, set to write UTF-8 if it can be. On Windows a redirected stdout or stderr writes the
+    locale's code page (cp1252), which turns the phone's text into bytes no UTF-8 reader takes, and
+    refuses what the code page lacks (emoji) outright."""
+    if hasattr(stream, "reconfigure"):
+        stream.reconfigure(encoding="utf-8")
+    return stream
+
+
 def main(argv: list[str] | None = None, env: dict | None = None, out=None, err=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("method", type=str.upper, choices=["GET", "POST", "PUT"])
@@ -143,10 +152,12 @@ def main(argv: list[str] | None = None, env: dict | None = None, out=None, err=N
     parser.add_argument("--wait", type=float, default=DEFAULT_WAIT_S, help="seconds to wait for the reply (default %(default)s)")
     parser.add_argument("--env-file", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    out = out or utf8(sys.stdout)
+    err = err or utf8(sys.stderr)
     try:
-        return run(args, os.environ if env is None else env, out or sys.stdout, err or sys.stderr)
+        return run(args, os.environ if env is None else env, out, err)
     except SetupError as e:
-        (err or sys.stderr).write(f"phone.py: {e}\n")
+        err.write(f"phone.py: {e}\n")
         return 2
 
 

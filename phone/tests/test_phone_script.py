@@ -12,6 +12,7 @@ import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 spec = importlib.util.spec_from_file_location("phone_script", os.path.join(ROOT, "scripts", "phone.py"))
@@ -37,6 +38,8 @@ class Relay(BaseHTTPRequestHandler):
             code, body, kind = 200, b"\xff\xd8\xff\xe0jpeg", "image/jpeg"
         elif self.path == "/missing":
             code, body, kind = 404, b'{"ok":false,"error":"not_found"}', "application/json"
+        elif self.path == "/notifications":
+            code, body, kind = 200, '{"ok":true,"text":"don’t forget 👋"}'.encode("utf-8"), "application/json"
         else:
             code, body, kind = 200, b'{"ok":true}', "application/json"
         self.send_response(code)
@@ -116,6 +119,16 @@ class PhoneScriptTest(unittest.TestCase):
             self.assertEqual((code, out), (0, ""))
             with open(target, "rb") as f:
                 self.assertEqual(f.read(), b"\xff\xd8\xff\xe0jpeg")
+
+    def test_the_phones_text_is_printed_as_utf8_whatever_the_consoles_code_page(self):
+        # stdout as Windows gives it when redirected to a file: the locale's code page.
+        stdout = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+        stderr = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+        with mock.patch.object(phone.sys, "stdout", stdout), mock.patch.object(phone.sys, "stderr", stderr):
+            code = phone.main(["GET", "/notifications"], self.env)
+            stdout.flush()
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(stdout.buffer.getvalue().decode("utf-8"))["text"], "don’t forget 👋")
 
     def test_an_error_reply_is_printed_and_exits_1(self):
         code, out, _ = self.call("GET", "/missing")
